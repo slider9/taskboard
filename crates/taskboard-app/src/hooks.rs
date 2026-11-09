@@ -33,8 +33,15 @@ const MARKETPLACE: &str = "taskboard";
 /// The plugin's PreToolUse script for Bash, inside the marketplace folder.
 const WAIT_HINT: &str = "task-board/bin/wait-hint";
 
-/// Tools whose PreToolUse the board sees.
-const TOOLS: &str = "Bash|Agent|Task|Workflow|EnterWorktree|mcp__.*|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob";
+/// Tools whose PreToolUse the board sees. On Windows Claude Code also runs commands in its PowerShell
+/// tool; elsewhere the entries stay as they were, so an install there isn't asked to reinstall.
+const TOOLS: &str = if cfg!(windows) {
+    "Bash|PowerShell|Agent|Task|Workflow|EnterWorktree|mcp__.*|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob"
+} else {
+    "Bash|Agent|Task|Workflow|EnterWorktree|mcp__.*|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob"
+};
+/// The calls whose end closes the window their start opened on the board.
+const WINDOWED: &str = if cfg!(windows) { "Bash|PowerShell|Agent|Task" } else { "Bash|Agent|Task" };
 
 /// What a hook entry runs: `tb hook <arg>`, or the plugin's wait-hint script.
 #[derive(Clone, Copy)]
@@ -68,14 +75,24 @@ const ENTRIES: &[Entry] = &[
     on("PreToolUse", Some("Bash"), Run::WaitHint, false),
     on("PreToolUse", Some("AskUserQuestion"), Run::Tb("AskUser"), true),
     Entry { when: Some("Bash(git *)"), ..on("PostToolUse", Some("Bash"), Run::Tb("PostToolUse"), true) },
-    on("PostToolUse", Some("Bash|Agent|Task"), Run::Tb("ToolEnd"), false),
+    on("PostToolUse", Some(WINDOWED), Run::Tb("ToolEnd"), false),
     on("PostToolUse", Some("Edit|Write|MultiEdit"), Run::Tb("EditDone"), true),
     on("PostToolUse", Some("AskUserQuestion"), Run::Tb("AskUserDone"), true),
-    on("PostToolUseFailure", Some("Bash|Agent|Task"), Run::Tb("ToolEnd"), false),
+    on("PostToolUseFailure", Some(WINDOWED), Run::Tb("ToolEnd"), false),
     on("PostToolUseFailure", Some("AskUserQuestion"), Run::Tb("AskUserDone"), true),
     Entry { timeout: None, ..on("SessionEnd", None, Run::Tb("SessionEnd"), false) },
     on("Notification", Some("permission_prompt|idle_prompt"), Run::Tb("Notification"), true),
 ];
+
+/// Windows also reports a PowerShell call's git commands (`tb hook PostToolUse` keeps only a commit or a
+/// push). No `if` narrows it, as `Bash(git *)` does Bash's: it runs in the background, and the hook
+/// looks at the command itself.
+const WINDOWS_ENTRIES: &[Entry] = if cfg!(windows) { &[on("PostToolUse", Some("PowerShell"), Run::Tb("PostToolUse"), true)] } else { &[] };
+
+/// Every entry this app writes, in order.
+fn entries() -> impl Iterator<Item = &'static Entry> {
+    ENTRIES.iter().chain(WINDOWS_ENTRIES)
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Hooks {
@@ -251,7 +268,7 @@ fn with(settings: &Value, t: &Target) -> Value {
         v = json!({});
     }
     let hooks = v.as_object_mut().unwrap().entry("hooks").or_insert_with(|| json!({}));
-    for e in ENTRIES {
+    for e in entries() {
         let arr = hooks.as_object_mut().unwrap().entry(e.event.to_string()).or_insert_with(|| json!([]));
         if let Some(a) = arr.as_array_mut() {
             a.push(entry(e, t));
@@ -272,13 +289,13 @@ fn state(settings: &Value, t: &Target) -> State {
     if have.is_empty() {
         return State::None;
     }
-    let want: Vec<(String, Value)> = ENTRIES.iter().map(|e| (e.event.to_string(), entry(e, t))).collect();
+    let want: Vec<(String, Value)> = entries().map(|e| (e.event.to_string(), entry(e, t))).collect();
     if have.len() == want.len() && want.iter().all(|w| have.contains(w)) {
         return State::Current;
     }
-    let commands: Vec<String> = ENTRIES.iter().map(|e| command(e.run, t)).collect();
+    let commands: Vec<String> = entries().map(|e| command(e.run, t)).collect();
     let elsewhere = have.iter().flat_map(|(_, e)| e["hooks"].as_array().cloned().unwrap_or_default()).filter(is_ours).any(|h| !commands.iter().any(|c| h["command"] == json!(c)));
-    let mut missing: Vec<&str> = ENTRIES.iter().map(|e| e.event).filter(|ev| !have.iter().any(|(h, _)| h == ev)).collect();
+    let mut missing: Vec<&str> = entries().map(|e| e.event).filter(|ev| !have.iter().any(|(h, _)| h == ev)).collect();
     missing.dedup();
     State::Stale(if elsewhere {
         "Its hooks run another copy of tb, not this app's.".to_string()
@@ -539,6 +556,19 @@ mod tests {
         assert_eq!(command(Run::Tb("Stop"), &t), format!("[ -x '{CLI}' ] && exec '{CLI}' hook Stop || true"));
         assert!(is_ours(&json!({"command": command(Run::Tb("Stop"), &t)})));
         assert!(is_ours(&json!({"command": command(Run::WaitHint, &t)})));
+    }
+
+    #[cfg(windows)]
+    #[::core::prelude::v1::test]
+    fn windows_hooks_watch_the_powershell_tool() {
+        let t = app(APP);
+        let v = with(&json!({}), &t);
+        assert!(v["hooks"]["PreToolUse"][0]["matcher"].as_str().unwrap().split('|').any(|m| m == "PowerShell"));
+        let post = v["hooks"]["PostToolUse"].as_array().unwrap();
+        let runs = |e: &Value, arg: &str| e["hooks"][0]["command"].as_str().is_some_and(|c| c.ends_with(&format!("hook {arg} || true")));
+        assert!(post.iter().any(|e| e["matcher"] == "Bash|PowerShell|Agent|Task" && runs(e, "ToolEnd")));
+        assert!(post.iter().any(|e| e["matcher"] == "PowerShell" && runs(e, "PostToolUse") && e["hooks"][0].get("if").is_none() && e["hooks"][0]["async"] == true));
+        assert!(matches!(state(&v, &t), State::Current));
     }
 
     #[::core::prelude::v1::test]

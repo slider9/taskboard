@@ -346,7 +346,9 @@ mod tests {
         assert!(log(&app, id).contains(&"Started in the UI".to_string()), "{:?}", log(&app, id));
     }
 
-    /// Serves `app`'s router on an app socket in `dir`, as `serve` does.
+    /// Serves `app`'s router on an app socket in `dir`, as `serve` does (Unix only: there's no app
+    /// socket on Windows).
+    #[cfg(unix)]
     async fn on_socket(app: &Arc<App>, dir: &std::path::Path) -> std::path::PathBuf {
         let path = dir.join(crate::apporigin::SOCKET);
         let unix = crate::apporigin::bind(&path).unwrap();
@@ -355,6 +357,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     async fn post_socket(sock: &std::path::Path, path: &str, headers: &[(&'static str, String)]) -> (u16, Value) {
         let (sock, path, headers) = (sock.to_path_buf(), path.to_string(), headers.to_vec());
         tokio::task::spawn_blocking(move || {
@@ -405,6 +408,7 @@ mod tests {
     }
 
     /// An unsigned (dev) board on its socket still goes by the token.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn an_unsigned_board_takes_the_token_on_its_socket() {
         let (_r, app, id, dir) = board_with_task();

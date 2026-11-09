@@ -17,7 +17,12 @@ const NEUTRAL_PREFIXES: &[&str] = &["<command-name>", "<command-message>", "<loc
 const SLASH_PREFIXES: &[&str] = &["<command-name>", "<command-message>"];
 const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 /// Tools that can change files the transcript doesn't name: a shell command, or a subagent.
-const SHELL_TOOLS: &[&str] = &["Bash"];
+const SHELL_TOOLS: &[&str] = &["Bash", "PowerShell"];
+
+/// Whether `tool` runs a shell command: Bash, or the PowerShell tool Claude Code has on Windows.
+pub fn is_shell(tool: &str) -> bool {
+    SHELL_TOOLS.contains(&tool)
+}
 const SUBAGENT_TOOLS: &[&str] = &["Task", "Agent"];
 const TAIL_BYTES: u64 = 2 * 1024 * 1024;
 pub const CLAUDE_STOPS_BACKGROUND_AFTER: f64 = 2.0 * 3600.0;

@@ -194,7 +194,7 @@ fn top_category(spans: &[&Span]) -> String {
 /// (or the last one), within one conversation.
 fn rerun_chains(spans: &[&Span]) -> Vec<Value> {
     let mut runs: BTreeMap<(&str, &str), Vec<&Span>> = BTreeMap::new();
-    for s in spans.iter().filter(|s| s.tool == "Bash" && !s.background) {
+    for s in spans.iter().filter(|s| crate::transcript::is_shell(&s.tool) && !s.background) {
         runs.entry((s.claude_id.as_str(), s.fingerprint.as_str())).or_default().push(s);
     }
     let mut chains = vec![];
@@ -299,7 +299,7 @@ pub fn report(app: &App, start: f64, end: f64) -> Result<Value> {
         .collect();
 
     let mut cmds: HashMap<&str, Vec<&Span>> = HashMap::new();
-    for s in counted.iter().filter(|s| s.tool == "Bash" && !s.background && !WAITS.contains(&s.category.as_str())) {
+    for s in counted.iter().filter(|s| crate::transcript::is_shell(&s.tool) && !s.background && !WAITS.contains(&s.category.as_str())) {
         cmds.entry(s.fingerprint.as_str()).or_default().push(s);
     }
     let mut repeated: Vec<Value> = cmds

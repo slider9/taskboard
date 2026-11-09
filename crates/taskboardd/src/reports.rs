@@ -1149,7 +1149,7 @@ fn window_key(tool: &str) -> &'static str {
 }
 
 /// The calls the hook opens a window for.
-const WINDOW_TOOLS: &[&str] = &["Bash", "Agent", "Task"];
+const WINDOW_TOOLS: &[&str] = &["Bash", "PowerShell", "Agent", "Task"];
 
 /// Adds what changed in the checkout between a call's two stamps to the turn's windows, under `key`.
 fn window_changes(windows: &mut Value, key: &str, before: &Value, after: &Value) {

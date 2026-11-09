@@ -105,9 +105,33 @@ fn fill_vars(text: &str, dir: &Path, home: &str) -> String {
         .replace_all(text, |c: &regex::Captures| match &c[1] {
             "TASKBOARD_DATA" => dir.to_string_lossy().to_string(),
             "HOME" if !home.is_empty() => home.to_string(),
-            name => std::env::var(name).ok().filter(|v| v.starts_with('/')).unwrap_or_else(|| c[0].to_string()),
+            name => std::env::var(name).ok().filter(|v| Path::new(v).is_absolute()).unwrap_or_else(|| c[0].to_string()),
         })
         .into_owned()
+}
+
+/// PowerShell's `$env:NAME`.
+static PS_ENV_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?i)\$env:([A-Za-z_][A-Za-z0-9_]*)").unwrap());
+
+/// A PowerShell command as the Bash reading here takes it: `$env:NAME` as `${NAME}`, the backtick
+/// escape taken out (`` `$ `` is a plain `$`), and `\`, a plain character in PowerShell, as the folder
+/// separator it is in a path.
+fn powershell_as_posix(cmd: &str) -> String {
+    let vars = PS_ENV_RE.replace_all(cmd, |c: &regex::Captures| format!("${{{}}}", &c[1]));
+    let mut out = String::new();
+    let mut chars = vars.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => match chars.next() {
+                Some('$') => out.push_str("\\$"),
+                Some(n) => out.push(n),
+                None => {}
+            },
+            '\\' => out.push('/'),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The call's text as a shell would read it: quotes and backslashes gone (`ta''sk` is `task`),
@@ -184,18 +208,21 @@ fn has_glob(s: &str) -> bool {
 }
 
 /// `p` made absolute (from `cwd`), `.` and `..` worked out, and symlinks resolved as far as the path
-/// exists (`/tmp` is `/private/tmp`). Lowercase: macOS folders ignore case.
+/// exists (`/tmp` is `/private/tmp`). Lowercase: macOS and Windows folders ignore case.
 fn resolve(p: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     let p = Path::new(p);
-    let abs = if p.is_absolute() { p.to_path_buf() } else { cwd?.join(p) };
-    let mut clean = PathBuf::from("/");
+    // On Windows `/x` isn't absolute, but it's placed all the same: on the working folder's drive.
+    let abs = if p.has_root() { p.to_path_buf() } else { cwd?.join(p) };
+    let mut clean = PathBuf::new();
     for c in abs.components() {
         match c {
+            // The root, and on Windows the drive before it.
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => clean.push(c.as_os_str()),
             std::path::Component::ParentDir => {
                 clean.pop();
             }
             std::path::Component::Normal(n) => clean.push(n),
-            _ => {}
+            std::path::Component::CurDir => {}
         }
     }
     let mut rest = vec![];
@@ -423,9 +450,13 @@ fn words_reach(words: &[String], dir: &Path, private: &Path, cwd: Option<&Path>)
 
 /// Whether `text` names the token's folder: [`DIR`] as a whole path segment, however it's quoted.
 fn names_dir(text: &str, dir: &Path) -> bool {
-    let text = as_shell_reads(text, dir).to_lowercase();
-    let part = |c: char| c.is_alphanumeric() || "_-.".contains(c);
-    text.match_indices(DIR).any(|(at, _)| !text[..at].chars().next_back().is_some_and(part) && !text[at + DIR.len()..].chars().next().is_some_and(part))
+    let named = |text: &str| {
+        let text = as_shell_reads(text, dir).to_lowercase();
+        let part = |c: char| c.is_alphanumeric() || "_-.".contains(c);
+        text.match_indices(DIR).any(|(at, _)| !text[..at].chars().next_back().is_some_and(part) && !text[at + DIR.len()..].chars().next().is_some_and(part))
+    };
+    // On Windows a `\` is as likely a folder separator (`C:\…\.app-only`) as the shell's escape.
+    named(text) || (cfg!(windows) && named(&text.replace('\\', "/")))
 }
 
 /// Whether an agent's tool call (`tool`, `input`, run in `cwd`) reaches the token's folder ([`DIR`] in
@@ -461,12 +492,13 @@ pub fn tool_reaches(tool: &str, input: &serde_json::Value, dir: &Path, cwd: Opti
     }
     let commands = match tool {
         "Bash" => Script::parse(input["command"].as_str().unwrap_or("")).commands,
+        "PowerShell" => Script::parse(&powershell_as_posix(input["command"].as_str().unwrap_or(""))).commands,
         "Read" | "Grep" | "Glob" | "LS" => {
             // The path read or searched (Glob's pattern below it); Grep and Glob with none search the
             // working folder.
             let path = ["file_path", "path"].iter().find_map(|k| input[*k].as_str()).unwrap_or("");
             let word = match input["pattern"].as_str().filter(|_| tool == "Glob") {
-                Some(p) if p.starts_with('/') || path.is_empty() => p.to_string(),
+                Some(p) if Path::new(p).has_root() || path.is_empty() => p.to_string(),
                 Some(p) => format!("{path}/{p}"),
                 None if path.is_empty() => ".".to_string(),
                 None => path.to_string(),
@@ -483,8 +515,11 @@ pub fn tool_reaches(tool: &str, input: &serde_json::Value, dir: &Path, cwd: Opti
             return true;
         }
         // A `cd` moves where the next commands' relative paths start (`cd x && cat ../y`). One the hook
-        // can't follow (`cd $X`, `cd -`) leaves it where it was.
-        if let Some(("cd", args)) = command_word(cmd) {
+        // can't follow (`cd $X`, `cd -`) leaves it where it was. PowerShell's has other names too.
+        let moves = |name: &str| {
+            name == "cd" || (tool == "PowerShell" && matches!(name.to_ascii_lowercase().as_str(), "cd" | "chdir" | "sl" | "set-location" | "pushd" | "push-location"))
+        };
+        if let Some((_, args)) = command_word(cmd).filter(|(name, _)| moves(name)) {
             let to = match args.iter().find(|a| !a.starts_with('-') || a.as_str() == "-") {
                 Some(a) => Some(shell_word(a, dir)).filter(|a| !RUNTIME_RE.is_match(a) && !has_glob(a) && a != "-").map(|a| literal(&a)),
                 None => dirs::home_dir().map(|h| h.to_string_lossy().to_string()),
@@ -633,6 +668,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinks_tmp_and_a_working_folder_inside_are_followed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -673,6 +709,52 @@ mod tests {
     }
 
     #[test]
+    fn a_powershell_call_into_the_tokens_folder_is_caught() {
+        let home = dirs::home_dir().unwrap();
+        let dir = home.join(".config").join("taskboard");
+        let d = dir.display().to_string();
+        let ps = |c: &str| tool_reaches("PowerShell", &json!({"command": c}), &dir, Some(&home));
+        for yes in [
+            format!("Get-Content ~/.config/taskboard/{DIR}/{FILE}"),
+            format!("Get-Content $HOME/.config/taskboard/{DIR}/{FILE}"),
+            format!("Get-Content \"{d}/{DIR}/{FILE}\""),
+            format!("Get-ChildItem -Force ~/.config/taskboard/{DIR}"),
+            "Set-Location ~/.config/taskboard; Get-Content .*/*".into(),
+            "cd ~/.config/taskboard; gc .*/*".into(),
+        ] {
+            assert!(ps(&yes), "{yes}");
+        }
+        for no in ["Get-Content ~/.config/taskboard/config.toml", "Get-ChildItem -Force ~/.config/taskboard", "git status; git commit -m `\"x`\""] {
+            assert!(!ps(no), "{no}");
+        }
+    }
+
+    /// Windows spells paths with `\`: in PowerShell, where it's a plain character, in a file tool's
+    /// path, and quoted in Git Bash.
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_into_the_tokens_folder_are_caught() {
+        let home = dirs::home_dir().unwrap();
+        let dir = home.join(".config").join("taskboard");
+        let d = dir.display().to_string();
+        let ps = |c: &str| tool_reaches("PowerShell", &json!({"command": c}), &dir, Some(&home));
+        for yes in [
+            format!("Get-Content {d}\\{DIR}\\{FILE}"),
+            format!("Get-Content '{d}\\{DIR}\\{FILE}'"),
+            format!("Get-Content $env:USERPROFILE\\.config\\taskboard\\{DIR}\\{FILE}"),
+            format!("Get-Content ~\\.config\\taskboard\\{DIR}\\{FILE}"),
+            "Set-Location $env:USERPROFILE\\.config\\taskboard; Get-Content .*\\*".into(),
+        ] {
+            assert!(ps(&yes), "{yes}");
+        }
+        assert!(tool_reaches("Read", &json!({"file_path": format!("{d}\\{DIR}\\{FILE}")}), &dir, Some(&home)));
+        assert!(tool_reaches("Bash", &json!({"command": format!("cat '{d}\\{DIR}\\{FILE}'")}), &dir, Some(&home)));
+        for no in [format!("Get-Content {d}\\config.toml"), "Get-ChildItem $env:USERPROFILE\\.config\\taskboard".into()] {
+            assert!(!ps(&no), "{no}");
+        }
+    }
+
+    #[test]
     fn globs_match_like_the_shell() {
         for (pat, name) in [("ab-*", "ab-cd"), ("a?-c[d]", "ab-cd"), ("ab-{x,cd}", "ab-cd"), ("[!x]b-*", "ab-cd"), ("*", "x"), (".*", ".x"), (".[a]b", ".ab")] {
             assert!(glob_matches(pat, name), "{pat} {name}");
@@ -693,9 +775,12 @@ mod tests {
         write(&p, &a).unwrap();
         write(&p, &b).unwrap();
         assert_eq!(read(&p).as_deref(), Some(b.as_str()));
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(std::fs::metadata(p.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(p.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        }
     }
 
     #[test]

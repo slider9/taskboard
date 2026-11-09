@@ -8544,6 +8544,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
+    // Its fake midna is a shell script.
+    #[cfg(unix)]
     #[test]
     fn tb_question_under_test_never_runs_midna() {
         // tb question alerts only through the Ctx's midna, whatever MIDNA_SESSION the test inherited, and test

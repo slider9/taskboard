@@ -478,14 +478,20 @@ fn note(app: &App, t: &Row, key: &str, text: Option<&str>) -> Result<()> {
     })
 }
 
-/// `…/.claude/worktrees/<name>` for a path inside a worktree, else None.
+/// `…/.claude/worktrees/<name>` for a path inside a worktree, else None. On Windows the path's
+/// separators can be `\` (`D:\repo\.claude\worktrees\slot-3`), and the answer keeps them.
 pub fn root_of(path: Option<&str>) -> Option<String> {
     let p = path?;
-    let i = p.find(WORKTREES)?;
+    // Same length: each `\` is one byte, like the `/` it stands for here.
+    let flat = if cfg!(windows) { p.replace('\\', "/") } else { p.to_string() };
+    let i = flat.find(WORKTREES)?;
     let rest = &p[i + WORKTREES.len()..];
-    let name = rest.split('/').next().filter(|n| !n.is_empty())?;
+    let name = rest.split(SEPARATORS).next().filter(|n| !n.is_empty())?;
     Some(format!("{}{name}", &p[..i + WORKTREES.len()]))
 }
+
+/// What separates a path's folders: `/`, and on Windows `\` too.
+pub const SEPARATORS: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
 
 /// Another open task whose worktree this path is in (its PR still open, if it's done).
 pub fn owner(app: &App, path: &str, t: &Row) -> Result<Option<Row>> {

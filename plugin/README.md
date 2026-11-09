@@ -82,7 +82,8 @@ On Windows, agents often run commands in the PowerShell tool, which can't run th
 so the app keeps a copy of its `tb.exe` at `~/.local/bin/tb.exe` (a symlink would need Developer Mode)
 and refreshes it each time it starts; `~/.local/bin` has to be on the PATH, as Claude Code's own
 installer leaves it. A permission rule that allows `tb` has to cover the PowerShell tool as well as
-Bash.
+Bash. For the same reason the hooks the app installs on Windows also watch the PowerShell tool: its
+calls get the same guards (the app token's included), windows and git reports as Bash's.
 
 If no binary is found, `tb hook …` and `tb statusline` exit 0 silently, so a missing binary never
 breaks Claude Code. Any other command prints a one-line error and exits 1.

@@ -137,7 +137,7 @@ pub fn describe(app: &App, name: &str) -> Result<Value> {
 /// Is this path in a pool slot (`…/.claude/worktrees/slot-<n>`)?
 pub fn is_slot(path: &str) -> bool {
     crate::worktrees::root_of(Some(path))
-        .and_then(|r| r.rsplit('/').next().and_then(|n| n.strip_prefix("slot-")).map(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+        .and_then(|r| r.rsplit(crate::worktrees::SEPARATORS).next().and_then(|n| n.strip_prefix("slot-")).map(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
         .unwrap_or(false)
 }
 
@@ -896,6 +896,21 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use std::sync::mpsc;
+
+    #[test]
+    fn a_slot_is_known_by_its_folder() {
+        assert!(is_slot("/w/b/.claude/worktrees/slot-3"));
+        assert!(is_slot("/w/b/.claude/worktrees/slot-3/src/x.rs"));
+        assert!(!is_slot("/w/b/.claude/worktrees/t9"));
+        assert!(!is_slot("/w/b/.claude/worktrees/slot-x"));
+        assert!(!is_slot("/w/b/src"));
+        // Windows writes the same folders with `\`.
+        assert_eq!(is_slot(r"D:\w\b\.claude\worktrees\slot-3\src"), cfg!(windows));
+        assert_eq!(crate::worktrees::root_of(Some(r"D:\w\b\.claude\worktrees\slot-3\src")).is_some(), cfg!(windows));
+        if cfg!(windows) {
+            assert_eq!(crate::worktrees::root_of(Some(r"D:\w\b\.claude\worktrees\slot-3\src")).as_deref(), Some(r"D:\w\b\.claude\worktrees\slot-3"));
+        }
+    }
 
     #[test]
     fn a_claim_inside_a_transaction_waits_for_the_next_try_while_another_claim_runs() {

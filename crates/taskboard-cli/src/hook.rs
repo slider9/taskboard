@@ -15,6 +15,7 @@ use taskboardd::comments;
 use taskboardd::config::Config;
 use taskboardd::hunks::{self, Hunk, Marks};
 use taskboardd::steps::{from_listing, Before, Step};
+use taskboardd::transcript::is_shell;
 
 const CONTEXT_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit"];
 const WAITING_NOTIFICATIONS: &[&str] = &["permission_prompt", "idle_prompt"];
@@ -39,7 +40,7 @@ static GITLAB_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bglab\s+mr\s+create\b
 static PR_TOOL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^mcp__.*(?:create_?pull_?request|create_pr$|pull_?request_?create)").unwrap());
 
 fn opens_pr(tool: &str, input: &Value) -> bool {
-    if tool != "Bash" {
+    if !is_shell(tool) {
         return PR_TOOL_RE.is_match(tool);
     }
     let cmd = input["command"].as_str().unwrap_or("");
@@ -56,7 +57,8 @@ static GIT_WORK_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\bgit\b(?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+(?:commit|push|worktree\s+add|checkout|switch|merge|rebase|reset|cherry-pick|revert)\b").unwrap()
 });
 static GIT_DIR_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s-C\s+(\S+)").unwrap());
-static CD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?:^|&&|;|\|\||\()\s*(?:cd|pushd)\s+([^\s;&|)]+)").unwrap());
+/// A `cd` or `pushd`, or PowerShell's `Set-Location` and `Push-Location`, and the folder it names.
+static CD_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?:^|&&|;|\|\||\()\s*(?:cd|pushd|(?i:set-location|push-location))\s+([^\s;&|)]+)").unwrap());
 
 /// Where a tool call changes a repository: the file an edit names; for a git command that changes
 /// one (`GIT_WORK_RE`) or a PR opening, the folder it runs in (`git -C <dir>`, else the last `cd <dir>`
@@ -65,7 +67,7 @@ fn work_place(tool: &str, input: &Value, cwd: &str) -> Option<PathBuf> {
     if EDIT_TOOLS.contains(&tool) {
         return input["file_path"].as_str().or(input["notebook_path"].as_str()).filter(|f| !f.is_empty()).map(|f| path_at(f, cwd));
     }
-    if tool != "Bash" {
+    if !is_shell(tool) {
         return None;
     }
     let cmd = input["command"].as_str().unwrap_or("");
@@ -80,8 +82,10 @@ fn work_place(tool: &str, input: &Value, cwd: &str) -> Option<PathBuf> {
 /// A path as a command or tool names it (quoted, `~/…`, relative to `cwd`), made absolute.
 fn path_at(p: &str, cwd: &str) -> PathBuf {
     let p = p.trim_matches(['"', '\'']);
-    let p = match (p.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
+    // `~\…` too: PowerShell's.
+    let home = std::env::var("HOME").ok().or_else(|| cfg!(windows).then(|| taskboardd::util::expand_home("~").to_string_lossy().into_owned()));
+    let p = match (p.strip_prefix("~/").or_else(|| p.strip_prefix("~\\").filter(|_| cfg!(windows))), home) {
+        (Some(rest), Some(home)) => format!("{home}/{rest}"),
         _ => p.to_string(),
     };
     let p = Path::new(&p);
@@ -788,7 +792,7 @@ fn works_in(v: &Value, top: &Path) -> bool {
 /// works in that slot now counts (a stopped rebase or merge there isn't held up by a record left from
 /// before). No other task's edits, no board: carry on.
 fn shared_checkout_refused(payload: &Value, session: &str, cfg: &Config, cwd: &str) -> bool {
-    if payload["tool_name"] != "Bash" {
+    if !is_shell(payload["tool_name"].as_str().unwrap_or("")) {
         return false;
     }
     let cmd = payload["tool_input"]["command"].as_str().unwrap_or("");
@@ -851,7 +855,7 @@ fn branch_move(cmd: &str, cwd: &str) -> Option<(String, PathBuf)> {
 /// while another terminal works there, on a task or not: the branch would move under it, and its next
 /// commit would land on a branch it never chose. A worktree slot has one terminal; no board: carry on.
 fn shared_branch_refused(payload: &Value, session: &str, cfg: &Config, cwd: &str) -> bool {
-    if payload["tool_name"] != "Bash" {
+    if !is_shell(payload["tool_name"].as_str().unwrap_or("")) {
         return false;
     }
     let cmd = payload["tool_input"]["command"].as_str().unwrap_or("");
@@ -943,7 +947,7 @@ fn stray_worktree(tool: &str, input: &Value, cwd: &str, own: Option<&str>) -> Op
         taskboardd::slots::is_slot(&p.to_string_lossy()) || own.filter(|o| !o.is_empty()).is_some_and(|o| p.starts_with(resolved(Path::new(o))))
     };
     match tool {
-        "Bash" => {
+        "Bash" | "PowerShell" => {
             let cmd = input["command"].as_str().unwrap_or("");
             WORKTREE_ADD_RE.captures_iter(cmd).find_map(|c| {
                 let m = c.get(0)?;
@@ -1133,7 +1137,7 @@ fn onto_default(cmd: &str, cwd: &str, remote: &str) -> Option<(&'static str, Pat
 
 /// The branch a PR being opened goes into, when the command or tool names one (`origin/` dropped).
 fn opened_into(tool: &str, input: &Value) -> Option<String> {
-    let b = if tool == "Bash" {
+    let b = if is_shell(tool) {
         PR_BASE_RE.captures(input["command"].as_str().unwrap_or(""))?.get(1)?.as_str().to_string()
     } else {
         input["base"].as_str()?.trim().to_string()
@@ -1144,7 +1148,7 @@ fn opened_into(tool: &str, input: &Value) -> Option<String> {
 /// `PreToolUse`: with `[default_branch] guard` on (the default), refuses a commit on a repository's
 /// default branch and a push that lands on it, so work gets there through PRs. Read locally, no board needed.
 fn default_branch_refused(payload: &Value, cfg: &Config, cwd: &str) -> bool {
-    if !cfg.default_branch.guard || payload["tool_name"] != "Bash" {
+    if !cfg.default_branch.guard || !is_shell(payload["tool_name"].as_str().unwrap_or("")) {
         return false;
     }
     let cmd = payload["tool_input"]["command"].as_str().unwrap_or("");
@@ -1210,7 +1214,7 @@ fn pre_tool_use(payload: &Value, session: &str) -> bool {
         return true;
     }
     let opening = opens_pr(tool, &payload["tool_input"]);
-    let pushing = tool == "Bash" && PUSH_RE.is_match(payload["tool_input"]["command"].as_str().unwrap_or(""));
+    let pushing = is_shell(tool) && PUSH_RE.is_match(payload["tool_input"]["command"].as_str().unwrap_or(""));
     if !opening && !pushing {
         return false;
     }
@@ -1270,7 +1274,7 @@ const EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 const SUBAGENT_TOOLS: &[&str] = &["Agent", "Task"];
 /// Tool calls that can change files without naming them: the board stamps the checkout around each
 /// one, so a no-task Stop counts only what changed while the agent's own calls ran.
-const WINDOW_TOOLS: &[&str] = &["Bash", "Agent", "Task"];
+const WINDOW_TOOLS: &[&str] = &["Bash", "PowerShell", "Agent", "Task"];
 
 /// The id Claude gives a tool call, which its PreToolUse and PostToolUse both carry; failing that, one
 /// made from the call itself, which the board can match to the transcript's copy of the call.
@@ -1339,7 +1343,7 @@ fn deny(reason: &str) {
 /// `read` or an interactive prompt meets the end of its input and fails at once instead of waiting
 /// for typing that never comes, which holds the turn (and its task) open for good. Heredocs and pipes
 /// in the command still feed what they name. Only the input changes: Claude Code still asks for the
-/// call as it would have.
+/// call as it would have. Not PowerShell's: the group is Bash's syntax.
 fn close_stdin(payload: &Value) {
     if payload["tool_name"] != "Bash" {
         return;
@@ -1583,7 +1587,7 @@ pub fn run(event_arg: Option<&str>) -> i32 {
     let mut extra = serde_json::Map::new();
     match hook.as_str() {
         "PostToolUse" => {
-            if payload["tool_name"] != "Bash" {
+            if !is_shell(payload["tool_name"].as_str().unwrap_or("")) {
                 return 0;
             }
             let command = payload["tool_input"]["command"].as_str().unwrap_or("");
@@ -2104,6 +2108,19 @@ mod tests {
     }
 
     #[test]
+    fn powershell_calls_are_read_like_bash_ones() {
+        let ps = |c: &str| json!({"command": c});
+        assert!(opens_pr("PowerShell", &ps("gh pr create --fill")));
+        assert_eq!(opened_into("PowerShell", &ps("gh pr create --base release/1.x")).as_deref(), Some("release/1.x"));
+        assert_eq!(work_place("PowerShell", &ps("git commit -m x"), "/w/a"), Some(PathBuf::from("/w/a")));
+        assert_eq!(work_place("PowerShell", &ps("Set-Location /w/b; git commit -m x"), "/w/a"), Some(PathBuf::from("/w/b")));
+        assert_eq!(work_place("PowerShell", &ps("Push-Location /w/b; git switch main"), "/w/a"), Some(PathBuf::from("/w/b")));
+        assert_eq!(work_place("PowerShell", &ps("git status; Get-ChildItem"), "/w/a"), None, "reading changes nothing");
+        assert!(stray_worktree("PowerShell", &ps("git worktree add ../b-t9"), "/w/b", None).is_some());
+        assert!(WINDOW_TOOLS.contains(&"PowerShell"), "its calls get windows too");
+    }
+
+    #[test]
     fn a_pr_being_opened_names_its_base() {
         let bash = |c: &str| opened_into("Bash", &json!({"command": c}));
         assert_eq!(bash("gh pr create --base release/1.x --title x").as_deref(), Some("release/1.x"));
@@ -2545,7 +2562,8 @@ mod tests {
 
     #[test]
     fn worktrees_outside_the_slot_pool_are_caught() {
-        let bash = |c: &str| stray_worktree("Bash", &json!({"command": c}), "/w/b", None);
+        // The folder as this OS writes it: `\w\b-fix` on Windows.
+        let bash = |c: &str| stray_worktree("Bash", &json!({"command": c}), "/w/b", None).map(|s| s.replace('\\', "/"));
         assert_eq!(bash("git worktree add ../b-fix -b fix").as_deref(), Some("git worktree add /w/b-fix"));
         assert_eq!(bash("cd /w/a && git worktree add -b fix --lock --reason why /w/a-fix main").as_deref(), Some("git worktree add /w/a-fix"));
         assert!(bash("git -C /w/b worktree add .claude/worktrees/t9").is_some());
@@ -2820,7 +2838,8 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+// File modes: Unix only.
+#[cfg(all(test, unix))]
 mod private_status_tests {
     use std::os::unix::fs::PermissionsExt;
 

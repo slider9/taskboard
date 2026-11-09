@@ -77,7 +77,7 @@ static SPACES: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 
 /// The category the owner's rules, then the built-in ones, give a call.
 pub fn category(rules: &[Rule], tool: &str, command: &str) -> String {
-    let text = if tool == "Bash" { command.to_string() } else { format!("{tool} {command}") };
+    let text = if crate::transcript::is_shell(tool) { command.to_string() } else { format!("{tool} {command}") };
     for r in rules {
         if Regex::new(&r.pattern).is_ok_and(|re| re.is_match(&text)) {
             return r.category.clone();

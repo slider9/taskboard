@@ -175,6 +175,8 @@ mod tests {
         assert_eq!(who_listens("127.0.0.1", port), Listener::Other("another task board (the old one?)".into()));
     }
 
+    // Shell-script tbs and `:` between PATH entries: the Unix layout.
+    #[cfg(unix)]
     #[test]
     fn finds_a_foreign_tb_first_on_the_path() {
         use std::os::unix::fs::PermissionsExt;
