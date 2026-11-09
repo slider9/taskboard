@@ -42,6 +42,13 @@ aho-corasick = "1"
 security-framework = "3"
 core-foundation = "0.10"
 
+[target.'cfg(windows)'.dependencies]
+# midna.rs: Midna's socket on Windows 10 1803+ is an AF_UNIX socket at a path, as on macOS (Midna's own
+# Windows build uses the same crate).
+uds_windows = "1.2"
+# proc.rs: a command's process tree as a job object. slot_ageing.rs: free disk.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

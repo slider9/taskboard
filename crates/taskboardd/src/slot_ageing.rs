@@ -16,6 +16,7 @@ const DAY: f64 = 86_400.0;
 const GB: f64 = 1_073_741_824.0;
 
 /// Free disk in GB where `path` is.
+#[cfg(unix)]
 fn free_gb(path: &str) -> Option<f64> {
     let c = std::ffi::CString::new(path).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -23,6 +24,18 @@ fn free_gb(path: &str) -> Option<f64> {
         return None;
     }
     Some(st.f_bavail as f64 * st.f_frsize as f64 / GB)
+}
+
+/// Free disk in GB where `path` is (what this user may use, as `f_bavail` is on Unix).
+#[cfg(windows)]
+fn free_gb(path: &str) -> Option<f64> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = Path::new(path).as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut avail = 0u64;
+    // SAFETY: a NUL-terminated path, and out-pointers that live through the call (the two unwanted
+    // totals are null, which the call allows).
+    let ok = unsafe { windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, std::ptr::null_mut(), std::ptr::null_mut()) };
+    (ok != 0).then(|| avail as f64 / GB)
 }
 
 /// Is no task holding this slot: never taken, its task gone, or done with its terminal closed?

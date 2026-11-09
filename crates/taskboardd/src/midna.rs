@@ -135,7 +135,12 @@ pub const RPC_CONFLICT: i64 = 4;
 /// can't go through the CLI.
 pub fn rpc(sock: &Path, method: &str, params: &Value, timeout: f64) -> std::result::Result<Value, RpcError> {
     use std::io::{BufRead, BufReader, Write};
-    let mut s = std::os::unix::net::UnixStream::connect(sock).map_err(|e| RpcError::Down(format!("Midna isn't running ({}: {e})", sock.display())))?;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixStream;
+    // Windows 10 1803+ AF_UNIX, as Midna's Windows build listens on.
+    #[cfg(windows)]
+    use uds_windows::UnixStream;
+    let mut s = UnixStream::connect(sock).map_err(|e| RpcError::Down(format!("Midna isn't running ({}: {e})", sock.display())))?;
     let t = Some(Duration::from_secs_f64(timeout));
     let refused = |m: String| RpcError::Refused { code: 0, message: m };
     let _ = s.set_read_timeout(t);

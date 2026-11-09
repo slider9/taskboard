@@ -67,7 +67,7 @@
 //! connected; the later starts the settle window; `active` and `idle_until`: the listener's own hours,
 //! as its last heartbeat that said gave them).
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -1009,8 +1009,7 @@ pub fn listener_loop(app: Arc<App>) {
                 app.info("feed: the listener exited; starting it again");
             }
             let base = app.cfg.url();
-            let spawned = Command::new("/bin/sh")
-                .args(["-c", &cmd])
+            let spawned = crate::proc::shell(&cmd)
                 .env("TASKBOARD_URL", &base)
                 .env("TB_EVENT_URL", format!("{base}/tasks/api/prs/event"))
                 .stdin(Stdio::null())

@@ -2,9 +2,8 @@
 //! waits in code review while the board runs the command in the task's worktree, then carries on.
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -625,8 +624,9 @@ fn tree_of(dir: &str) -> Option<String> {
     tree
 }
 
-/// Runs the reviewer with `sh -c` in its own process group, its stderr passed to `progress` line by
-/// line. Its exit code (`None` when killed) and the end of what it said, or why it couldn't run.
+/// Runs the reviewer in a shell (`proc::shell`) as its own process group (`proc::Group`), its stderr
+/// passed to `progress` line by line. Its exit code (`None` when killed) and the end of what it said,
+/// or why it couldn't run.
 fn run_reviewer(
     cmd: &str,
     dir: &str,
@@ -638,17 +638,10 @@ fn run_reviewer(
     if !Path::new(dir).is_dir() {
         return Err(format!("its worktree {dir} isn't there"));
     }
-    let mut child = Command::new("/bin/sh")
-        .args(["-c", cmd])
-        .current_dir(dir)
-        .envs(env.iter().map(|(k, v)| (k, v)))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("couldn't start the reviewer: {e}"))?;
-    let pgid = child.id() as i32;
+    let mut command = crate::proc::shell(cmd);
+    command.current_dir(dir).envs(env.iter().map(|(k, v)| (k, v))).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = crate::proc::Group::prepare(&mut command).spawn().map_err(|e| format!("couldn't start the reviewer: {e}"))?;
+    let group = crate::proc::Group::of(&child);
     let mut out = child.stdout.take().unwrap();
     let err = child.stderr.take().unwrap();
     let drain = std::thread::spawn(move || {
@@ -676,9 +669,8 @@ fn run_reviewer(
     };
     let end = Instant::now() + timeout;
     let kill = |child: &mut std::process::Child| {
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
-        }
+        group.kill();
+        let _ = child.kill();
         let _ = child.wait();
     };
     let status = loop {
@@ -700,9 +692,7 @@ fn run_reviewer(
         }
     };
     // Anything it left running in its group goes with it.
-    unsafe {
-        libc::kill(-pgid, libc::SIGKILL);
-    }
+    group.kill();
     while let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
         heard(line);
     }

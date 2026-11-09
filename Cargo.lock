@@ -6955,7 +6955,9 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tower",
+ "uds_windows",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

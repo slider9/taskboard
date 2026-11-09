@@ -1747,23 +1747,21 @@ const SEND_TIMEOUT: f64 = 10.0;
 /// spool for it to read later; without (a tool call's window, which the board ignores once late),
 /// it's dropped.
 fn send_later(cfg: &Config, body: &Value, keep: bool) {
-    use std::os::unix::process::CommandExt;
     let start = Instant::now();
     let path = match client::spool_claimed(cfg, body) {
         Ok(p) => p,
         Err(e) => return log_failure(&cfg.data, "spool", &e.to_string(), start.elapsed()),
     };
     let spawned = std::env::current_exe().and_then(|exe| {
-        std::process::Command::new(exe)
-            .args(["hook", "Send"])
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args(["hook", "Send"])
             .arg(&path)
             .args((!keep).then_some("--drop"))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            // Its own group: Claude ending the hook's doesn't end the send.
-            .process_group(0)
-            .spawn()
+            .stderr(std::process::Stdio::null());
+        // Its own group: Claude ending the hook's doesn't end the send.
+        taskboardd::proc::detach(&mut cmd).spawn()
     });
     if let Err(e) = spawned {
         log_failure(&cfg.data, "send", &e.to_string(), start.elapsed());
@@ -1950,7 +1948,7 @@ pub fn statusline(pass: bool) -> i32 {
     let Ok(v) = parsed else { return 0 };
     let sid = v["session_id"].as_str().unwrap_or("").to_string();
     let name = std::env::var("MIDNA_SESSION").ok().filter(|s| !s.is_empty()).unwrap_or(sid);
-    if name.is_empty() || name.contains('/') {
+    if name.is_empty() || name.contains(['/', '\\']) {
         return 0;
     }
     let cfg = client::config();
@@ -1959,14 +1957,25 @@ pub fn statusline(pass: bool) -> i32 {
 }
 
 /// Writes one session's status JSON to `<dir>/<name>.json`. It holds the session's folder, cost and rate
-/// limits, so the folder is kept 0700 and the file 0600.
+/// limits, so the folder is kept 0700 and the file 0600 (on Windows, the user profile's own
+/// permissions, which the data folder inherits).
 fn save_private(dir: &std::path::Path, name: &str, raw: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let mut mkdir = std::fs::DirBuilder::new();
+    mkdir.recursive(true);
+    #[cfg(unix)]
+    mkdir.mode(0o700);
+    mkdir.create(dir)?;
+    #[cfg(unix)]
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     let path = dir.join(format!("{name}.json"));
     let tmp = dir.join(format!("{name}.json.{}.tmp", std::process::id()));
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts.open(&tmp)?;
     f.write_all(raw.as_bytes())?;
     drop(f);
     std::fs::rename(&tmp, &path)

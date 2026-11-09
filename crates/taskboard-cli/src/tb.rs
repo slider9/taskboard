@@ -5510,24 +5510,24 @@ fn aim_cmd(c: &Ctx, a: Aim, clear: bool, t: TaskArg) -> Result<i32, String> {
 /// output's tail.
 fn run_script(c: &Ctx, label: &str, script: &str, vars: &BTreeMap<String, String>, timeout: u64) -> (bool, String) {
     use std::io::{BufRead, BufReader};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use std::time::{Duration, Instant};
     let dir = ["worktree", "repo"]
         .iter()
         .find_map(|k| vars.get(*k).filter(|r| !r.is_empty() && std::path::Path::new(r).is_dir()).cloned())
         .unwrap_or_else(|| c.cwd.clone());
     out(&format!("{label}: {script}"));
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(format!("exec 2>&1\n{script}")).current_dir(&dir).stdin(Stdio::null()).stdout(Stdio::piped());
-    // Its own process group, so a timeout stops everything the script started.
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut cmd = taskboardd::proc::shell(&format!("exec 2>&1\n{script}"));
+    cmd.current_dir(&dir).stdin(Stdio::null()).stdout(Stdio::piped());
     for (k, v) in vars {
         cmd.env(format!("TASKBOARD_{}", k.to_uppercase()), v);
     }
-    let mut child = match cmd.spawn() {
+    // Its own process group, so a timeout stops everything the script started.
+    let mut child = match taskboardd::proc::Group::prepare(&mut cmd).spawn() {
         Ok(ch) => ch,
         Err(e) => return (false, format!("couldn't start it: {e}")),
     };
+    let group = taskboardd::proc::Group::of(&child);
     let stdout = child.stdout.take().expect("piped");
     let reader = std::thread::spawn(move || {
         let mut tail: std::collections::VecDeque<String> = Default::default();
@@ -5546,7 +5546,7 @@ fn run_script(c: &Ctx, label: &str, script: &str, vars: &BTreeMap<String, String
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
             Ok(None) if start.elapsed() > Duration::from_secs(timeout) => {
-                let _ = Command::new("/bin/kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
+                group.kill();
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;

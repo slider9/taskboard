@@ -16,6 +16,9 @@
 //!   so the per-launch token file of `apptoken` counts, as before, unless `[app_origin] token = false`.
 //!   Agents run as the same user and can read that file; the PreToolUse guard
 //!   (`apptoken::tool_reaches`) only catches the plain ways to.
+//!
+//! Windows has no code signature check yet, so there's no app socket either: the app posts to the TCP
+//! port with the token, and `post` here says there's no socket, which the app falls back from.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -110,6 +113,7 @@ pub struct Peer {
     pub audit_token: Option<[u32; 8]>,
 }
 
+#[cfg(unix)]
 impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, tokio::net::UnixListener>> for Peer {
     fn connect_info(stream: axum::serve::IncomingStream<'_, tokio::net::UnixListener>) -> Self {
         use std::os::fd::AsRawFd;
@@ -126,7 +130,7 @@ pub fn peer_audit_token(fd: std::os::fd::RawFd) -> Option<[u32; 8]> {
     (r == 0 && len as usize == std::mem::size_of_val(&token)).then_some(token)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn peer_audit_token(_fd: std::os::fd::RawFd) -> Option<[u32; 8]> {
     None
 }
@@ -143,8 +147,11 @@ pub fn is_app(trust: &Trust, peer: Option<&Peer>, given_token: Option<&str>, tok
 }
 
 // The CS_* status bits of a running process (<kern/cs_blobs.h>).
+#[cfg(target_os = "macos")]
 const CS_VALID: u32 = 0x1;
+#[cfg(target_os = "macos")]
 const CS_RUNTIME: u32 = 0x10000;
+#[cfg(target_os = "macos")]
 const CS_DEBUGGED: u32 = 0x1000_0000;
 
 /// Whether the process with audit token `audit` meets `requirement` (and, with `runtime`, runs with
@@ -255,7 +262,8 @@ mod ffi {
 }
 
 /// Binds the app socket at `path`, replacing a stale one, connectable by this user only. A path
-/// macOS can't bind (over 103 bytes) is an error.
+/// macOS can't bind (over 103 bytes) is an error. Unix only (see the module's note on Windows).
+#[cfg(unix)]
 pub fn bind(path: &Path) -> std::io::Result<tokio::net::UnixListener> {
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     if path.as_os_str().len() > 103 {
@@ -274,7 +282,7 @@ pub fn bind(path: &Path) -> std::io::Result<tokio::net::UnixListener> {
 /// A blocking `POST /tasks/api/<api_path>` over the app socket: (status, body). `Connection: close`,
 /// so the answer is everything up to EOF.
 pub fn post(socket: &Path, api_path: &str, headers: &[(&str, &str)], body: &[u8], timeout: Duration) -> std::io::Result<(u16, Vec<u8>)> {
-    let mut s = std::os::unix::net::UnixStream::connect(socket)?;
+    let mut s = connect(socket)?;
     s.set_read_timeout(Some(timeout))?;
     s.set_write_timeout(Some(timeout))?;
     let mut req = format!("POST /tasks/api/{api_path} HTTP/1.1\r\nHost: taskboard\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n", body.len());
@@ -290,6 +298,17 @@ pub fn post(socket: &Path, api_path: &str, headers: &[(&str, &str)], body: &[u8]
     let mut out = vec![];
     s.read_to_end(&mut out)?;
     parse_response(&out).ok_or_else(|| std::io::Error::other("the board's answer isn't HTTP"))
+}
+
+#[cfg(unix)]
+fn connect(socket: &Path) -> std::io::Result<std::os::unix::net::UnixStream> {
+    std::os::unix::net::UnixStream::connect(socket)
+}
+
+/// Windows has no app socket: NotFound, which sends the app to the port.
+#[cfg(not(unix))]
+fn connect(socket: &Path) -> std::io::Result<std::net::TcpStream> {
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("no app socket on this platform ({})", socket.display())))
 }
 
 /// (status, body) of a whole HTTP/1.1 response.

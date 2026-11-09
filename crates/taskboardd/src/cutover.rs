@@ -76,11 +76,22 @@ pub fn is_our_tb(p: &Path) -> bool {
 
 /// The first `tb` on `path_var` (a PATH value), when it isn't this board's.
 pub fn foreign_tb(path_var: &str) -> Option<PathBuf> {
-    let first = path_var.split(':').filter(|d| !d.is_empty()).map(|d| Path::new(d).join("tb")).find(|p| {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    })?;
+    let tb = format!("tb{}", std::env::consts::EXE_SUFFIX);
+    let first = std::env::split_paths(path_var).filter(|d| !d.as_os_str().is_empty()).map(|d| d.join(&tb)).find(|p| runnable(p))?;
     (!is_our_tb(&first)).then_some(first)
+}
+
+/// An executable file: any execute bit on Unix; on Windows the `.exe` name says so.
+fn runnable(p: &Path) -> bool {
+    let Ok(m) = std::fs::metadata(p) else { return false };
+    #[cfg(unix)]
+    let run = {
+        use std::os::unix::fs::PermissionsExt;
+        m.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let run = true;
+    m.is_file() && run
 }
 
 /// Task-board plugins in Claude Code's `installed_plugins.json` other than this board's

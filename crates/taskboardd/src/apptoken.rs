@@ -40,20 +40,29 @@ pub fn fresh() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// Writes `token` to `path`, readable and writable by this user only (0600, its folder 0700), replacing
-/// what was there.
+/// Writes `token` to `path`, readable and writable by this user only (0600, its folder 0700; on
+/// Windows, the user profile's own permissions, which the data folder inherits), replacing what was
+/// there.
 pub fn write(path: &Path, token: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts.open(&tmp)?;
+    #[cfg(unix)]
     f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     f.write_all(token.as_bytes())?;
     f.sync_all()?;
+    drop(f);
     std::fs::rename(&tmp, path)
 }
 

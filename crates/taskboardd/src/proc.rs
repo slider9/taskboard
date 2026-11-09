@@ -112,6 +112,121 @@ pub fn run_until(
     Ok(Some(Output { code, stdout, stderr }))
 }
 
+/// A command that runs `script` in a shell: `/bin/sh -c` on Unix, Git Bash's `bash -c` on Windows, so
+/// the same POSIX commands in config.toml run on both.
+pub fn shell(script: &str) -> Command {
+    #[cfg(unix)]
+    let mut c = Command::new("/bin/sh");
+    #[cfg(windows)]
+    let mut c = Command::new(git_bash());
+    c.args(["-c", script]);
+    c
+}
+
+/// Git Bash's `bash.exe`, which Claude Code on Windows needs too: `CLAUDE_CODE_GIT_BASH_PATH` (the
+/// variable Claude Code reads), else the one beside the `git.exe` on PATH, else Git's default install.
+#[cfg(windows)]
+pub fn git_bash() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH").map(std::path::PathBuf::from).filter(|p| p.is_file()) {
+        return p;
+    }
+    // `<Git>\cmd\git.exe`, `<Git>\bin\git.exe` or `<Git>\mingw64\bin\git.exe`.
+    if let Some(git) = which("git.exe") {
+        if let Some(b) = git.ancestors().skip(1).take(3).map(|d| d.join("bin").join("bash.exe")).find(|b| b.is_file()) {
+            return b;
+        }
+    }
+    std::path::PathBuf::from(r"C:\Program Files\Git\bin\bash.exe")
+}
+
+/// Starts `cmd` on its own, so whatever ends the caller's group (Claude ending a hook's) doesn't end
+/// it: its own process group on Unix; on Windows its own console process group, with no console.
+pub fn detach(cmd: &mut Command) -> &mut Command {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    cmd
+}
+
+/// A child and whatever it starts, so a timeout or a stop ends them all: on Unix the child leads its
+/// own process group, on Windows it's put in a job object. `prepare` the command, spawn it, then take
+/// the child's `Group`.
+pub struct Group {
+    #[cfg(unix)]
+    pgid: i32,
+    /// Null when the job couldn't be made or the child couldn't join it; `kill` then does nothing,
+    /// so callers kill the child itself as well.
+    #[cfg(windows)]
+    job: windows_sys::Win32::Foundation::HANDLE,
+}
+
+impl Group {
+    pub fn prepare(cmd: &mut Command) -> &mut Command {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        cmd
+    }
+
+    #[cfg(unix)]
+    pub fn of(child: &std::process::Child) -> Group {
+        Group { pgid: child.id() as i32 }
+    }
+
+    /// The child's new job. What the child starts in the moment before it joins isn't in the job.
+    #[cfg(windows)]
+    pub fn of(child: &std::process::Child) -> Group {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        // SAFETY: an unnamed job with default security; the child's handle is open while it's borrowed.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Group { job };
+        }
+        if unsafe { AssignProcessToJobObject(job, child.as_raw_handle()) } == 0 {
+            // SAFETY: the job was just made and nothing else holds it.
+            unsafe { CloseHandle(job) };
+            return Group { job: std::ptr::null_mut() };
+        }
+        Group { job }
+    }
+
+    /// Kills every process in the group, the child too if it's still running.
+    pub fn kill(&self) {
+        // SAFETY: plain syscalls on the group's own pgid / job handle.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-self.pgid, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        if !self.job.is_null() {
+            unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job, 1) };
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Group {
+    fn drop(&mut self) {
+        if !self.job.is_null() {
+            // SAFETY: the group owns its job handle and nothing uses it after this.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.job) };
+        }
+    }
+}
+
 /// Finds a command on PATH (or returns the path as given when it has a slash).
 pub fn which(name: &str) -> Option<std::path::PathBuf> {
     if name.contains('/') {

@@ -140,6 +140,12 @@ fn secret_name(k: &str) -> bool {
     ["TOKEN", "SECRET", "KEY", "PASS", "AUTH", "CREDENTIAL", "COOKIE", "SESSION"].iter().any(|w| k.contains(w))
 }
 
+#[cfg(windows)]
+fn hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default()
+}
+
+#[cfg(unix)]
 fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: the buffer outlives the call and its length is passed with it.

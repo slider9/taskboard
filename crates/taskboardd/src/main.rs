@@ -163,6 +163,8 @@ fn serve(cfg: Config) -> i32 {
         taskboardd::start_threads(&app);
         let router = taskboardd::server::router(app.clone());
         let socket = taskboardd::apporigin::socket_path(&app.cfg);
+        // Windows has no app socket: the app posts to the port with the token (`apporigin`).
+        #[cfg(unix)]
         match taskboardd::apporigin::bind(&socket) {
             Ok(unix) => {
                 let svc = router.clone().into_make_service_with_connect_info::<taskboardd::apporigin::Peer>();
@@ -177,12 +179,7 @@ fn serve(cfg: Config) -> i32 {
         }
         let stop = app.clone();
         let shutdown = async move {
-            // ctrl-c in a terminal, SIGTERM from launchd (logout, the app unregistering the agent).
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
-            let why = tokio::select! {
-                _ = tokio::signal::ctrl_c() => "ctrl-c (SIGINT)",
-                _ = term.recv() => "SIGTERM from launchd (logout, the app restarting or upgrading the daemon, or turning it off)",
-            };
+            let why = stop_signal().await;
             taskboardd::runmark::stopping(&stop, why);
             stop.stop();
         };
@@ -196,6 +193,29 @@ fn serve(cfg: Config) -> i32 {
         taskboardd::runmark::stopped(&app);
         0
     })
+}
+
+/// Waits for what stops the server, and says what it was.
+#[cfg(unix)]
+async fn stop_signal() -> &'static str {
+    // ctrl-c in a terminal, SIGTERM from launchd (logout, the app unregistering the agent).
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "ctrl-c (SIGINT)",
+        _ = term.recv() => "SIGTERM from launchd (logout, the app restarting or upgrading the daemon, or turning it off)",
+    }
+}
+
+/// Waits for what stops the server, and says what it was.
+#[cfg(windows)]
+async fn stop_signal() -> &'static str {
+    let mut brk = tokio::signal::windows::ctrl_break().expect("ctrl-break handler");
+    let mut close = tokio::signal::windows::ctrl_close().expect("console close handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "ctrl-c",
+        _ = brk.recv() => "ctrl-break",
+        _ = close.recv() => "its console closed",
+    }
 }
 
 fn init() -> i32 {
