@@ -501,7 +501,8 @@ impl Render for PreviewTip {
         let pane = div().h(px(200.)).w_full().flex().items_center().justify_center().border_b_1().border_color(t.border).overflow_hidden();
         let pane = match &self.preview {
             Preview::Image(src) => {
-                let source: ImageSource = if src.starts_with('/') { std::path::Path::new(src).into() } else { SharedString::from(src.clone()).into() };
+                let local = src.starts_with('/') || std::path::Path::new(src).is_absolute();
+                let source: ImageSource = if local { std::path::Path::new(src).into() } else { SharedString::from(src.clone()).into() };
                 pane.bg(t.panel_2).child(img(source).size_full().object_fit(ObjectFit::Contain))
             }
             Preview::Video => pane.bg(rgb(0x1c2129)).child(play(34.)),
@@ -669,7 +670,7 @@ mod tests {
     fn images_and_videos_get_a_preview_with_the_file_name() {
         let r = rollup(&goal(), Filter::All, Some(ALL_WAVES));
         let t1 = &r.waves[0].tasks[0].files;
-        assert!(matches!(&t1[0].preview, Some(Preview::Image(p)) if p.ends_with("/before.png") && !p.starts_with('~')));
+        assert!(matches!(&t1[0].preview, Some(Preview::Image(p)) if std::path::Path::new(p).ends_with("before.png") && !p.starts_with('~')));
         assert_eq!((t1[0].icon, t1[0].detail.as_str()), ("image", "before.png"));
         assert_eq!((t1[1].preview.clone(), t1[1].icon), (Some(Preview::Video), "video"));
         assert_eq!(r.goal[1].preview, None);

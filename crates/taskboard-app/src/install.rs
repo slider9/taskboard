@@ -17,7 +17,12 @@
 //!
 //! Everything here blocks; `start` runs it on its own thread and publishes the result in
 //! [`status`] for the banner.
+//!
+//! Elsewhere (Windows) there's no bundle, so every launch is a dev launch for now, and the login
+//! item and `tb` link calls say they're macOS only.
+#[cfg(target_os = "macos")]
 use objc2_foundation::NSString;
+#[cfg(target_os = "macos")]
 use objc2_service_management::{SMAppService, SMAppServiceStatus};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -29,7 +34,9 @@ pub enum LoginItem {
     Checking,
     Enabled,
     /// Registered, but the human must switch it on in System Settings ▸ Login Items.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     RequiresApproval,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     NotRegistered,
     Failed(String),
     /// Another board holds the port (a rollback to the old board), so this launch neither registered the
@@ -136,6 +143,7 @@ pub fn installed_bundle() -> Option<PathBuf> {
 }
 
 /// The LaunchAgent plist shipped in the bundle (the first one in `Contents/Library/LaunchAgents`).
+#[cfg(target_os = "macos")]
 fn bundled_agent_plist(bundle: &Path) -> Option<PathBuf> {
     let dir = bundle.join("Contents/Library/LaunchAgents");
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "plist")).collect();
@@ -143,11 +151,13 @@ fn bundled_agent_plist(bundle: &Path) -> Option<PathBuf> {
     v.into_iter().next()
 }
 
+#[cfg(target_os = "macos")]
 fn agent_service(plist: &Path) -> objc2::rc::Retained<SMAppService> {
     let name = plist.file_name().unwrap_or_default().to_string_lossy();
     unsafe { SMAppService::agentServiceWithPlistName(&NSString::from_str(&name)) }
 }
 
+#[cfg(target_os = "macos")]
 fn from_status(s: SMAppServiceStatus) -> LoginItem {
     match s {
         SMAppServiceStatus::Enabled => LoginItem::Enabled,
@@ -159,6 +169,7 @@ fn from_status(s: SMAppServiceStatus) -> LoginItem {
 }
 
 /// The agent's launchd label (`Label` in its plist).
+#[cfg(target_os = "macos")]
 fn agent_label(plist: &Path) -> Option<String> {
     let out = std::process::Command::new("/usr/bin/plutil").args(["-extract", "Label", "raw", "-o", "-"]).arg(plist).output().ok()?;
     let label = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -168,10 +179,12 @@ fn agent_label(plist: &Path) -> Option<String> {
 /// `launchctl print` for a job launchd won't start under its registration: the binary's signature
 /// no longer matches the one recorded when it was registered (each ad-hoc dev build has a new one),
 /// so every spawn fails with EX_CONFIG (78).
+#[cfg(target_os = "macos")]
 fn stale_registration(launchctl_print: &str) -> bool {
     launchctl_print.lines().map(str::trim).any(|l| l == "job state = spawn failed" || l.starts_with("last exit code = 78"))
 }
 
+#[cfg(target_os = "macos")]
 fn launchd_job(label: &str) -> Option<String> {
     let uid = String::from_utf8_lossy(&std::process::Command::new("/usr/bin/id").arg("-u").output().ok()?.stdout).trim().to_string();
     let out = std::process::Command::new("/bin/launchctl").arg("print").arg(format!("gui/{uid}/{label}")).output().ok()?;
@@ -180,6 +193,7 @@ fn launchd_job(label: &str) -> Option<String> {
 
 /// Register the bundled LaunchAgent (idempotent). Returns the resulting state. A registration
 /// launchd can't start (see [`stale_registration`]) is dropped and made again for this bundle.
+#[cfg(target_os = "macos")]
 pub fn register(bundle: &Path) -> LoginItem {
     let Some(plist) = bundled_agent_plist(bundle) else {
         return LoginItem::Failed("The launch agent isn't in the app bundle.".into());
@@ -214,6 +228,7 @@ pub fn register(bundle: &Path) -> LoginItem {
 }
 
 /// Restart the bundle's daemon (`launchctl kickstart -k`), so it runs the binary now in the bundle.
+#[cfg(target_os = "macos")]
 pub fn restart_daemon(bundle: &Path) -> Result<(), String> {
     let plist = bundled_agent_plist(bundle).ok_or("The launch agent isn't in the app bundle.")?;
     let label = agent_label(&plist).ok_or("The launch agent has no label.")?;
@@ -222,15 +237,38 @@ pub fn restart_daemon(bundle: &Path) -> Result<(), String> {
     if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
 }
 
+#[cfg(target_os = "macos")]
 pub fn unregister(bundle: &Path) -> Result<(), String> {
     let plist = bundled_agent_plist(bundle).ok_or("The launch agent isn't in the app bundle.")?;
     unsafe { agent_service(&plist).unregisterAndReturnError() }.map_err(|e| e.localizedDescription().to_string())
 }
 
 /// Open System Settings ▸ General ▸ Login Items (where a RequiresApproval agent is switched on).
+#[cfg(target_os = "macos")]
 pub fn open_login_items() {
     unsafe { SMAppService::openSystemSettingsLoginItems() };
 }
+
+#[cfg(not(target_os = "macos"))]
+const MACOS_ONLY: &str = "Starting the daemon at login is only set up on macOS.";
+
+#[cfg(not(target_os = "macos"))]
+pub fn register(_bundle: &Path) -> LoginItem {
+    LoginItem::Failed(MACOS_ONLY.into())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn restart_daemon(_bundle: &Path) -> Result<(), String> {
+    Err(MACOS_ONLY.into())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn unregister(_bundle: &Path) -> Result<(), String> {
+    Err(MACOS_ONLY.into())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn open_login_items() {}
 
 // ------------------------------------------------------------------ tb link
 
@@ -261,7 +299,11 @@ pub fn link_tb(bundle: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let tmp = dir.join(format!(".tb.{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    std::os::unix::fs::symlink(&target, &tmp).and_then(|_| std::fs::rename(&tmp, &link)).map_err(|e| {
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&target, &tmp);
+    #[cfg(not(unix))]
+    let linked: std::io::Result<()> = Err(std::io::Error::other("linking tb is only set up on macOS"));
+    linked.and_then(|_| std::fs::rename(&tmp, &link)).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         e.to_string()
     })
@@ -351,6 +393,7 @@ pub fn start(backend: &str) {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_daemon_launchd_cant_start_needs_registering_again() {
         let failed = "\tlast exit code = 78: EX_CONFIG\n\tjob state = spawn failed\n";
@@ -389,6 +432,7 @@ mod tests {
         assert_eq!(bundle_of(Path::new("/x/target/debug/taskboard-app")), None);
     }
 
+    #[cfg(unix)]
     #[::core::prelude::v1::test]
     fn only_replaces_taskboard_links() {
         let dir = std::env::temp_dir().join(format!("tb-link-test-{}", std::process::id()));

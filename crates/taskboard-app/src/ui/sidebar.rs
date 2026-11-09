@@ -121,8 +121,8 @@ pub fn render(m: &mut MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> An
         .px(px(12.))
         .pb(px(10.))
         .gap(px(4.))
-        // The traffic lights sit over this strip; it moves the window like a title bar.
-        .child(div().flex_none().h(px(44.)).on_mouse_down(MouseButton::Left, crate::settings::drag_window))
+        // On macOS the traffic lights sit over this strip; it moves the window like a title bar.
+        .child(div().flex_none().h(kit::title_strip(44.)).on_mouse_down(MouseButton::Left, crate::settings::drag_window))
         .child(search_box(t, cx))
         .child(div().h(px(6.)))
         .child(nav("nav-needs", "Needs you", kit::dot(t.warn, 8.), (needs > 0).then(|| (needs.to_string(), true)), Page::Board, on(Page::Board), cx))
@@ -220,7 +220,7 @@ fn search_box(t: &Theme, cx: &mut Context<MainWindow>) -> Stateful<Div> {
         .on_click(cx.listener(|m, _, window, cx| crate::ui::search::open(m, window, cx)))
         .child(kit::glyph(kit::Glyph::Search, 13., t.muted))
         .child(div().flex_1().min_w_0().truncate().child("Search tasks, goals, T14…"))
-        .child(div().font_family(t.mono_font.clone()).text_size(px(11.)).child("⌘K"))
+        .child(div().font_family(t.mono_font.clone()).text_size(px(11.)).child(kit::shortcut("K")))
 }
 
 /// The board's health: Midna, work hours and usage, then whatever needs a look (hooks, accounts,
@@ -265,7 +265,7 @@ fn footer(m: &mut MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> Div {
             .text_color(t.muted)
             .cursor_pointer()
             .hover(move |s| s.text_color(text))
-            .tooltip(kit::tip("Settings (⌘,)"))
+            .tooltip(kit::tip(format!("Settings ({})", kit::shortcut(","))))
             .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenSettings), cx))
             .child("Settings"),
     )

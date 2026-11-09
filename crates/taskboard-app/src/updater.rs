@@ -225,6 +225,9 @@ fn off_reason(backend: &str) -> Option<String> {
     if backend == "fake" {
         return Some("The sample board doesn't update.".into());
     }
+    if !cfg!(target_os = "macos") {
+        return Some("Only the macOS app updates itself so far.".into());
+    }
     let Some(bundle) = crate::install::installed_bundle() else {
         return Some("A dev build: it isn't running from Taskboard.app.".into());
     };
@@ -360,6 +363,13 @@ fn swap_in(staged: &Path, installed: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Never reached elsewhere: only the macOS app updates itself (`off_reason`).
+#[cfg(not(target_os = "macos"))]
+fn swap(_a: &Path, _b: &Path) -> Result<(), String> {
+    Err("Only the macOS app updates itself so far.".into())
+}
+
+#[cfg(target_os = "macos")]
 fn swap(a: &Path, b: &Path) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
     let ca = std::ffi::CString::new(a.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
@@ -415,6 +425,7 @@ mod tests {
         assert_eq!(pick(&draft, "0.1.0"), None);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn swap_exchanges_the_bundles() {
         let tmp = std::env::temp_dir().join(format!("taskboard-swap-{}", std::process::id()));

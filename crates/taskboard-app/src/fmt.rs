@@ -224,10 +224,14 @@ pub fn outside(v: &Value) -> Option<String> {
     })
 }
 
-/// A path under the user's folder with that part as "~".
+/// A path under the user's folder with that part as "~" (on Windows, after either separator).
 pub fn short_path(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && path.starts_with(&format!("{home}/")) => format!("~{}", &path[home.len()..]),
+    let home = taskboardd::util::expand_home("~").to_string_lossy().into_owned();
+    if home.is_empty() || home == "~" {
+        return path.to_string();
+    }
+    match path.strip_prefix(home.as_str()) {
+        Some(rest) if rest.starts_with('/') || (cfg!(windows) && rest.starts_with('\\')) => format!("~{rest}"),
         _ => path.to_string(),
     }
 }
@@ -341,7 +345,7 @@ mod tests {
 
     #[test]
     fn short_path_puts_a_tilde_for_the_home_folder() {
-        let home = std::env::var("HOME").unwrap();
+        let home = taskboardd::util::expand_home("~").to_string_lossy().into_owned();
         assert_eq!(short_path(&format!("{home}/Development/web")), "~/Development/web");
         assert_eq!(short_path("/srv/web"), "/srv/web");
         assert_eq!(short_path(&format!("{home}x/web")), format!("{home}x/web"));

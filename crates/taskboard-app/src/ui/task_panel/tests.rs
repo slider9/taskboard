@@ -311,7 +311,7 @@ fn cmd_c_copies_a_selection_made_after_typing_in_a_field(cx: &mut gpui_kit::Test
     cx.simulate_mouse_up(point(left + px(80.), px(68.)), MouseButton::Left, Modifiers::default());
     let picked = cx.update(|window, cx| gpui_kit::base::TextSelection::selected_text(window, cx));
     assert!(!picked.is_empty(), "the drag selected some of the title");
-    cx.simulate_keystrokes("cmd-c");
+    cx.simulate_keystrokes("secondary-c");
     assert_eq!(cx.read_from_clipboard().and_then(|c| c.text()), Some(picked));
 }
 

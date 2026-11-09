@@ -318,13 +318,14 @@ impl Input {
         self.field.update(cx, |f, cx| f.clear(cx));
     }
 
-    /// Keys the field leaves to the parent: ↩ submits (⌘↩ in a multi-line field), esc cancels.
+    /// Keys the field leaves to the parent: ↩ submits (⌘↩, Ctrl+Enter on Windows, in a multi-line
+    /// field), esc cancels.
     pub fn on_key(&self, ev: &KeyDownEvent, cx: &App) -> KeyOutcome {
         let ks = &ev.keystroke;
         let multi = self.field.read(cx).wrap;
         match ks.key.as_str() {
             "enter" if !multi && !ks.modifiers.shift => KeyOutcome::Submit,
-            "enter" if multi && ks.modifiers.platform => KeyOutcome::Submit,
+            "enter" if multi && ks.modifiers.secondary() => KeyOutcome::Submit,
             "escape" => KeyOutcome::Cancel,
             _ => KeyOutcome::Ignored,
         }
@@ -377,6 +378,28 @@ impl Render for Tip {
 }
 
 /// A plain text tooltip: `.tooltip(tip("…"))`.
+/// A window's title bar. On macOS the window's content runs up under the traffic lights, placed at
+/// `lights`; elsewhere (Windows) the window keeps the system's title bar, whose minimize, maximize
+/// and close buttons the app doesn't draw.
+pub fn titlebar(title: &'static str, lights: Point<Pixels>) -> TitlebarOptions {
+    if cfg!(target_os = "macos") {
+        TitlebarOptions { title: Some(title.into()), appears_transparent: true, traffic_light_position: Some(lights) }
+    } else {
+        TitlebarOptions { title: Some(title.into()), appears_transparent: false, traffic_light_position: None }
+    }
+}
+
+/// The strip atop a sidebar: `mac` tall on macOS, clear of the traffic lights; a little air where
+/// the system draws the title bar.
+pub fn title_strip(mac: f32) -> Pixels {
+    px(if cfg!(target_os = "macos") { mac } else { 12. })
+}
+
+/// A shortcut as the platform writes it: `shortcut("K")` is "⌘K" on macOS and "Ctrl+K" elsewhere.
+pub fn shortcut(key: &str) -> String {
+    if cfg!(target_os = "macos") { format!("⌘{key}") } else { format!("Ctrl+{key}") }
+}
+
 pub fn tip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     let text = text.into();
     move |_, cx| cx.new(|_| Tip { text: text.clone() }).into()

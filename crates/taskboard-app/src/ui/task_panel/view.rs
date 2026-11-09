@@ -2488,7 +2488,8 @@ pub const ATT_KINDS: [&str; 6] = ["design", "proposal", "doc", "evidence", "resu
 /// What clicking an attachment's name opens (`attHref`): a web URL, a local path, or nothing.
 pub fn att_href(a: &Value) -> Option<String> {
     let url = s(a, "url");
-    if is_web(url) || url.starts_with('~') || url.starts_with('/') { Some(url.to_string()) } else { None }
+    let local = url.starts_with('~') || url.starts_with('/') || std::path::Path::new(url).is_absolute();
+    if is_web(url) || local { Some(url.to_string()) } else { None }
 }
 
 // ------------------------------------------------------------------ context

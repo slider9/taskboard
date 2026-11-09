@@ -533,15 +533,15 @@ fn att_web(a: &Value) -> bool {
 
 /// A web link, or a `~` / absolute file path the board can open.
 fn att_has_href(a: &Value) -> bool {
-    att_web(a) || s(a, "url").starts_with('~') || s(a, "url").starts_with('/')
+    let u = s(a, "url");
+    att_web(a) || u.starts_with('~') || u.starts_with('/') || std::path::Path::new(u).is_absolute()
 }
 
 pub fn open_attachment(url: &str, cx: &mut App) {
     if url.starts_with("http://") || url.starts_with("https://") {
         cx.open_url(url);
     } else {
-        let path = taskboardd::util::expand_home(url);
-        let _ = std::process::Command::new("/usr/bin/open").arg(path).spawn();
+        cx.open_with_system(&taskboardd::util::expand_home(url));
     }
 }
 

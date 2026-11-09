@@ -117,8 +117,9 @@ pub fn claude_dir() -> PathBuf {
     }
 }
 
+/// The user's folder (`HOME` on Unix, the profile folder on Windows, where `HOME` is usually unset).
 fn dirs_home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+    taskboardd::util::expand_home("~")
 }
 
 fn read_json(p: &Path) -> Result<Value, String> {
@@ -505,6 +506,8 @@ mod tests {
         assert!(matches!(state(&v, &t), State::Stale(w) if w.contains("differ")));
     }
 
+    // The hook commands are POSIX shell; how Claude Code on Windows runs them is still to settle.
+    #[cfg(unix)]
     #[::core::prelude::v1::test]
     fn a_command_does_nothing_when_tb_is_missing() {
         for run in [Run::Tb("Stop"), Run::WaitHint] {
@@ -513,6 +516,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[::core::prelude::v1::test]
     fn a_command_runs_tb_with_its_event() {
         let (t, _, target) = setup("run");

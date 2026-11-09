@@ -38,23 +38,50 @@ use theme::Theme;
 
 actions!(taskboard, [Quit, Hide, HideOthers, ShowAll, CloseWindow, OpenSettings, OpenSystemSettings, ExportForDebugging]);
 
-/// Writes the same redacted zip as `tb export` into Downloads and shows it in Finder, off the UI thread.
+/// Writes the same redacted zip as `tb export` into Downloads and shows it in Finder (Explorer on
+/// Windows), off the UI thread.
 fn export_for_debugging() {
     std::thread::spawn(|| {
         let made = taskboardd::config::Config::load()
             .map_err(|e| e.to_string())
             .and_then(|cfg| taskboardd::export::run(&cfg, "app", &taskboardd::export::default_dir()));
-        let _ = match made {
-            Ok(path) => std::process::Command::new("open").arg("-R").arg(path).status(),
-            Err(e) => std::process::Command::new("osascript")
-                .args(["-e", "on run argv", "-e", "display alert \"Couldn't export the board\" message (item 1 of argv)", "-e", "end run", &e])
-                .status(),
-        };
+        match made {
+            Ok(path) => reveal(&path),
+            Err(e) => export_failed(&e),
+        }
     });
 }
 
+/// Shows `path` selected in the file manager.
+fn reveal(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg("-R").arg(path).status();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Explorer reads `/select,"<path>"` itself, so it's passed as written.
+        let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path.display())).status();
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let _ = path;
+}
+
+/// Says the export failed: an alert on macOS, the app log elsewhere.
+fn export_failed(why: &str) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("osascript")
+        .args(["-e", "on run argv", "-e", "display alert \"Couldn't export the board\" message (item 1 of argv)", "-e", "end run", why])
+        .status();
+    #[cfg(not(target_os = "macos"))]
+    log::info(format!("couldn't export the board: {why}"));
+}
+
 fn main() {
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    // A write to a closed pipe is an error to handle, not a reason to die.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN)
+    };
     log::init();
     if let Some(code) = install::headless(&std::env::args().collect::<Vec<_>>()) {
         std::process::exit(code);
@@ -75,13 +102,15 @@ fn main() {
         let system_dark = matches!(cx.window_appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
         cx.set_global(Theme::new(theme::startup_mode(system_dark), ui_font, mono_font));
         app::bind_keys(cx);
+        // `secondary` is ⌘ on macOS and Ctrl on Windows.
         cx.bind_keys([
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("cmd-h", Hide, None),
-            KeyBinding::new("cmd-alt-h", HideOthers, None),
-            KeyBinding::new("cmd-w", CloseWindow, None),
-            KeyBinding::new("cmd-,", OpenSettings, None),
+            KeyBinding::new("secondary-q", Quit, None),
+            KeyBinding::new("secondary-w", CloseWindow, None),
+            KeyBinding::new("secondary-,", OpenSettings, None),
         ]);
+        // Hiding apps is macOS's (GPUI's Windows backend doesn't have Hide Others at all).
+        #[cfg(target_os = "macos")]
+        cx.bind_keys([KeyBinding::new("cmd-h", Hide, None), KeyBinding::new("cmd-alt-h", HideOthers, None)]);
         let b = backend.clone();
         cx.on_action(move |_: &OpenSettings, cx| {
             let _ = settings::open(b.clone(), cx);
@@ -102,20 +131,18 @@ fn main() {
                 let _ = w.update(cx, |_, window, _| window.remove_window());
             }
         });
+        let mut app_menu = vec![MenuItem::action("Settings…", OpenSettings), MenuItem::separator()];
+        if cfg!(target_os = "macos") {
+            app_menu.extend([
+                MenuItem::action("Hide Task board", Hide),
+                MenuItem::action("Hide Others", HideOthers),
+                MenuItem::action("Show All", ShowAll),
+                MenuItem::separator(),
+            ]);
+        }
+        app_menu.push(MenuItem::action("Quit Task board", Quit));
         cx.set_menus(vec![
-            Menu {
-                name: "Task board".into(),
-                items: vec![
-                    MenuItem::action("Settings…", OpenSettings),
-                    MenuItem::separator(),
-                    MenuItem::action("Hide Task board", Hide),
-                    MenuItem::action("Hide Others", HideOthers),
-                    MenuItem::action("Show All", ShowAll),
-                    MenuItem::separator(),
-                    MenuItem::action("Quit Task board", Quit),
-                ],
-                disabled: false,
-            },
+            Menu { name: "Task board".into(), items: app_menu, disabled: false },
             Menu {
                 name: "File".into(),
                 items: if backend.label() == "fake" {
@@ -158,7 +185,7 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         let opts = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions { title: Some("Task board".into()), appears_transparent: true, traffic_light_position: Some(point(px(16.), px(16.))) }),
+            titlebar: Some(ui::kit::titlebar("Task board", point(px(16.), px(16.)))),
             window_min_size: Some(size(px(900.), px(560.))),
             app_id: Some("com.mrgnhnt.taskboard".into()),
             focus: std::env::var("TASKBOARD_NO_ACTIVATE").is_err(),

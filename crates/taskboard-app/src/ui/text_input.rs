@@ -208,8 +208,15 @@ impl TextField {
         }
         let c = self.cursor();
         let len = self.content.len();
+        let mac = cfg!(target_os = "macos");
+        // Select all, copy, cut and paste: ⌘ on macOS, Ctrl elsewhere.
+        let command = m.secondary();
+        // To the line's ends: ⌘ on macOS (elsewhere Home and End do it).
+        let line = mac && m.platform;
+        // By words: ⌥ on macOS, Ctrl elsewhere.
+        let word = if mac { m.alt } else { m.control };
         let target = |s: &Self, left: bool| -> usize {
-            match (left, m.platform, m.alt) {
+            match (left, line, word) {
                 (true, true, _) => 0,
                 (false, true, _) => len,
                 (true, _, true) => s.prev_word(c),
@@ -219,12 +226,13 @@ impl TextField {
             }
         };
         match ks.key.as_str() {
-            "left" | "right" if !m.control => {
+            // ⌃← and ⌃→ belong to macOS (Spaces); elsewhere Ctrl moves by words.
+            "left" | "right" if !(mac && m.control) => {
                 let left = ks.key == "left";
                 if m.shift {
                     let t = target(self, left);
                     self.select_to(t, cx);
-                } else if !self.selected.is_empty() && !m.platform && !m.alt {
+                } else if !self.selected.is_empty() && !line && !word {
                     let edge = if left { self.selected.start } else { self.selected.end };
                     self.move_to(edge, cx);
                 } else {
@@ -247,18 +255,19 @@ impl TextField {
             }
             "home" => self.move_to(0, cx),
             "end" => self.move_to(len, cx),
-            "a" if m.control => self.move_to(0, cx),
-            "e" if m.control => self.move_to(len, cx),
-            "k" if m.control => {
+            // The Emacs keys macOS text fields take; elsewhere Ctrl+A selects all.
+            "a" if mac && m.control => self.move_to(0, cx),
+            "e" if mac && m.control => self.move_to(len, cx),
+            "k" if mac && m.control => {
                 let r = c..len;
                 if !r.is_empty() {
                     self.replace(r, "", cx);
                 }
             }
             "backspace" => {
-                let to = if m.platform {
+                let to = if line {
                     0
-                } else if m.alt {
+                } else if word {
                     self.prev_word(c)
                 } else {
                     self.prev_char(c)
@@ -266,15 +275,15 @@ impl TextField {
                 self.delete_to(to, cx);
             }
             "delete" => {
-                let to = if m.alt { self.next_word(c) } else { self.next_char(c) };
+                let to = if word { self.next_word(c) } else { self.next_char(c) };
                 self.delete_to(to, cx);
             }
-            "a" if m.platform => {
+            "a" if command => {
                 self.selected = 0..len;
                 self.reversed = false;
                 cx.notify();
             }
-            "c" | "x" if m.platform => {
+            "c" | "x" if command => {
                 if self.secret || self.selected.is_empty() {
                     return; // let the parent's copy (if any) run
                 }
@@ -284,7 +293,7 @@ impl TextField {
                     self.replace(r, "", cx);
                 }
             }
-            "v" if m.platform => {
+            "v" if command => {
                 if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
                     let r = self.selected.clone();
                     self.replace(r, t.trim_end_matches(['\r', '\n']), cx);

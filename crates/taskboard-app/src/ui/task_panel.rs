@@ -743,14 +743,13 @@ fn go(m: &mut MainWindow, g: &Go, cx: &mut Context<MainWindow>) {
     }
 }
 
-/// Opens a web link, or a local file path (`~` or `/`) with `open`.
+/// Opens a web link, or a local file path (`~` or absolute) in the app the system opens it with.
 fn open_target(url: &str, cx: &mut App) {
     let l = url.to_ascii_lowercase();
     if l.starts_with("http://") || l.starts_with("https://") {
         cx.open_url(url);
     } else {
-        let path = taskboardd::util::expand_home(url);
-        let _ = std::process::Command::new("/usr/bin/open").arg(path).spawn();
+        cx.open_with_system(&taskboardd::util::expand_home(url));
     }
 }
 

@@ -35,7 +35,7 @@ pub fn open(backend: Arc<dyn Backend>, cx: &mut App) -> Option<WindowHandle<Sett
     let h: f32 = std::env::var("TASKBOARD_SETTINGS_H").ok().and_then(|v| v.parse().ok()).unwrap_or(680.);
     let opts = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(w), px(h)), cx))),
-        titlebar: Some(TitlebarOptions { title: Some("Settings".into()), appears_transparent: true, traffic_light_position: Some(point(px(16.), px(17.))) }),
+        titlebar: Some(kit::titlebar("Settings", point(px(16.), px(17.)))),
         window_min_size: Some(size(px(720.), px(460.))),
         app_id: Some("com.mrgnhnt.taskboard".into()),
         focus: std::env::var("TASKBOARD_NO_ACTIVATE").is_err(),
@@ -676,7 +676,7 @@ impl SettingsWindow {
             .border_r_1()
             .border_color(t.border)
             // room for the traffic lights; drags the window like a title bar
-            .child(div().id("sidebar-drag").h(px(48.)).flex_none().on_mouse_down(MouseButton::Left, drag_window))
+            .child(div().id("sidebar-drag").h(kit::title_strip(48.)).flex_none().on_mouse_down(MouseButton::Left, drag_window))
             .child(list)
             .child(
                 div()
@@ -1018,7 +1018,7 @@ impl SettingsWindow {
             .gap(px(12.))
             .child(step("2", true))
             .child(open)
-            .child(div().flex_1().min_w_0().text_size(px(12.5)).text_color(t.text_2).child("Press ⌘V in the code boxes, then Continue and Authorize."));
+            .child(div().flex_1().min_w_0().text_size(px(12.5)).text_color(t.text_2).child(format!("Press {} in the code boxes, then Continue and Authorize.", kit::shortcut("V"))));
         let after = if opened {
             "Waiting for you to approve on GitHub. This updates by itself. Page didn't load? Open it again: the code works for 15 minutes."
         } else {

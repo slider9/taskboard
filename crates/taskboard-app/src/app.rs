@@ -1572,26 +1572,34 @@ fn merge_goal(v: Value) -> Value {
 
 actions!(taskboard, [CloseOverlay, GoBoard, GoBacklog, GoProjects, GoDays, GoGoals, Refresh, CopyRef, CopySelection, Search, NavBack, NavForward]);
 
+/// Back and forward: ⌘← and ⌘→ on macOS, as in Safari; Alt+← and Alt+→ elsewhere, as in Windows'
+/// browsers (Ctrl+← and Ctrl+→ move by words there).
+#[cfg(target_os = "macos")]
+pub const NAV_KEYS: [&str; 2] = ["cmd-left", "cmd-right"];
+#[cfg(not(target_os = "macos"))]
+pub const NAV_KEYS: [&str; 2] = ["alt-left", "alt-right"];
+
+/// `secondary` is ⌘ on macOS and Ctrl elsewhere.
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("escape", CloseOverlay, Some("MainWindow")),
         // In the sidebar's order.
-        KeyBinding::new("cmd-1", GoBoard, Some("MainWindow")),
-        KeyBinding::new("cmd-2", GoProjects, Some("MainWindow")),
-        KeyBinding::new("cmd-3", GoGoals, Some("MainWindow")),
-        KeyBinding::new("cmd-5", GoBacklog, Some("MainWindow")),
-        KeyBinding::new("cmd-6", GoDays, Some("MainWindow")),
-        KeyBinding::new("cmd-k", Search, Some("MainWindow")),
-        KeyBinding::new("cmd-r", Refresh, Some("MainWindow")),
-        KeyBinding::new("cmd-shift-c", CopyRef, Some("MainWindow")),
-        KeyBinding::new("cmd-c", CopySelection, Some("MainWindow")),
-        KeyBinding::new("cmd-left", NavBack, Some("MainWindow")),
-        KeyBinding::new("cmd-right", NavForward, Some("MainWindow")),
-        // In a text field ⌘← and ⌘→ move the cursor to the line's ends instead.
-        KeyBinding::new("cmd-left", NoAction, Some(ui::text_input::CTX)),
-        KeyBinding::new("cmd-right", NoAction, Some(ui::text_input::CTX)),
+        KeyBinding::new("secondary-1", GoBoard, Some("MainWindow")),
+        KeyBinding::new("secondary-2", GoProjects, Some("MainWindow")),
+        KeyBinding::new("secondary-3", GoGoals, Some("MainWindow")),
+        KeyBinding::new("secondary-5", GoBacklog, Some("MainWindow")),
+        KeyBinding::new("secondary-6", GoDays, Some("MainWindow")),
+        KeyBinding::new("secondary-k", Search, Some("MainWindow")),
+        KeyBinding::new("secondary-r", Refresh, Some("MainWindow")),
+        KeyBinding::new("secondary-shift-c", CopyRef, Some("MainWindow")),
+        KeyBinding::new("secondary-c", CopySelection, Some("MainWindow")),
+        KeyBinding::new(NAV_KEYS[0], NavBack, Some("MainWindow")),
+        KeyBinding::new(NAV_KEYS[1], NavForward, Some("MainWindow")),
+        // In a text field the same keys move the cursor instead.
+        KeyBinding::new(NAV_KEYS[0], NoAction, Some(ui::text_input::CTX)),
+        KeyBinding::new(NAV_KEYS[1], NoAction, Some(ui::text_input::CTX)),
         // A text field copies its own selection.
-        KeyBinding::new("cmd-c", NoAction, Some(ui::text_input::CTX)),
+        KeyBinding::new("secondary-c", NoAction, Some(ui::text_input::CTX)),
         // ⇧↩ starts a new line in a multi-line field (New idea's detail, answers); ↩ stays the parent's.
         KeyBinding::new("shift-enter", ui::text_input::Newline, Some(ui::text_input::CTX_WRAP)),
     ]);
@@ -2787,7 +2795,7 @@ mod tests {
         w.update(cx, |m: &mut MainWindow, _, cx| m.go(Page::Projects, cx)).unwrap();
         w.update(cx, |m: &mut MainWindow, window, cx| ui::search::open(m, window, cx)).unwrap();
         draw(cx);
-        cx.simulate_keystrokes(w.into(), "cmd-left");
+        cx.simulate_keystrokes(w.into(), crate::app::NAV_KEYS[0]);
         settle(cx);
         w.update(cx, |m: &mut MainWindow, window, cx| {
             assert!(m.page == Page::Projects, "the field keeps ⌘← for its cursor");
@@ -2795,7 +2803,7 @@ mod tests {
             window.focus(&m.focus, cx);
         })
         .unwrap();
-        cx.simulate_keystrokes(w.into(), "cmd-left");
+        cx.simulate_keystrokes(w.into(), crate::app::NAV_KEYS[0]);
         settle(cx);
         w.update(cx, |m: &mut MainWindow, _, _| assert!(m.page == Page::Board)).unwrap();
     }

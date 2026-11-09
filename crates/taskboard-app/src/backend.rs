@@ -480,7 +480,9 @@ mod tests {
         let d = Daemon::at("http://127.0.0.1:9");
         d.get("state", &[]).unwrap_err();
         let why = d.down.lock().unwrap().clone().expect("a reason");
-        assert!(why.contains("refused"), "{why}");
+        // Windows retries a refused local connection for about two seconds, past this agent's 300 ms
+        // connect timeout, so there it times out.
+        assert!(why.contains("refused") || (cfg!(windows) && why.contains("timed out")), "{why}");
         d.get("board", &[]).unwrap_err();
         assert_eq!(d.down.lock().unwrap().as_deref(), Some(why.as_str()));
         d.reached();
@@ -488,7 +490,8 @@ mod tests {
     }
 
     /// Posts go to the app socket when there's one, saying they're the app's and carrying the token
-    /// when the daemon wrote one; the port is the fallback.
+    /// when the daemon wrote one; the port is the fallback. (Only Unix has an app socket.)
+    #[cfg(unix)]
     #[::core::prelude::v1::test]
     fn posts_go_to_the_app_socket() {
         use std::io::{Read, Write};
