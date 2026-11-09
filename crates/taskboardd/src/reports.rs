@@ -368,10 +368,7 @@ pub fn git_place(cmd: &str, cwd: &str) -> Option<String> {
 fn resolve(cwd: &str, p: &str) -> String {
     use std::path::{Component, Path, PathBuf};
     let p = p.trim_matches(['"', '\'']);
-    let p = match (p.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
-        _ => p.to_string(),
-    };
+    let p = crate::util::expand_home(p).to_string_lossy().into_owned();
     let mut out = PathBuf::new();
     for c in Path::new(cwd).join(p).components() {
         match c {
@@ -406,7 +403,7 @@ fn repo_of(dir: &str) -> Option<(String, String)> {
     let out = crate::proc::run(&git, &args, None, 10.0).ok().filter(|o| o.code == Some(0))?;
     let mut lines = out.stdout.lines().map(|l| {
         let p = std::path::PathBuf::from(l.trim());
-        p.canonicalize().unwrap_or(p).to_string_lossy().into_owned()
+        crate::util::canonical(&p).unwrap_or(p).to_string_lossy().into_owned()
     });
     let found = (lines.next()?, lines.next()?);
     KNOWN.lock().ok()?.insert(dir.to_string(), found.clone());
@@ -736,7 +733,7 @@ fn screen_reply(app: &App, tid: i64, sid: &str, name: &str, asked: &str) -> Resu
 
 /// Files a turn's tools didn't make that turn up in a checkout anyway: the OS's and editors' own.
 fn junk_file(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = path.rsplit(crate::util::SEPARATORS).next().unwrap_or(path);
     matches!(name, ".DS_Store" | "Thumbs.db" | "desktop.ini" | ".localized")
         || name.starts_with("._")
         || [".swp", ".swo", "~"].iter().any(|x| name.ends_with(x))
@@ -792,33 +789,35 @@ fn new_commit(before: &Value, after: &Value) -> Option<String> {
 /// folder, even with HOME at the checkout's root.
 fn turn_scope(cwd: &str, root: &str, turn: &transcript::Turn) -> Option<Vec<String>> {
     let mut dirs = turn_dirs(cwd, turn)?;
-    let root = root.trim_end_matches('/');
+    let root = root.trim_end_matches(crate::util::SEPARATORS);
     if !root.is_empty() {
         let mut roots = vec![root.to_string()];
-        roots.extend(std::fs::canonicalize(root).ok().map(|r| r.to_string_lossy().to_string()));
-        let holds_root = |d: &str| d == "/" || roots.iter().any(|r| r.starts_with(&format!("{}/", d.trim_end_matches('/'))));
-        dirs.retain(|d| !holds_root(d) && std::fs::canonicalize(d).map(|c| !holds_root(&c.to_string_lossy())).unwrap_or(true));
+        roots.extend(crate::util::canonical(root).ok().map(|r| r.to_string_lossy().to_string()));
+        let holds_root = |d: &str| d == "/" || roots.iter().any(|r| crate::util::is_under(r, d) && crate::util::path_key(r) != crate::util::path_key(d));
+        dirs.retain(|d| !holds_root(d) && crate::util::canonical(d).map(|c| !holds_root(&c.to_string_lossy())).unwrap_or(true));
     }
     Some(dirs)
 }
 
 fn turn_dirs(cwd: &str, turn: &transcript::Turn) -> Option<Vec<String>> {
-    let cwd = cwd.trim_end_matches('/');
+    let cwd = cwd.trim_end_matches(crate::util::SEPARATORS);
     if cwd.is_empty() {
         return None;
     }
-    let home = std::env::var("HOME").unwrap_or_default();
+    // From the terminal's folder, `~` the home folder.
+    let full_path = |p: &str| {
+        let p = crate::util::expand_home(p).to_string_lossy().into_owned();
+        clean_path(&if absolute(&p) { p } else { crate::util::join_path(cwd, &p) })
+    };
     let mut dirs = vec![clean_path(cwd)];
     for d in &turn.shell_dirs {
-        let d = if d == "~" { home.clone() } else if let Some(rest) = d.strip_prefix("~/") { format!("{home}/{rest}") } else { d.clone() };
-        dirs.push(clean_path(&if d.starts_with('/') { d } else { format!("{cwd}/{d}") }));
+        dirs.push(full_path(d));
     }
     for p in &turn.shell_paths {
         // A path a command names: a folder or a file there already, itself; one not there yet (the
         // command makes it), the folder it goes in too. A folder's parent would widen the turn to the
         // whole checkout for one `ls ../`.
-        let p = if p == "~" { home.clone() } else if let Some(rest) = p.strip_prefix("~/") { format!("{home}/{rest}") } else { p.clone() };
-        let full = clean_path(&if p.starts_with('/') { p } else { format!("{cwd}/{p}") });
+        let full = full_path(p);
         if !std::path::Path::new(&full).exists() {
             if let Some(parent) = std::path::Path::new(&full).parent() {
                 dirs.push(parent.to_string_lossy().to_string());
@@ -829,8 +828,7 @@ fn turn_dirs(cwd: &str, turn: &transcript::Turn) -> Option<Vec<String>> {
     for p in &turn.shell_runs {
         // A file a command runs or builds from (a script, a manifest, a config): what it writes can be
         // anywhere in its folder.
-        let p = if let Some(rest) = p.strip_prefix("~/") { format!("{home}/{rest}") } else { p.clone() };
-        let full = clean_path(&if p.starts_with('/') { p } else { format!("{cwd}/{p}") });
+        let full = full_path(p);
         if let Some(parent) = std::path::Path::new(&full).parent() {
             dirs.push(parent.to_string_lossy().to_string());
         }
@@ -841,13 +839,23 @@ fn turn_dirs(cwd: &str, turn: &transcript::Turn) -> Option<Vec<String>> {
         }
     }
     // Git names the checkout by its real path; the terminal may sit in it through a symlink.
-    let real: Vec<String> = dirs.iter().filter_map(|d| std::fs::canonicalize(d).ok()).map(|d| d.to_string_lossy().to_string()).collect();
+    let real: Vec<String> = dirs.iter().filter_map(|d| crate::util::canonical(d).ok()).map(|d| d.to_string_lossy().to_string()).collect();
     dirs.extend(real);
     Some(dirs)
 }
 
-/// A path with `.` and `..` resolved by name, without touching the disk.
+/// Whether `p` names a place without a folder to start from: `/…`, or on Windows `C:\…`, `C:/…`
+/// and a Git Bash `/c/…`.
+fn absolute(p: &str) -> bool {
+    p.starts_with('/') || std::path::Path::new(p).is_absolute()
+}
+
+/// A path with `.` and `..` resolved by name, without touching the disk. On Windows with `\`, and a
+/// Git Bash `/c/…` as `C:\…`.
 fn clean_path(p: &str) -> String {
+    if cfg!(windows) {
+        return clean_windows_path(p);
+    }
     let mut out: Vec<&str> = vec![];
     for part in p.split('/') {
         match part {
@@ -861,18 +869,37 @@ fn clean_path(p: &str) -> String {
     format!("/{}", out.join("/"))
 }
 
+fn clean_windows_path(p: &str) -> String {
+    use std::path::{Component, Path, PathBuf};
+    let p = crate::util::from_git_bash(p);
+    let mut out = PathBuf::new();
+    for c in Path::new(&p).components() {
+        match c {
+            // Never above the drive.
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                }
+            }
+            Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    out.to_string_lossy().into_owned()
+}
+
 fn under_any(f: &str, dirs: &[String]) -> bool {
-    dirs.iter().any(|d| d == "/" || f == d || f.starts_with(&format!("{d}/")))
+    dirs.iter().any(|d| d == "/" || crate::util::is_under(f, d))
 }
 
 const UNTRACKED_FILES_SHOWN: usize = 3;
 
 /// The turn's edits that fall in a known project or the terminal's own folder.
 fn project_files(app: &App, s: &Row, files: &[String]) -> Result<Vec<String>> {
-    let here = s.s("project_path").filter(|p| !p.is_empty()).or(s.s("cwd")).unwrap_or("").trim_end_matches('/').to_string();
+    let here = s.s("project_path").filter(|p| !p.is_empty()).or(s.s("cwd")).unwrap_or("").trim_end_matches(crate::util::SEPARATORS).to_string();
     let mut roots: Vec<String> = crate::projects::list_projects(app)?
         .iter()
-        .filter_map(|p| p["path"].as_str().map(|x| x.trim_end_matches('/').to_string()))
+        .filter_map(|p| p["path"].as_str().map(|x| x.trim_end_matches(crate::util::SEPARATORS).to_string()))
         .filter(|p| !p.is_empty())
         .collect();
     if !here.is_empty() {
@@ -880,9 +907,9 @@ fn project_files(app: &App, s: &Row, files: &[String]) -> Result<Vec<String>> {
     }
     let mut out: Vec<String> = vec![];
     for f in files {
-        let full = if f.starts_with('/') { f.clone() } else { format!("{}/{f}", if here.is_empty() { "" } else { &here }) };
+        let full = if absolute(f) { f.clone() } else { crate::util::join_path(&here, f) };
         let full = std::path::Path::new(&full).components().collect::<std::path::PathBuf>().to_string_lossy().to_string();
-        if !out.contains(f) && !is_agent_memory(&full) && roots.iter().any(|root| full == *root || full.starts_with(&format!("{root}/"))) {
+        if !out.contains(f) && !is_agent_memory(&full) && roots.iter().any(|root| crate::util::is_under(&full, root)) {
             out.push(f.clone());
         }
     }
@@ -892,13 +919,13 @@ fn project_files(app: &App, s: &Row, files: &[String]) -> Result<Vec<String>> {
 /// A note in the agent's own memory (`~/.claude/projects/<project>/memory/…`): the agent's
 /// bookkeeping, not work on the project, even when a project holds the home folder.
 fn is_agent_memory(path: &str) -> bool {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let home = home.trim_end_matches('/');
-    !home.is_empty() && memory_under(path, home)
+    let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned()).unwrap_or_default();
+    !home.is_empty() && memory_under(path, &home)
 }
 
 fn memory_under(path: &str, home: &str) -> bool {
-    let Some(rest) = path.strip_prefix(&format!("{home}/.claude/projects/")) else { return false };
+    let Some(rest) = crate::util::rel_under(path, home) else { return false };
+    let Some(rest) = rest.strip_prefix(".claude/projects/") else { return false };
     let mut parts = rest.split('/');
     matches!((parts.next(), parts.next(), parts.next()), (Some(p), Some("memory"), Some(_)) if !p.is_empty())
 }
@@ -3636,11 +3663,13 @@ mod tests {
 
     #[test]
     fn git_place_reads_dash_c_then_cd() {
-        assert_eq!(git_place("git -C ../other commit -m x", "/w/proj").as_deref(), Some("/w/other"));
-        assert_eq!(git_place("cd /srv/repo && git add . && git commit -m x", "/w/proj").as_deref(), Some("/srv/repo"));
-        assert_eq!(git_place("cd a; cd ./b && git push", "/w").as_deref(), Some("/w/a/b"));
-        assert_eq!(git_place("git commit -m x", "/w/proj"), None);
-        assert_eq!(git_place("git -C ../other status", "/w/proj"), None);
+        // The folder as this OS writes it: `\w\other` on Windows.
+        let place = |cmd: &str, cwd: &str| git_place(cmd, cwd).map(|p| p.replace('\\', "/"));
+        assert_eq!(place("git -C ../other commit -m x", "/w/proj").as_deref(), Some("/w/other"));
+        assert_eq!(place("cd /srv/repo && git add . && git commit -m x", "/w/proj").as_deref(), Some("/srv/repo"));
+        assert_eq!(place("cd a; cd ./b && git push", "/w").as_deref(), Some("/w/a/b"));
+        assert_eq!(place("git commit -m x", "/w/proj"), None);
+        assert_eq!(place("git -C ../other status", "/w/proj"), None);
     }
 
     #[test]
@@ -3654,8 +3683,8 @@ mod tests {
 
     #[test]
     fn resolve_unquotes_and_normalizes() {
-        assert_eq!(resolve("/w/proj", "'../x/./y'"), "/w/x/y");
-        assert_eq!(resolve("/w/proj", "/abs"), "/abs");
+        assert_eq!(resolve("/w/proj", "'../x/./y'").replace('\\', "/"), "/w/x/y");
+        assert_eq!(resolve("/w/proj", "/abs").replace('\\', "/"), "/abs");
     }
 
     #[test]

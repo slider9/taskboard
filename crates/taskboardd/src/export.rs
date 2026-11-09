@@ -86,7 +86,8 @@ static FIELD: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-z_][a-z0-9_]{0,40}$").
 static FILE_NAME: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Za-z0-9_.-]{1,64}$").unwrap());
 static EMAIL: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[^\s@]+@[^\s@]+\.[A-Za-z]{2,}$").unwrap());
 static URL: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[A-Za-z][A-Za-z0-9+.-]*://").unwrap());
-static PART_SPLIT: Lazy<Regex> = Lazy::new(|| Regex::new(r"[/:@#?=&]+").unwrap());
+/// Splits a path or URL into the parts free text is scrubbed of: on Windows at `\` too.
+static PART_SPLIT: Lazy<Regex> = Lazy::new(|| Regex::new(if cfg!(windows) { r"[/\:@#?=&]+" } else { r"[/:@#?=&]+" }).unwrap());
 
 /// What free text is scrubbed of, in order, after the board's own values: each match is replaced as a
 /// whole with a placeholder of its kind.
@@ -249,7 +250,7 @@ impl Redactor {
             "url"
         } else if EMAIL.is_match(s) {
             "email"
-        } else if s.starts_with('/') || s.starts_with("~/") {
+        } else if crate::util::is_full_path(s) {
             "path"
         } else {
             "text"

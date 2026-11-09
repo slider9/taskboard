@@ -1112,7 +1112,7 @@ pub fn attachment_title(title: &str, url: &str) -> String {
     if !t.is_empty() {
         return t;
     }
-    url.trim_end_matches('/').rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(url).to_string()
+    url.trim_end_matches(SEPARATORS).rsplit(SEPARATORS).next().filter(|s| !s.is_empty()).unwrap_or(url).to_string()
 }
 
 /// An attachment's summary as stored: one line, clipped; None when it's blank.
@@ -1159,7 +1159,7 @@ pub fn add_attachment(
     goal_id: Option<i64>,
 ) -> Result<Value> {
     let url = url.trim();
-    if !(URL_RE.is_match(url) || url.starts_with('/') || url.starts_with("~/")) {
+    if !(URL_RE.is_match(url) || is_full_path(url)) {
         return err(400, "Attach a link that starts with https:// or a full file path.");
     }
     if let Some(ext) = refused_extension(&app.cfg.attachments.refuse, url) {

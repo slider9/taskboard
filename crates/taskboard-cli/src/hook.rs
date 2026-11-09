@@ -154,7 +154,7 @@ fn repo_of(place: &Path) -> Option<(PathBuf, PathBuf)> {
     }
     let o = std::process::Command::new("git").arg("-C").arg(dir).args(["rev-parse", "--path-format=absolute", "--git-common-dir", "--show-toplevel"]).output().ok().filter(|o| o.status.success())?;
     let out = String::from_utf8_lossy(&o.stdout).to_string();
-    let mut lines = out.lines().map(|l| PathBuf::from(l.trim())).map(|p| p.canonicalize().unwrap_or(p));
+    let mut lines = out.lines().map(|l| PathBuf::from(l.trim())).map(|p| taskboardd::util::canonical(&p).unwrap_or(p));
     Some((lines.next()?, lines.next()?))
 }
 
@@ -304,8 +304,8 @@ fn ledger(data: &Path) -> Vec<Edit> {
 
 /// A file's path from the checkout's top folder, through the real path of the folder it's in.
 fn rel_to(file: &Path, top: &Path) -> Option<String> {
-    let real = file.parent()?.canonicalize().ok()?.join(file.file_name()?);
-    real.strip_prefix(top).ok().map(|r| r.to_string_lossy().to_string()).filter(|r| !r.is_empty())
+    let real = taskboardd::util::canonical(file.parent()?).ok()?.join(file.file_name()?);
+    real.strip_prefix(top).ok().map(tidy).filter(|r| !r.is_empty())
 }
 
 /// One uncommitted file in a checkout: whether it's staged, and whether git tracks it.
@@ -357,7 +357,7 @@ fn committed(cmd: &str, at: usize, dir: &Path, top: &Path, list: &[Change]) -> V
     let rest = &masked[at..];
     let args = &rest[..rest.find([';', '&', '|']).unwrap_or(rest.len())];
     let all_tracked = args.split_whitespace().any(|a| COMMIT_ALL_RE.is_match(a));
-    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let dir = taskboardd::util::canonical(dir).unwrap_or_else(|_| dir.to_path_buf());
     let mut covers: Vec<String> = vec![];
     let mut everything = false;
     let mut tracked = all_tracked;
@@ -399,7 +399,7 @@ fn carried(cmd: &str, at: usize, dir: &Path, top: &Path, list: &[Change]) -> Vec
     let args = words_of(cmd, &rest[..rest.find([';', '&', '|']).unwrap_or(rest.len())], at);
     let all = list.iter().map(|c| c.path.clone());
     let Some(i) = args.iter().position(|a| *a == "--") else { return all.collect() };
-    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let dir = taskboardd::util::canonical(dir).unwrap_or_else(|_| dir.to_path_buf());
     let covers: Vec<String> = args[i + 1..].iter().map(|a| from_top(a, &dir, top)).collect();
     if covers.is_empty() {
         return all.collect();
@@ -445,7 +445,7 @@ fn split_of(top: &Path, rel: &str) -> Option<Split> {
 /// log has none for the file.
 fn marks_of(data: &Path, task: &str, top: &Path, rel: &str, work: &[&str]) -> Option<Marks> {
     let log = std::fs::read_to_string(data.join("hunks").join(task)).unwrap_or_default();
-    Marks::of(&log, &top.join(rel).to_string_lossy(), work)
+    Marks::of(&log, &top.join(taskboardd::util::native(rel)).to_string_lossy(), work)
 }
 
 /// Whether two line ranges of HEAD, as (first line's index, count), touch: a range of none (an
@@ -486,15 +486,15 @@ fn nested(top: &Path) -> Vec<String> {
     let list = git_text(top, &["worktree", "list", "--porcelain"]).unwrap_or_default();
     list.lines()
         .filter_map(|l| l.strip_prefix("worktree "))
-        .map(|p| PathBuf::from(p).canonicalize().unwrap_or_else(|_| PathBuf::from(p)))
-        .filter_map(|p| p.strip_prefix(top).ok().map(|r| r.to_string_lossy().to_string()))
+        .map(|p| taskboardd::util::canonical(p).unwrap_or_else(|_| PathBuf::from(p)))
+        .filter_map(|p| p.strip_prefix(top).ok().map(tidy))
         .filter(|r| !r.is_empty())
         .collect()
 }
 
 /// A recorded file's path from `top`, when it's in that checkout and not in one `nested` in it.
 fn here_rel(file: &Path, top: &Path, nested: &[String]) -> Option<String> {
-    let rel = rel_to(file, top).or_else(|| file.strip_prefix(top).ok().map(|r| r.to_string_lossy().to_string()).filter(|r| !r.is_empty()))?;
+    let rel = rel_to(file, top).or_else(|| file.strip_prefix(top).ok().map(tidy).filter(|r| !r.is_empty()))?;
     (!covered(nested, &rel)).then_some(rel)
 }
 
@@ -564,7 +564,7 @@ fn settled(data: &Path, top: &Path, rel: &str, other: &str, pushed: &dyn Fn(&str
         return true;
     }
     let log = std::fs::read_to_string(data.join("hunks").join(other)).unwrap_or_default();
-    let file = top.join(rel).to_string_lossy().to_string();
+    let file = top.join(taskboardd::util::native(rel)).to_string_lossy().to_string();
     hunks::all_in(&log, &file, &s.head) || pushed(other, top).iter().any(|r| git_text(top, &["show", &format!("{r}:{rel}")]).is_some_and(|t| hunks::all_in(&log, &file, &t)))
 }
 
@@ -682,7 +682,7 @@ pub(crate) fn stage_own(data: &Path, own: &str, cwd: &Path, files: &[String]) ->
         mine.dedup();
         mine
     } else {
-        let dir = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let dir = taskboardd::util::canonical(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let named: Vec<String> = files.iter().map(|f| from_top(f, &dir, &top)).collect();
         let idle: Vec<&String> = named.iter().filter(|r| !list.iter().any(|c| c.path == **r)).collect();
         if !idle.is_empty() {
@@ -783,7 +783,7 @@ fn slot_holder(cfg: &Config, top: &Path) -> Option<String> {
 
 /// Whether the `/steps` answer `v` for a terminal has it working in the checkout at `top`.
 fn works_in(v: &Value, top: &Path) -> bool {
-    v["vars"]["worktree"].as_str().filter(|w| !w.is_empty()).is_some_and(|w| Path::new(w).canonicalize().is_ok_and(|w| w == top))
+    v["vars"]["worktree"].as_str().filter(|w| !w.is_empty()).is_some_and(|w| taskboardd::util::canonical(w).is_ok_and(|w| w == top))
 }
 
 /// `PreToolUse`: in a checkout tasks share, refuses a commit that takes files another task still on its
@@ -921,7 +921,7 @@ fn worktree_target(args: &str) -> Option<&str> {
 
 /// A path with its links resolved, or for one that doesn't exist yet its `.` and `..` worked out.
 fn resolved(p: &Path) -> PathBuf {
-    if let Ok(real) = p.canonicalize() {
+    if let Ok(real) = taskboardd::util::canonical(p) {
         return real;
     }
     let mut out = PathBuf::new();
@@ -1485,6 +1485,12 @@ fn plugin_root() -> Option<std::path::PathBuf> {
 }
 
 fn tb_path() -> String {
+    // On Windows the binary itself, written with `/`, which Git Bash and PowerShell both run; the
+    // plugin's `bin/tb` is a sh script PowerShell can't.
+    #[cfg(windows)]
+    if let Ok(p) = std::env::current_exe() {
+        return taskboardd::util::canonical(&p).unwrap_or(p).to_string_lossy().replace('\\', "/");
+    }
     if let Some(r) = plugin_root() {
         return r.join("bin").join("tb").to_string_lossy().to_string();
     }
@@ -1929,7 +1935,7 @@ fn status_text(v: &Value) -> String {
         parts.push(m.to_string());
     }
     if let Some(d) = v["workspace"]["current_dir"].as_str().or(v["cwd"].as_str()) {
-        parts.push(d.trim_end_matches('/').rsplit('/').next().unwrap_or(d).to_string());
+        parts.push(taskboardd::util::base_name(d).unwrap_or_else(|| d.to_string()));
     }
     let limits = &v["rate_limits"];
     let shown = [("five_hour", "5h"), ("seven_day", "7d")].into_iter().find_map(|(key, label)| limits[key]["used_percentage"].as_f64().map(|p| (label, p)));
@@ -2089,7 +2095,7 @@ mod tests {
         git_repo(&a);
         git_repo(&b);
         let (why, top) = elsewhere(&b.join("src/x.rs"), &a, "T115", "a").expect("another repository");
-        assert_eq!(top, b.canonicalize().unwrap());
+        assert_eq!(top, taskboardd::util::canonical(&b).unwrap());
         assert!(why.contains("T115 is a's work") && why.contains("midna project add"), "{why}");
     assert!(why.contains("tb task set T115 --project <its project>"), "a task filed under the wrong project can move: {why}");
         assert!(elsewhere(&a.join("src/x.rs"), &a, "T115", "a").is_none(), "the task's own repository");
@@ -2310,7 +2316,7 @@ mod tests {
         assert!(shared_conflicts("git add a.rs && git commit -m x", &cwd, &data, Some("T1")).is_none(), "its own files");
         assert!(shared_conflicts("git status && git diff b.rs && git log", &cwd, &data, Some("T1")).is_none(), "read-only git");
         let (verb, top, theirs) = shared_conflicts("git add -A && git commit -m x", &cwd, &data, Some("T1")).expect("T2's file");
-        assert_eq!((verb.as_str(), top.clone()), ("commit", repo.canonicalize().unwrap()));
+        assert_eq!((verb.as_str(), top.clone()), ("commit", taskboardd::util::canonical(&repo).unwrap()));
         assert_eq!(theirs, vec![("T2".to_string(), "s2".to_string(), vec!["b.rs".to_string()])]);
         let why = shared_refusal(Some("T1"), &verb, &top, &theirs);
         assert!(why.contains("T2 (b.rs)") && why.contains("git restore --staged") && why.contains("tb slot claim --bring <its files>"), "{why}");
@@ -2478,7 +2484,7 @@ mod tests {
     fn records_of_committed_files_are_dropped_and_tb_edits_clear_drops_the_rest() {
         let (root, repo, data) = shared_checkout("forget");
         let cwd = repo.to_string_lossy().to_string();
-        let top = repo.canonicalize().unwrap();
+        let top = taskboardd::util::canonical(&repo).unwrap();
         std::fs::write(repo.join("b.rs"), "theirs\n").unwrap();
         for f in ["a.rs", "b.rs", "src/c.rs"] {
             note_edit(&data, "T2", "s2", &repo.join(f));

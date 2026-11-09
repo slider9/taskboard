@@ -2968,7 +2968,7 @@ fn edit_attachment(app: &App, id: &str, body: &Value) -> Result<Value> {
         let mut url = a.st("url");
         if body.get("url").is_some() {
             url = body_str(body, "url");
-            let ok = url.starts_with('/') || url.starts_with("~/") || ((url.starts_with("https://") || url.starts_with("http://")) && !url.contains(char::is_whitespace));
+            let ok = is_full_path(&url) || ((url.starts_with("https://") || url.starts_with("http://")) && !url.contains(char::is_whitespace));
             if !ok {
                 return err(400, "Attach a link that starts with https:// or a full file path.");
             }
@@ -3016,7 +3016,7 @@ pub fn attachment_file(app: &App, id: &str) -> Result<std::path::PathBuf> {
     let a = app.db.q1("SELECT * FROM attachments WHERE id = ? AND removed_at IS NULL", p![aid])?;
     let Some(a) = a else { return err(404, "There's no such attachment.") };
     let url = a.st("url");
-    if !(url.starts_with('/') || url.starts_with("~/")) {
+    if !is_full_path(&url) {
         return err(404, "That attachment is a link, not a file.");
     }
     let p = expand_home(&url);
@@ -3561,7 +3561,7 @@ fn slot_claim(app: &App, id: i64, body: &Value) -> Result<Value> {
         },
     };
     let fresh = !held && crate::slots::is_slot(&path);
-    let slot = path.rsplit('/').next().unwrap_or_default().to_string();
+    let slot = path.rsplit(crate::util::SEPARATORS).next().unwrap_or_default().to_string();
     let mut out = json!({"ok": true, "task": me, "path": path, "slot": slot, "brought": [], "left": []});
     if let Some(b) = &bring {
         let mut patch = String::new();

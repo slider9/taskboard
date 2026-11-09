@@ -61,7 +61,7 @@ fn syntax(lang: &str) -> Option<Syntax> {
 
 /// The language a file is written in, by its extension.
 pub fn language_of(path: &str) -> Option<&'static str> {
-    let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    let name = path.rsplit(crate::util::SEPARATORS).next().unwrap_or(path).to_lowercase();
     let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
     Some(match ext {
         "rs" => "rust",

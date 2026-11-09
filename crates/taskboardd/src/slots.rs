@@ -146,7 +146,7 @@ pub fn lock_name(n: i64) -> String {
 }
 
 fn slot_path(repo: &str, n: i64) -> String {
-    format!("{}/.claude/worktrees/slot-{n}", repo.trim_end_matches('/'))
+    crate::util::join_path(repo, &format!(".claude/worktrees/slot-{n}"))
 }
 
 /// Is `path` a worktree git knows, with its own `.git`? A folder without one (its worktree removed
@@ -329,7 +329,7 @@ pub fn sharing(app: &App, path: &str, session: &str) -> Result<Value> {
             continue;
         }
         let place = crate::worktrees::real(&place);
-        if place != top && !place.starts_with(&format!("{top}/")) {
+        if !crate::util::is_under(&place, &top) {
             continue;
         }
         let name = s.s("name").filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| format!("Terminal {}", s.st("id").chars().take(8).collect::<String>()));
@@ -660,7 +660,9 @@ fn slot_before(t: &Row, ctx: &Row) -> Option<String> {
 
 /// The repository a slot folder belongs to, while it's still there.
 fn slot_repo(slot: &str) -> Option<&str> {
-    let (repo, _) = slot.rsplit_once("/.claude/worktrees/")?;
+    // Found in the path with `/` for `\`, the same length, so the cut falls in the same place.
+    let flat = if cfg!(windows) { slot.replace('\\', "/") } else { slot.to_string() };
+    let repo = &slot[..flat.rfind("/.claude/worktrees/")?];
     Path::new(repo).is_dir().then_some(repo)
 }
 
@@ -862,8 +864,34 @@ pub(crate) fn resized(path: &str) {
 }
 
 fn size_kb(path: &str) -> Option<i64> {
+    if cfg!(windows) {
+        return folder_bytes(Path::new(path)).map(|b| (b / 1024) as i64);
+    }
     let o = crate::proc::run(Path::new("/usr/bin/du"), &["-sk".to_string(), path.to_string()], None, 20.0).ok()?;
     o.stdout.split_whitespace().next()?.parse().ok()
+}
+
+/// Windows has no `du`: the sizes of the files in `p` added up, without following links (or junctions).
+fn folder_bytes(p: &Path) -> Option<u64> {
+    let meta = std::fs::symlink_metadata(p).ok()?;
+    if !meta.is_dir() {
+        return Some(meta.len());
+    }
+    let (mut total, mut folders) = (0, vec![p.to_path_buf()]);
+    while let Some(dir) = folders.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let Ok(m) = std::fs::symlink_metadata(e.path()) else { continue };
+            if m.file_type().is_symlink() {
+                continue;
+            }
+            if m.is_dir() {
+                folders.push(e.path());
+            } else {
+                total += m.len();
+            }
+        }
+    }
+    Some(total)
 }
 
 fn take(app: &App, t: &Row, id: i64, path: &str, text: &str, start: &str) -> Result<()> {

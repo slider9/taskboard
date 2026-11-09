@@ -3,7 +3,8 @@
 //! `tb.linked`, `tb.fold.<k>`, `tb.draft.<k>`, `tb.sessCollapsed`), and so do we.
 //!
 //! Stored as one JSON object in `app-state.json`: under `$TASKBOARD_DATA` when set (Taskboard Dev
-//! sets it), else `~/Library/Application Support/com.mrgnhnt.taskboard/`. Values are JSON.
+//! sets it), else `~/Library/Application Support/com.mrgnhnt.taskboard/` (on Windows
+//! `%APPDATA%\com.mrgnhnt.taskboard\`). Values are JSON.
 //! The fake backend and tests keep it in memory only, so they never touch the real file.
 use serde_json::{Map, Value};
 use std::path::PathBuf;
@@ -25,6 +26,11 @@ thread_local! {
 fn default_path() -> PathBuf {
     match std::env::var("TASKBOARD_DATA") {
         Ok(d) if !d.trim().is_empty() => taskboardd::util::expand_home(&d).join("app-state.json"),
+        _ if cfg!(windows) => std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| taskboardd::util::expand_home(r"~\AppData\Roaming"))
+            .join("com.mrgnhnt.taskboard")
+            .join("app-state.json"),
         _ => taskboardd::util::expand_home("~/Library/Application Support/com.mrgnhnt.taskboard/app-state.json"),
     }
 }

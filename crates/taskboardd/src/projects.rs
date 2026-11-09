@@ -548,7 +548,7 @@ pub fn facts(app: &App, list: &[Value]) -> Result<Vec<Value>> {
 
 pub fn project_for_path(app: &App, path: Option<&str>) -> Result<Option<String>> {
     let Some(path) = path.filter(|p| !p.is_empty()) else { return Ok(None) };
-    Ok(deepest(&list_projects(app)?, path).or_else(|| base_name(path.trim_end_matches('/'))))
+    Ok(deepest(&list_projects(app)?, path).or_else(|| base_name(path)))
 }
 
 /// The Midna project whose folder holds `path` (the deepest one), without falling back to a folder name:
@@ -564,16 +564,15 @@ pub fn main_checkout(path: &str) -> Option<String> {
     let git = std::fs::read_to_string(format!("{}/.git", path.trim_end_matches('/'))).ok()?;
     let dir = git.trim().strip_prefix("gitdir:")?.trim();
     let (main, _) = dir.split_once("/.git/worktrees/")?;
-    Some(main.to_string()).filter(|m| !m.is_empty())
+    Some(native(main)).filter(|m| !m.is_empty())
 }
 
 /// The project in `list` whose path holds `path`, the deepest one.
 fn deepest(list: &[Value], path: &str) -> Option<String> {
-    let path = path.trim_end_matches('/');
     let mut best: Option<(String, usize)> = None;
     for p in list {
-        let pp = p["path"].as_str().unwrap_or("").trim_end_matches('/');
-        if !pp.is_empty() && (path == pp || path.starts_with(&format!("{pp}/"))) && best.as_ref().map(|(_, l)| pp.len() > *l).unwrap_or(true) {
+        let pp = path_key(p["path"].as_str().unwrap_or(""));
+        if is_under(path, &pp) && best.as_ref().map(|(_, l)| pp.len() > *l).unwrap_or(true) {
             best = Some((p["name"].as_str().unwrap_or("").to_string(), pp.len()));
         }
     }

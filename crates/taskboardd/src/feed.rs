@@ -964,7 +964,7 @@ fn raise(app: &App, src: &Source, st: &mut Row, text: &str) -> Result<()> {
 fn restart(src: &Source) -> std::result::Result<(), String> {
     let cmd = src.restart_cmd.trim();
     if !cmd.is_empty() {
-        let out = crate::proc::run(std::path::Path::new("/bin/sh"), &["-c".into(), cmd.to_string()], None, RESTART_TIMEOUT_SECS)
+        let out = crate::proc::run(&crate::proc::sh(), &["-c".into(), cmd.to_string()], None, RESTART_TIMEOUT_SECS)
             .map_err(|_| format!("restart_cmd didn't finish in {RESTART_TIMEOUT_SECS} seconds"))?;
         if out.code != Some(0) {
             let why = out.stderr.lines().chain(out.stdout.lines()).find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();

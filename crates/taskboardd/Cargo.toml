@@ -36,6 +36,8 @@ libc = "0.2"
 flate2 = "1"
 crc32fast = "1"
 aho-corasick = "1"
+# util::canonical: real paths without Windows' `\\?\`.
+dunce = "1"
 
 # apporigin.rs: the app socket's peer is checked against the app's code signature.
 [target.'cfg(target_os = "macos")'.dependencies]

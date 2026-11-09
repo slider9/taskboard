@@ -6,7 +6,6 @@
 //! timeline and failed test results, with the Azure DevOps account's token (Settings ▸ Accounts), else the env var
 //! `pr.azure_token_env`). A check none of them can read gets no detail; `tb pr status` says so.
 
-use std::path::Path;
 
 use serde_json::Value;
 
@@ -195,7 +194,7 @@ impl CiProvider for CommandCi {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
-        let o = crate::proc::run_with(Path::new("/bin/sh"), &["-c".into(), cmd], None, 60.0, &env, None).map_err(|_| "failures_cmd didn't finish in 60 seconds".to_string())?;
+        let o = crate::proc::run_with(&crate::proc::sh(), &["-c".into(), cmd], None, 60.0, &env, None).map_err(|_| "failures_cmd didn't finish in 60 seconds".to_string())?;
         if o.code != Some(0) {
             return Err(format!("failures_cmd failed: {}", o.stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no output")));
         }

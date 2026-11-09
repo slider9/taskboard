@@ -287,7 +287,7 @@ fn run_script(app: &App, r: &Row, script: &str) -> Option<String> {
     let name = r.st("name");
     let dir = r.s("dir").map(str::to_string).or_else(|| crate::projects::project_path(app, Some(r.s("project")?)).ok().flatten());
     let Some(dir) = dir.filter(|d| std::path::Path::new(d).is_dir()) else { return Some("its checkout is gone".into()) };
-    let top = git(&dir, &["rev-parse", "--show-toplevel"]).filter(|t| !t.is_empty()).unwrap_or(dir);
+    let top = git(&dir, &["rev-parse", "--show-toplevel"]).filter(|t| !t.is_empty()).map(|t| crate::util::native(&t)).unwrap_or(dir);
     let branch = git(&top, &["branch", "--show-current"]).unwrap_or_default();
     if branch != "main" && !branch.starts_with("release/") {
         let on = if branch.is_empty() { "a detached HEAD".to_string() } else { branch };
@@ -305,7 +305,7 @@ fn run_script(app: &App, r: &Row, script: &str) -> Option<String> {
     }
     app.info(format!("pending cut: running the release script in {top}: {script} {name}"));
     let args = vec!["-c".to_string(), format!("{script} \"$1\""), "sh".to_string(), name];
-    match crate::proc::run_with(std::path::Path::new("/bin/sh"), &args, Some(std::path::Path::new(&top)), SCRIPT_SECS, &env, None) {
+    match crate::proc::run_with(&crate::proc::sh(), &args, Some(std::path::Path::new(&top)), SCRIPT_SECS, &env, None) {
         Err(crate::proc::RunError::Spawn(e)) => Some(format!("the release script couldn't start: {e}")),
         Err(crate::proc::RunError::TimedOut) => Some(format!("the release script ran past {} minutes and was stopped", SCRIPT_SECS as i64 / 60)),
         Ok(o) if o.code == Some(0) => None,

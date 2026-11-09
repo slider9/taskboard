@@ -177,7 +177,7 @@ fn nearest(block: &[&str], work: &[&str], want: usize) -> Option<usize> {
 /// `file` through the real path of its folder, as `rel_in` names the checkout's files.
 fn real_file(file: &str) -> String {
     let p = Path::new(file);
-    match (p.parent().and_then(|d| d.canonicalize().ok()), p.file_name()) {
+    match (p.parent().and_then(|d| crate::util::canonical(d).ok()), p.file_name()) {
         (Some(d), Some(n)) => d.join(n).to_string_lossy().to_string(),
         _ => file.to_string(),
     }

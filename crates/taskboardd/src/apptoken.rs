@@ -228,7 +228,7 @@ fn resolve(p: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     let mut rest = vec![];
     let mut head = clean.clone();
     let real = loop {
-        if let Ok(r) = std::fs::canonicalize(&head) {
+        if let Ok(r) = crate::util::canonical(&head) {
             break r;
         }
         match (head.file_name().map(|n| n.to_os_string()), head.parent().map(Path::to_path_buf)) {
@@ -673,7 +673,7 @@ mod tests {
     fn symlinks_tmp_and_a_working_folder_inside_are_followed() {
         let tmp = tempfile::tempdir().unwrap();
         // Under /tmp, as `/private/tmp` (what it resolves to) or `/tmp`.
-        let real = std::fs::canonicalize(tmp.path()).unwrap();
+        let real = crate::util::canonical(tmp.path()).unwrap();
         let dir = real.join("board");
         let private = dir.join(DIR);
         std::fs::create_dir_all(&private).unwrap();

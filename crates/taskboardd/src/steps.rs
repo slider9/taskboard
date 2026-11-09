@@ -222,6 +222,15 @@ const PLACEHOLDERS: &[&str] = &["task", "title", "project", "branch", "base", "b
 /// Why a script isn't valid `sh` (`sh -n` on it, its placeholders filled with sample values), naming the
 /// line: "line 3: unexpected EOF while looking for matching `\"'". None when it parses, or when `sh` can't
 /// be run to tell. Kept per text, as config.toml is read on every request.
+/// A line of the shell's complaint without the shell's name before it: `/bin/sh: `, or Git Bash's
+/// `/usr/bin/bash: `.
+fn shell_said(line: &str) -> &str {
+    match line.split_once(": ") {
+        Some((name, rest)) if name.ends_with("sh") && !name.contains(' ') => rest,
+        _ => line,
+    }
+}
+
 pub fn shell_error(script: &str) -> Option<String> {
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -234,9 +243,10 @@ pub fn shell_error(script: &str) -> Option<String> {
     }
     let sample: BTreeMap<String, String> = PLACEHOLDERS.iter().map(|k| (k.to_string(), "x".to_string())).collect();
     let filled = fill_shell(script, &sample);
-    let out = crate::proc::run_with(std::path::Path::new("/bin/sh"), &["-n".into()], None, 5.0, &[], Some(filled.as_bytes())).ok()?;
+    let sh = crate::proc::sh();
+    let out = crate::proc::run_with(&sh, &["-n".into()], None, 5.0, &[], Some(filled.as_bytes())).ok()?;
     let e = (out.code != Some(0)).then(|| {
-        let why: Vec<&str> = out.stderr.lines().map(|l| l.trim_start_matches("/bin/sh: ").trim()).filter(|l| !l.is_empty()).collect();
+        let why: Vec<&str> = out.stderr.lines().map(|l| shell_said(l).trim()).filter(|l| !l.is_empty()).collect();
         if why.is_empty() {
             "sh can't parse it".to_string()
         } else {
@@ -576,7 +586,7 @@ fn own_checkout(t: &Row) -> (Option<String>, Option<String>) {
 /// A folder's repository: its shared git folder, one for all of the repository's worktrees.
 fn repo_id(dir: &str) -> Option<std::path::PathBuf> {
     let p = std::path::PathBuf::from(git_in(dir, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?);
-    Some(p.canonicalize().unwrap_or(p))
+    Some(crate::util::canonical(&p).unwrap_or(p))
 }
 
 /// Why `dir` isn't the task's to judge, when it's a checkout of another repository than the task's
@@ -587,7 +597,7 @@ pub fn outside(t: &Row, dir: &str) -> Option<String> {
     if theirs == mine {
         return None;
     }
-    let top = git_in(dir.trim(), &["rev-parse", "--show-toplevel"]).unwrap_or_else(|| dir.trim().to_string());
+    let top = git_in(dir.trim(), &["rev-parse", "--show-toplevel"]).map(|t| crate::util::native(&t)).unwrap_or_else(|| dir.trim().to_string());
     Some(format!("{top} is another repository than {}'s ({repo}), so the board won't judge {}'s steps there", t.st("project"), rf("task", t.id())))
 }
 

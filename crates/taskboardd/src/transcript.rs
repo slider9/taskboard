@@ -77,8 +77,8 @@ impl Background {
 /// The background commands and background agents in this transcript that started (under two hours
 /// ago) and haven't reported back.
 pub fn background_running(root: &Path, path: Option<&str>) -> Option<Background> {
-    let p = std::fs::canonicalize(expand_home(path?)).ok()?;
-    let root = std::fs::canonicalize(root).ok()?;
+    let p = canonical(expand_home(path?)).ok()?;
+    let root = canonical(root).ok()?;
     if p.extension().map(|e| e != "jsonl").unwrap_or(true) || !p.starts_with(&root) {
         return None;
     }
@@ -373,14 +373,14 @@ fn tool_calls(e: &Value) -> Vec<(String, String, String)> {
         .unwrap_or_default()
 }
 
-/// The paths a shell command names: its words with a `/` in them (a flag's `--x=` value included),
-/// quotes taken off. URLs and bare words aren't paths; a bare name sits in the folder the command runs in.
+/// The paths a shell command names: its words with a `/` in them (on Windows a `\` too; a flag's
+/// `--x=` value included), quotes taken off. URLs and bare words aren't paths; a bare name sits in the folder the command runs in.
 fn named_paths(command: &str) -> Vec<String> {
     let mut out: Vec<String> = vec![];
     for word in command.split(|c: char| c.is_whitespace() || ";&|()<>".contains(c)) {
         let w = word.trim_matches(|c| c == '"' || c == '\'' || c == '`');
         let w = if w.starts_with('-') { w.split_once('=').map(|(_, v)| v.trim_matches(|c| c == '"' || c == '\'')).unwrap_or("") } else { w };
-        if w.contains('/') && !w.contains("://") && !w.contains('$') && !out.iter().any(|x| x == w) {
+        if w.contains(crate::util::SEPARATORS) && !w.contains("://") && !w.contains('$') && !out.iter().any(|x| x == w) {
             out.push(w.to_string());
         }
     }
@@ -395,9 +395,13 @@ const WRAPPERS: &[&str] = &["sudo", "env", "time", "nice", "nohup", "exec", "com
 /// Two words that run the program after them (`uv run`, `pnpm exec`).
 const WRAPPER_PAIRS: &[(&str, &str)] = &[("uv", "run"), ("pnpm", "exec"), ("pnpm", "dlx"), ("yarn", "exec"), ("yarn", "dlx"), ("poetry", "run"), ("pipenv", "run"), ("bundle", "exec")];
 
-/// A program's name without its folder (`/usr/bin/env` is `env`).
+/// A program's name without its folder (`/usr/bin/env` is `env`), and on Windows without `.exe`.
 fn base_name(program: &str) -> &str {
-    program.rsplit('/').next().unwrap_or(program)
+    let name = program.rsplit(crate::util::SEPARATORS).next().unwrap_or(program);
+    match name.len().checked_sub(4).and_then(|i| Some((name.get(..i)?, name.get(i..)?))) {
+        Some((stem, ext)) if cfg!(windows) && !stem.is_empty() && ext.eq_ignore_ascii_case(".exe") => stem,
+        _ => name,
+    }
 }
 
 /// Where the program in `words` is: past the wrappers (by name, wherever they live), their flags,
@@ -433,7 +437,7 @@ const REWRITES: &[&str] = &["fmt", "format", "fix", "--fix", "--write", "--apply
 fn run_paths(command: &str) -> Vec<String> {
     let mut out: Vec<String> = vec![];
     let mut add = |w: &str| {
-        if w.contains('/') && !w.contains("://") && !w.contains('$') && !out.iter().any(|x| x == w) {
+        if w.contains(crate::util::SEPARATORS) && !w.contains("://") && !w.contains('$') && !out.iter().any(|x| x == w) {
             out.push(w.to_string());
         }
     };
@@ -447,7 +451,7 @@ fn run_paths(command: &str) -> Vec<String> {
             if let Some(script) = words[i + 1..].iter().find(|w| !w.starts_with('-')) {
                 add(script);
             }
-        } else if program.contains('/') {
+        } else if program.contains(crate::util::SEPARATORS) {
             add(program);
         }
         if !words[i + 1..].iter().any(|w| REWRITES.contains(&w.as_str())) {
@@ -568,8 +572,8 @@ pub fn last_turn(app: &App, s: &Row) -> Option<Turn> {
 
 /// The last turn of the transcript a hook named (its `transcript_path`), when it's one of Claude's.
 pub fn last_turn_at(root: &Path, path: Option<&str>) -> Option<Turn> {
-    let p = std::fs::canonicalize(expand_home(path.filter(|p| !p.is_empty())?)).ok()?;
-    let root = std::fs::canonicalize(root).ok()?;
+    let p = canonical(expand_home(path.filter(|p| !p.is_empty())?)).ok()?;
+    let root = canonical(root).ok()?;
     if p.extension().map(|e| e != "jsonl").unwrap_or(true) || !p.starts_with(&root) {
         return None;
     }
@@ -578,8 +582,8 @@ pub fn last_turn_at(root: &Path, path: Option<&str>) -> Option<Turn> {
 
 /// The text of the last reply in the transcript a hook named, when it's one of Claude's.
 pub fn last_reply_at(root: &Path, path: Option<&str>) -> Option<String> {
-    let p = std::fs::canonicalize(expand_home(path.filter(|p| !p.is_empty())?)).ok()?;
-    let root = std::fs::canonicalize(root).ok()?;
+    let p = canonical(expand_home(path.filter(|p| !p.is_empty())?)).ok()?;
+    let root = canonical(root).ok()?;
     if p.extension().map(|e| e != "jsonl").unwrap_or(true) || !p.starts_with(&root) {
         return None;
     }

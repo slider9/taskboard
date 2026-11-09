@@ -1072,7 +1072,7 @@ fn focus(app: &App, name: &str) -> Result<Value> {
         ("TASKBOARD_DEVICE_KIND".to_string(), d.st("kind")),
     ];
     // Waited for, so the person or agent who asked sees it when nothing came up.
-    let run = || crate::proc::run_with(std::path::Path::new("/bin/sh"), &["-c".to_string(), cmd], None, timeout, &env, None);
+    let run = || crate::proc::run_with(&crate::proc::sh(), &["-c".to_string(), cmd], None, timeout, &env, None);
     let failed = match crate::progress::waiting(&format!("{dev}'s focus command"), crate::progress::WAITING_EVERY, run) {
         Ok(o) if o.code == Some(0) => None,
         Ok(o) => {

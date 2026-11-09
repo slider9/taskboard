@@ -273,6 +273,7 @@ pub fn tree_stamp(cwd: &str, timeout: f64) -> Value {
     let (Some(root), head) = (rev.next().map(str::trim).filter(|r| !r.is_empty()), rev.next().unwrap_or("").trim()) else {
         return Value::Null;
     };
+    let root = taskboardd::util::native(root);
     let mut files = serde_json::Map::new();
     let mut budget = HASH_TOTAL_MAX;
     let mut entries = status.split('\0');
@@ -284,7 +285,7 @@ pub fn tree_stamp(cwd: &str, timeout: f64) -> Value {
         if code.contains('R') || code.contains('C') {
             entries.next();
         }
-        let full = format!("{root}/{path}");
+        let full = taskboardd::util::join_path(&root, path);
         files.insert(full.clone(), json!(file_stamp(&full, &mut budget)));
     }
     json!({"root": root, "head": head, "files": files, "reflog": reflog_entries(&reflog)})
@@ -439,7 +440,7 @@ mod tests {
         std::fs::write(dir.join("src/a.rs"), "a").unwrap();
         git(&dir, &["add", "."]);
         git(&dir, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "a"]);
-        let root = std::fs::canonicalize(&dir).unwrap().to_string_lossy().to_string();
+        let root = taskboardd::util::canonical(&dir).unwrap().to_string_lossy().to_string();
         let clean = tree_stamp(&dir.to_string_lossy(), 5.0);
         assert_eq!(clean["root"], json!(root));
         assert_eq!(clean["head"].as_str().map(str::len), Some(40));
@@ -449,7 +450,7 @@ mod tests {
         std::fs::write(dir.join("src/new.rs"), "new").unwrap();
         let dirty = tree_stamp(&dir.to_string_lossy(), 5.0);
         let files: Vec<&String> = dirty["files"].as_object().unwrap().keys().collect();
-        assert_eq!(files, [&format!("{root}/src/a.rs"), &format!("{root}/src/new.rs")]);
+        assert_eq!(files, [&taskboardd::util::join_path(&root, "src/a.rs"), &taskboardd::util::join_path(&root, "src/new.rs")]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

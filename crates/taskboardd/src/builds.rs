@@ -38,8 +38,8 @@ fn cargo_repo(cwd: &str) -> Option<PathBuf> {
         ["-C", cwd, "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"].iter().map(|s| s.to_string()).collect();
     let out = crate::proc::run(&git, &args, None, 10.0).ok().filter(|o| o.code == Some(0))?;
     let mut lines = out.stdout.lines().map(str::trim);
-    let top = PathBuf::from(lines.next()?);
-    let common = PathBuf::from(lines.next()?);
+    let top = PathBuf::from(crate::util::native(lines.next()?));
+    let common = PathBuf::from(crate::util::native(lines.next()?));
     main_checkout(&common).filter(|_| top.join("Cargo.toml").is_file())
 }
 
@@ -101,7 +101,7 @@ mod tests {
         run(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
         let wt = repo.join(".claude/worktrees/T4");
         run(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]);
-        let main = repo.canonicalize().unwrap();
+        let main = crate::util::canonical(&repo).unwrap();
 
         let env = env_for(&BuildsConfig::default(), wt.to_str().unwrap());
         assert_eq!(env["CARGO_TARGET_DIR"], json!(main.join("target").to_string_lossy()));

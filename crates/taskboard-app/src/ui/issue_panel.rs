@@ -757,10 +757,14 @@ impl Picker {
     }
 }
 
-/// `/Users/alex/x` → `~/x`.
+/// `/Users/alex/x` → `~/x`, and on Windows `C:\Users\alex\x` → `~\x`.
 fn home_tilde(p: &str) -> String {
-    match p.strip_prefix("/Users/") {
-        Some(rest) => match rest.find('/') {
+    let windows = || {
+        let (drive, rest) = p.split_at_checked(1)?;
+        drive.chars().all(|c| c.is_ascii_alphabetic()).then(|| rest.strip_prefix(r":\Users\")).flatten()
+    };
+    match p.strip_prefix("/Users/").or_else(|| if cfg!(windows) { windows() } else { None }) {
+        Some(rest) => match rest.find(taskboardd::util::SEPARATORS) {
             Some(i) => format!("~{}", &rest[i..]),
             None => "~".into(),
         },
@@ -1417,7 +1421,7 @@ pub fn render_aside(t: &Theme, issue: Option<(&Value, &AsideView)>, err: Option<
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that brings GPUI's `test` attribute, which `#[gpui_kit::test]` then recurses on.
-    use super::{Ctx, drop_issue, filter_items, issue_from, issue_how, issue_state, kind_label, panel_view, picker_items, picker_label, promote, search, snap_rows, ticket};
+    use super::{Ctx, drop_issue, filter_items, home_tilde, issue_from, issue_how, issue_state, kind_label, panel_view, picker_items, picker_label, promote, search, snap_rows, ticket};
     use crate::app::Panel;
     use crate::backend::Backend;
     use crate::fmt::{self, arr, s};
@@ -1481,6 +1485,15 @@ mod tests {
         assert_eq!(names("probe"), ["coe-probe"]);
         assert!(names("3").is_empty());
         assert!(names("all").is_empty());
+    }
+
+    #[test]
+    fn a_project_under_a_users_folder_is_shown_from_tilde() {
+        assert_eq!(home_tilde("/Users/alex/code/webapp"), "~/code/webapp");
+        assert_eq!(home_tilde("/Users/alex"), "~");
+        assert_eq!(home_tilde("/opt/webapp"), "/opt/webapp");
+        let windows = if cfg!(windows) { r"~\code\webapp" } else { r"C:\Users\alex\code\webapp" };
+        assert_eq!(home_tilde(r"C:\Users\alex\code\webapp"), windows);
     }
 
     #[test]

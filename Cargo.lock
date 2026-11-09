@@ -6939,6 +6939,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "crc32fast",
  "dirs",
+ "dunce",
  "flate2",
  "futures-util",
  "libc",

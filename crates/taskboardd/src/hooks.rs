@@ -443,7 +443,7 @@ fn env_str(v: &Value) -> String {
 pub fn run(h: &Hook, event: &str, input: &Value, cwd: Option<&Path>, log: &Path) -> RunResult {
     let (program, args) = match &h.args {
         Some(a) => (expand_home(&h.command), a.clone()),
-        None => (PathBuf::from("/bin/sh"), vec!["-c".to_string(), h.command.clone()]),
+        None => (crate::proc::sh(), vec!["-c".to_string(), h.command.clone()]),
     };
     let (t, g) = (&input["task"], &input["goal"]);
     let project = if t.is_object() { &t["project"] } else { &g["project"] };

@@ -305,8 +305,8 @@ pub fn short(text: &str, n: usize) -> String {
 }
 
 pub fn base_name(path: &str) -> Option<String> {
-    let p = path.trim_end_matches('/');
-    let b = p.rsplit('/').next().unwrap_or("");
+    let p = path.trim_end_matches(SEPARATORS);
+    let b = p.rsplit(SEPARATORS).next().unwrap_or("");
     if b.is_empty() {
         None
     } else {
@@ -314,8 +314,64 @@ pub fn base_name(path: &str) -> Option<String> {
     }
 }
 
+/// What separates a path's parts: `/`, and on Windows `\` too.
+pub const SEPARATORS: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+
+/// A path in the form two paths are compared in, without a trailing separator. On Windows git's
+/// `C:/x`, Claude Code's `C:\x` and a canonical `\\?\C:\x` all become `c:/x` (its paths ignore case).
+pub fn path_key(p: &str) -> String {
+    if cfg!(windows) {
+        p.trim_start_matches(r"\\?\").replace('\\', "/").trim_end_matches('/').to_lowercase()
+    } else {
+        p.trim_end_matches('/').to_string()
+    }
+}
+
+/// Whether `path` is the folder `dir` or inside it.
+pub fn is_under(path: &str, dir: &str) -> bool {
+    let (p, d) = (path_key(path), path_key(dir));
+    !d.is_empty() && (p == d || p.starts_with(&format!("{d}/")))
+}
+
+/// `path` from inside `dir` with `/` between its parts, as git names a checkout's files; None when
+/// it isn't inside. Kept in its own case.
+pub fn rel_under(path: &str, dir: &str) -> Option<String> {
+    if !is_under(path, dir) {
+        return None;
+    }
+    // Past a `\\?\`, `dir` is as long as the start of `path` it matched: only separators and case differ.
+    let path = path.trim_start_matches(r"\\?\").trim_end_matches(SEPARATORS);
+    let cut = dir.trim_start_matches(r"\\?\").trim_end_matches(SEPARATORS).len();
+    let rest = path.get(cut..)?.trim_start_matches(SEPARATORS);
+    Some(if cfg!(windows) { rest.replace('\\', "/") } else { rest.to_string() })
+}
+
+/// Whether `p` is a full path to a file, as an attachment names one: `/…` or `~/…`, and on Windows
+/// `C:\…` (or `C:/…`) and `~\…` too.
+pub fn is_full_path(p: &str) -> bool {
+    p.starts_with('/') || p.starts_with("~/") || (cfg!(windows) && (p.starts_with("~\\") || std::path::Path::new(p).is_absolute()))
+}
+
+/// A Git Bash path to a drive (`/c/Users/…`) as Windows writes it (`C:\Users\…`); anything else, and
+/// everything off Windows, as it is.
+pub fn from_git_bash(p: &str) -> String {
+    let b = p.as_bytes();
+    let drive = cfg!(windows) && b.len() >= 2 && b[0] == b'/' && b[1].is_ascii_alphabetic() && (b.len() == 2 || b[2] == b'/');
+    if !drive {
+        return p.to_string();
+    }
+    format!("{}:\\{}", (b[1] as char).to_ascii_uppercase(), p[2..].trim_start_matches('/').replace('/', "\\"))
+}
+
+/// `rel` (parts split by `/`) inside the folder `dir`, with this system's separator.
+pub fn join_path(dir: &str, rel: &str) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
+    let rel = if cfg!(windows) { rel.replace('/', "\\") } else { rel.to_string() };
+    format!("{}{sep}{}", dir.trim_end_matches(SEPARATORS), rel.trim_start_matches(SEPARATORS))
+}
+
 pub fn expand_home(p: &str) -> std::path::PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
+    if let Some(rest) = p.strip_prefix("~/").or_else(|| if cfg!(windows) { p.strip_prefix("~\\") } else { None }) {
         if let Some(h) = dirs::home_dir() {
             return h.join(rest);
         }
@@ -326,6 +382,23 @@ pub fn expand_home(p: &str) -> std::path::PathBuf {
         }
     }
     std::path::PathBuf::from(p)
+}
+
+/// A path git printed, written the way this system writes paths: git on Windows prints `C:/Users/…`
+/// where Claude Code and the board have `C:\Users\…`.
+pub fn native(path: &str) -> String {
+    if cfg!(windows) {
+        path.replace('/', "\\")
+    } else {
+        path.to_string()
+    }
+}
+
+/// `std::fs::canonicalize`, without the `\\?\` it puts before a Windows path (`\\?\C:\Users\…`),
+/// which no path from git or Claude Code has and in which `/` isn't a separator. It's kept where the
+/// path needs it (one too long, or a reserved name like `NUL`).
+pub fn canonical(p: impl AsRef<std::path::Path>) -> std::io::Result<std::path::PathBuf> {
+    dunce::canonicalize(p)
 }
 
 /// A pull request found in text: GitHub, GitLab or Bitbucket.
@@ -444,6 +517,46 @@ pub fn body_has(body: &Value, key: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn unix_paths_compare_as_they_always_have() {
+        assert!(is_under("/r/app/src", "/r/app") && is_under("/r/app", "/r/app/") && !is_under("/r/apple", "/r/app"));
+        assert!(!is_under("/r/app", ""), "no folder holds everything");
+        assert_eq!(rel_under("/r/app/src/x.rs", "/r/app").as_deref(), Some("src/x.rs"));
+        assert_eq!(rel_under("/r/app", "/r/app").as_deref(), Some(""));
+        assert_eq!(rel_under("/r/other/x.rs", "/r/app"), None);
+        assert_eq!(base_name("/r/app/"), Some("app".into()));
+        assert!(is_full_path("/r/a.png") && is_full_path("~/a.png") && !is_full_path("a.png"));
+        if cfg!(unix) {
+            assert!(!is_under("/R/App/src", "/r/app"), "case counts off Windows");
+            assert_eq!(join_path("/r/app/", "src/x.rs"), "/r/app/src/x.rs");
+            assert_eq!(native("/r/app"), "/r/app");
+            assert_eq!(from_git_bash("/c/r"), "/c/r");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_compare_however_they_are_written() {
+        // Claude Code's, git's and a canonical path to one folder.
+        for dir in [r"C:\Users\sam\app", "C:/Users/sam/app", r"\\?\C:\Users\sam\app", r"c:\users\SAM\app\"] {
+            assert!(is_under(r"C:\Users\sam\app\src", dir), "{dir}");
+            assert_eq!(rel_under(r"C:\Users\sam\app\src\x.rs", dir).as_deref(), Some("src/x.rs"), "{dir}");
+        }
+        assert!(!is_under(r"C:\Users\sam\apple", r"C:\Users\sam\app"));
+        assert!(is_under(r"C:\Users", r"C:\"), "a drive holds its folders");
+        assert_eq!(rel_under(r"C:\Users\Sam\App\x.rs", r"c:\users\sam\app").as_deref(), Some("x.rs"));
+        assert_eq!(base_name(r"C:\Users\sam\app\"), Some("app".into()));
+        assert_eq!(join_path(r"C:\r\app\", "src/x.rs"), r"C:\r\app\src\x.rs");
+        assert_eq!(native("C:/r/app"), r"C:\r\app");
+        assert_eq!(from_git_bash("/c/r/app"), r"C:\r\app");
+        assert_eq!(from_git_bash("/c"), r"C:\");
+        assert_eq!(from_git_bash("/tmp/x"), "/tmp/x", "only a one-letter drive");
+        assert!(is_full_path(r"C:\r\a.png") && is_full_path("C:/r/a.png") && is_full_path(r"~\a.png") && !is_full_path(r"r\a.png"));
+        assert_eq!(expand_home(r"~\x"), expand_home("~").join("x"));
+        let real = canonical(std::env::temp_dir()).unwrap();
+        assert!(!real.to_string_lossy().starts_with(r"\\?\"), "{}", real.display());
+    }
 
     #[test]
     fn refs_round_trip() {

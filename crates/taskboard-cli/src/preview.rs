@@ -64,7 +64,7 @@ pub fn run(url: &str, port: Option<u16>) -> Result<i32, String> {
     if let Some(p) = port {
         cfg.port = p;
     }
-    let tb = std::env::current_exe().and_then(std::fs::canonicalize).map(|p| p.display().to_string()).unwrap_or_else(|_| "tb".into());
+    let tb = std::env::current_exe().and_then(taskboardd::util::canonical).map(|p| p.display().to_string()).unwrap_or_else(|_| "tb".into());
     let path = match target {
         Target::Task(n) => format!("/tasks/T{n}"),
         Target::Goal(n) => format!("/goals/G{n}"),

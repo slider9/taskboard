@@ -163,7 +163,7 @@ fn split(top: &str, f: &str, me: &str, mine: &str, theirs: &[(String, String)], 
     }
     let (h, w) = (hunks::lines(&head.out), hunks::lines(&work));
     let all = hunks::parse(f, &h, &w, &diff.out);
-    let abs = format!("{top}/{f}");
+    let abs = crate::util::join_path(top, f);
     let my_marks = Marks::of(mine, &abs, &w).unwrap_or_default();
     let mut their_marks = vec![];
     for (task, log) in theirs {
@@ -226,7 +226,7 @@ pub fn start_at(app: &App, t: &Row) -> Result<Option<(String, String)>> {
 /// back as it was and the shared checkout is left alone; the 409 names the files and the patch.
 pub fn carry(app: &App, t: &Row, b: &Bring, slot: &str) -> Result<String> {
     let me = rf("task", t.id());
-    let name = slot.rsplit('/').next().unwrap_or(slot);
+    let name = slot.rsplit(crate::util::SEPARATORS).next().unwrap_or(slot);
     let dirty = git(slot, &["status", "--porcelain"], GIT_SECS);
     if dirty.code != 0 || !dirty.out.trim().is_empty() {
         return err(409, format!("{me} can't bring {} into {name} ({slot}): the slot has uncommitted changes of its own. Commit or discard them there first. Nothing changed.", b.files.join(", ")));
@@ -383,11 +383,13 @@ fn changes(top: &str) -> Result<Vec<String>> {
 fn rel_in(top: &str, file: &str) -> String {
     let p = Path::new(file);
     if !p.is_absolute() {
+        // With `/`, as git names the checkout's files.
+        let file = if cfg!(windows) { file.replace('\\', "/") } else { file.to_string() };
         return file.trim_start_matches("./").to_string();
     }
     let real_parent = p.parent().map(|d| real(&d.to_string_lossy())).unwrap_or_default();
-    let full = format!("{real_parent}/{}", p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
-    full.strip_prefix(&format!("{top}/")).map(str::to_string).unwrap_or_else(|| file.to_string())
+    let full = Path::new(&real_parent).join(p.file_name().unwrap_or_default());
+    crate::util::rel_under(&full.to_string_lossy(), top).filter(|r| !r.is_empty()).unwrap_or_else(|| file.to_string())
 }
 
 /// The files in `task`'s edit log under `top`, from the checkout's top folder.

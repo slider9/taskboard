@@ -422,7 +422,7 @@ fn worktree_and_lock_lines(app: &App, t: &Row, ctx: &Row) -> Result<Vec<String>>
     let mut lines = vec![];
     lines.extend(lane_line(app, t)?);
     if let Some(slot) = ctx.s("worktree_slot").filter(|s| !s.is_empty()) {
-        let name = slot.rsplit('/').next().unwrap_or(slot);
+        let name = slot.rsplit(crate::util::SEPARATORS).next().unwrap_or(slot);
         let base = ctx.s("worktree_base").map(|b| format!(", detached at {b}")).unwrap_or_default();
         lines.push(format!(
             "The board gave the task the worktree {name} from its pool: {slot}{base}. Work there and make the task's branch \

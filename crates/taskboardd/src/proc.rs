@@ -115,18 +115,30 @@ pub fn run_until(
 /// A command that runs `script` in a shell: `/bin/sh -c` on Unix, Git Bash's `bash -c` on Windows, so
 /// the same POSIX commands in config.toml run on both.
 pub fn shell(script: &str) -> Command {
-    #[cfg(unix)]
-    let mut c = Command::new("/bin/sh");
-    #[cfg(windows)]
-    let mut c = Command::new(git_bash());
+    let mut c = Command::new(sh());
     c.args(["-c", script]);
     c
 }
 
+/// The shell config.toml's commands run in (`sh -c "…"`): `/bin/sh` on Unix, Git Bash on Windows.
+pub fn sh() -> std::path::PathBuf {
+    #[cfg(unix)]
+    return std::path::PathBuf::from("/bin/sh");
+    #[cfg(windows)]
+    return git_bash();
+}
+
 /// Git Bash's `bash.exe`, which Claude Code on Windows needs too: `CLAUDE_CODE_GIT_BASH_PATH` (the
 /// variable Claude Code reads), else the one beside the `git.exe` on PATH, else Git's default install.
+/// Looked for once.
 #[cfg(windows)]
 pub fn git_bash() -> std::path::PathBuf {
+    static FOUND: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    FOUND.get_or_init(find_git_bash).clone()
+}
+
+#[cfg(windows)]
+fn find_git_bash() -> std::path::PathBuf {
     if let Some(p) = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH").map(std::path::PathBuf::from).filter(|p| p.is_file()) {
         return p;
     }
@@ -227,24 +239,57 @@ impl Drop for Group {
     }
 }
 
-/// Finds a command on PATH (or returns the path as given when it has a slash).
+/// Finds a command on PATH (or returns the path as given when it has a slash). On Windows a name
+/// without an extension is looked for with each of PATHEXT's (`git` is `git.exe`, `npm` is `npm.cmd`).
 pub fn which(name: &str) -> Option<std::path::PathBuf> {
-    if name.contains('/') {
-        let p = crate::util::expand_home(name);
-        return if p.is_file() { Some(p) } else { None };
+    if name.contains('/') || (cfg!(windows) && name.contains('\\')) {
+        return runnable_as(&crate::util::expand_home(name));
     }
     let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let p = dir.join(name);
-        if p.is_file() {
-            return Some(p);
-        }
+    let extra: &[&str] = if cfg!(windows) { &["~/.local/bin"] } else { &["~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"] };
+    std::env::split_paths(&path).chain(extra.iter().map(|d| crate::util::expand_home(d))).find_map(|dir| runnable_as(&dir.join(name)))
+}
+
+/// `p` when it's a file. On Windows, when `p` has no extension, `p` with the first of PATHEXT's that
+/// names a file instead: a file without one isn't a program there (npm keeps a shell script called
+/// `npm` beside `npm.cmd`).
+fn runnable_as(p: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !cfg!(windows) || p.extension().is_some() {
+        return p.is_file().then(|| p.to_path_buf());
     }
-    for extra in ["~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"] {
-        let p = crate::util::expand_home(extra).join(name);
-        if p.is_file() {
-            return Some(p);
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    exts.split(';').filter(|e| !e.is_empty()).find_map(|e| {
+        let mut s = p.as_os_str().to_owned();
+        s.push(e.to_ascii_lowercase());
+        let c = std::path::PathBuf::from(s);
+        c.is_file().then_some(c)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn which_finds_git() {
+        let git = which("git").expect("git on the PATH");
+        assert!(git.is_file());
+        assert_eq!(which(&git.to_string_lossy()), Some(git.clone()), "a path is taken as given");
+        if cfg!(windows) {
+            assert!(git.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")), "{}", git.display());
         }
+        assert_eq!(which("no-such-program-anywhere"), None);
     }
-    None
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_program_is_the_file_with_an_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        // npm's layout: a shell script with no extension beside the .cmd Windows runs.
+        std::fs::write(dir.path().join("tool"), "#!/bin/sh\n").unwrap();
+        assert_eq!(runnable_as(&dir.path().join("tool")), None);
+        std::fs::write(dir.path().join("tool.cmd"), "@echo off\n").unwrap();
+        assert_eq!(runnable_as(&dir.path().join("tool")), Some(dir.path().join("tool.cmd")));
+        assert_eq!(runnable_as(&dir.path().join("tool.cmd")), Some(dir.path().join("tool.cmd")));
+    }
 }

@@ -159,10 +159,12 @@ mod tests {
             })
         };
         has_it.recv().unwrap();
-        app.db.count("SELECT 1", vec![]).unwrap();
+        // A write: a read has its own connection and doesn't wait.
+        app.db.changed("DELETE FROM events WHERE 0", vec![]).unwrap();
         holder.join().unwrap();
         let log = std::fs::read_to_string(app.cfg.log_path()).unwrap();
-        assert!(log.contains("command timed out after 0.2s: sleep 5 in "), "{log}");
-        assert!(log.contains("slow db lock: waited 1.") && log.contains("for SELECT 1"), "{log}");
+        // The program by its file name: `sleep.exe` on Windows.
+        assert!(log.contains("command timed out after 0.2s: sleep 5 in ") || log.contains("command timed out after 0.2s: sleep.exe 5 in "), "{log}");
+        assert!(log.contains("slow db lock: waited 1.") && log.contains("for DELETE FROM events WHERE 0"), "{log}");
     }
 }

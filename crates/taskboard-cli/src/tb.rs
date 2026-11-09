@@ -2607,7 +2607,7 @@ fn daemon_restart(cfg: &taskboardd::config::Config) -> Result<i32, String> {
 
 /// The label of the LaunchAgent in the app bundle this tb runs from (`Contents/MacOS/tb` or the plugin's copy).
 fn bundle_daemon_label() -> Option<String> {
-    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let exe = taskboardd::util::canonical(std::env::current_exe().ok()?).ok()?;
     let app = exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app"))?;
     let mut plists: Vec<PathBuf> = std::fs::read_dir(app.join("Contents/Library/LaunchAgents")).ok()?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "plist")).collect();
     plists.sort();
@@ -3701,7 +3701,7 @@ fn edits_clear(c: &Ctx, t: &str, target: &str, checkout: Option<&str>) -> Result
     if !session.is_empty() {
         // A terminal the board no longer knows isn't working anywhere.
         let on = c.call("GET", &format!("/steps?session={}", qv(session)), None).unwrap_or_default();
-        let there = on["vars"]["worktree"].as_str().and_then(|w| std::path::Path::new(w).canonicalize().ok()).is_some_and(|w| w == top);
+        let there = on["vars"]["worktree"].as_str().and_then(|w| taskboardd::util::canonical(w).ok()).is_some_and(|w| w == top);
         if on["task"].as_str() == Some(target) && there {
             return Err(format!("{target}'s terminal still works in {}; its records stand for its work there.", top.display()));
         }
@@ -3815,14 +3815,13 @@ fn device_cmd(c: &Ctx, action: DeviceCmd) -> Result<i32, String> {
 
 /// The project whose folder holds `cwd` (the deepest one), else the folder's name, as the board decides.
 fn project_at(projects: &[Value], cwd: &str) -> Option<String> {
-    let cwd = cwd.trim_end_matches('/');
     projects
         .iter()
-        .filter_map(|p| Some((p["name"].as_str().filter(|n| !n.is_empty())?, p["path"].as_str()?.trim_end_matches('/'))))
-        .filter(|(_, pp)| !pp.is_empty() && (cwd == *pp || cwd.starts_with(&format!("{pp}/"))))
+        .filter_map(|p| Some((p["name"].as_str().filter(|n| !n.is_empty())?, taskboardd::util::path_key(p["path"].as_str()?))))
+        .filter(|(_, pp)| taskboardd::util::is_under(cwd, pp))
         .max_by_key(|(_, pp)| pp.len())
         .map(|(n, _)| n.to_string())
-        .or_else(|| cwd.rsplit('/').next().filter(|n| !n.is_empty()).map(|n| n.to_string()))
+        .or_else(|| taskboardd::util::base_name(cwd))
 }
 
 /// The project and goal filters of `tb tasks` and `tb backlog list`: this terminal's project unless
@@ -4487,7 +4486,7 @@ fn release_checkout(dir: Option<&str>) -> String {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .map(|o| taskboardd::util::native(String::from_utf8_lossy(&o.stdout).trim()))
         .filter(|t| !t.is_empty())
         .unwrap_or(dir)
 }
@@ -4508,7 +4507,7 @@ fn checkout_branch(top: &str) -> String {
 fn run_release_script(script: &str, name: &str, dir: Option<&str>, replaces: bool) -> Result<i32, String> {
     let top = release_checkout(dir);
     out(&format!("Running the release script in {top}: {script} {name}"));
-    let mut cmd = std::process::Command::new("sh");
+    let mut cmd = std::process::Command::new(taskboardd::proc::sh());
     cmd.arg("-c").arg(format!("{script} \"$1\"")).arg("sh").arg(name).current_dir(&top).env("TB_RELEASE", name).env_remove("TB_RELEASE_REPLACE");
     if replaces {
         cmd.env("TB_RELEASE_REPLACE", "1");
@@ -4780,14 +4779,14 @@ fn attach_target(url: &str, cwd: &str) -> Result<String, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
         return Ok(url.to_string());
     }
-    let path = match url.strip_prefix("~/") {
-        Some(rest) => std::path::Path::new(&std::env::var("HOME").unwrap_or_default()).join(rest),
-        None => std::path::Path::new(cwd).join(url),
+    let path = match url == "~" || url.starts_with("~/") || (cfg!(windows) && url.starts_with("~\\")) {
+        true => taskboardd::util::expand_home(url),
+        false => std::path::Path::new(cwd).join(url),
     };
     if !path.exists() {
         return Err(format!("no such file: {}", path.display()));
     }
-    Ok(std::fs::canonicalize(&path).unwrap_or(path).to_string_lossy().to_string())
+    Ok(taskboardd::util::canonical(&path).unwrap_or(path).to_string_lossy().to_string())
 }
 
 fn close_done_line(n: i64) -> String {
@@ -5225,7 +5224,7 @@ fn worktree_with(dir: &str, branch: &str) -> Option<String> {
     let mut path = None;
     for line in String::from_utf8_lossy(&o.stdout).lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
-            path = Some(p.to_string());
+            path = Some(taskboardd::util::native(p));
         } else if line == want {
             return path;
         }
@@ -5260,12 +5259,12 @@ fn branch_in(dir: &str) -> Option<String> {
 fn home_checkout(c: &Ctx, v: &Value) -> String {
     let repo = v["vars"]["repo"].as_str().unwrap_or("");
     let common = |d: &str| {
-        git_out(d, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).and_then(|p| std::fs::canonicalize(p).ok())
+        git_out(d, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).and_then(|p| taskboardd::util::canonical(p).ok())
     };
-    let canon = |d: &str| std::fs::canonicalize(d).ok();
+    let canon = |d: &str| taskboardd::util::canonical(d).ok();
     let theirs = v["vars"]["worktree"].as_str().filter(|w| !w.is_empty() && std::path::Path::new(w).is_dir()).map(|w| w.to_string());
     let mine = !c.session.is_empty() && v["session"].as_str() == Some(c.session.as_str());
-    match git_out(&c.cwd, &["rev-parse", "--show-toplevel"]).filter(|t| !t.is_empty()) {
+    match git_out(&c.cwd, &["rev-parse", "--show-toplevel"]).filter(|t| !t.is_empty()).map(|t| taskboardd::util::native(&t)) {
         Some(top) if theirs.as_deref().is_some_and(|w| canon(w) == canon(&top)) => top,
         Some(top) if (mine || theirs.is_none()) && (repo.is_empty() || common(&top) == common(repo) || common(repo).is_none()) => top,
         _ => theirs.unwrap_or_else(|| repo.to_string()),
@@ -5277,7 +5276,7 @@ fn home_checkout(c: &Ctx, v: &Value) -> String {
 /// the task's repository isn't known.
 fn outside_repo(dir: &str, v: &Value) -> Option<String> {
     let repo = v["vars"]["repo"].as_str().filter(|r| !r.is_empty())?;
-    let common = |d: &str| git_out(d, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).and_then(|p| std::fs::canonicalize(p).ok());
+    let common = |d: &str| git_out(d, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).and_then(|p| taskboardd::util::canonical(p).ok());
     let mine = common(repo)?;
     if common(dir).as_ref() == Some(&mine) {
         return None;
@@ -5299,7 +5298,7 @@ fn aim(c: &Ctx, v: &Value, a: &Aim) -> Result<Aimed, String> {
     let here = home_checkout(c, v);
     let mut detached_tip = None;
     let (dir, branch) = if let Some(w) = given(&a.worktree) {
-        let dir = std::fs::canonicalize(&w).map_err(|_| format!("There's no folder {w}."))?.to_string_lossy().to_string();
+        let dir = taskboardd::util::canonical(&w).map_err(|_| format!("There's no folder {w}."))?.to_string_lossy().to_string();
         resolve_commit(&dir, "HEAD").map_err(|_| format!("{dir} isn't a git checkout."))?;
         let has = branch_in(&dir);
         if let (Some(want), Some(has)) = (given(&a.branch), has.as_deref()) {
@@ -8592,12 +8591,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("shot.png"), b"png").unwrap();
         let cwd = dir.to_string_lossy().to_string();
-        let full = std::fs::canonicalize(dir.join("shot.png")).unwrap().to_string_lossy().to_string();
+        let full = taskboardd::util::canonical(dir.join("shot.png")).unwrap().to_string_lossy().to_string();
         assert_eq!(attach_target("shot.png", &cwd).unwrap(), full, "a relative path is made full");
         assert_eq!(attach_target(&full, "/").unwrap(), full);
         assert_eq!(attach_target("https://x.test/a", &cwd).unwrap(), "https://x.test/a");
-        assert_eq!(attach_target("/no/such/missing.png", &cwd).unwrap_err(), "no such file: /no/such/missing.png");
-        assert_eq!(attach_target("missing.png", &cwd).unwrap_err(), format!("no such file: {cwd}/missing.png"));
+        // On Windows `/no/such` is on the folder's drive.
+        let missing = |p: &str| format!("no such file: {}", std::path::Path::new(&cwd).join(p).display());
+        assert_eq!(attach_target("/no/such/missing.png", &cwd).unwrap_err(), missing("/no/such/missing.png"));
+        assert_eq!(attach_target("missing.png", &cwd).unwrap_err(), missing("missing.png"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8928,7 +8929,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        let repo = std::fs::canonicalize(repo).unwrap();
+        let repo = taskboardd::util::canonical(repo).unwrap();
         git(&repo, &["init", "-q", "-b", "main"]);
         git(&repo, &["config", "user.email", "t@example.com"]);
         git(&repo, &["config", "user.name", "T"]);
@@ -8963,7 +8964,7 @@ mod tests {
         assert_eq!((at.head.as_deref(), at.branch.as_deref(), at.pinned), (Some(second.as_str()), Some("main"), false));
         // A branch: the worktree that has it.
         let at = aim(&c, &v, &a(Some("feat"), None, None)).unwrap();
-        assert!(at.dir.as_deref().unwrap().ends_with("/feat"));
+        assert!(std::path::Path::new(at.dir.as_deref().unwrap()).ends_with("feat"));
         assert_eq!((at.head.as_deref(), at.pinned), (Some(feat.as_str()), false));
         // A branch no worktree has is refused, as the Python board did.
         git(std::path::Path::new(&c.cwd), &["branch", "loose", &first]);
@@ -8998,7 +8999,7 @@ mod tests {
         let (root, c, [first, _second, feat]) = repo("detached");
         let det = root.join("det");
         git(std::path::Path::new(&c.cwd), &["worktree", "add", "-q", "--detach", &det.to_string_lossy(), &first]);
-        let det = std::fs::canonicalize(det).unwrap().to_string_lossy().to_string();
+        let det = taskboardd::util::canonical(det).unwrap().to_string_lossy().to_string();
         let c = Ctx { cwd: det.clone(), ..c };
         let v = json!({"vars": {"repo": det}});
         let a = |branch: Option<&str>, worktree: Option<&str>, commit: Option<&str>| Aim {
@@ -9027,7 +9028,7 @@ mod tests {
         let (root, c, [first, second, feat]) = repo("detached-tip");
         let det = root.join("det");
         git(std::path::Path::new(&c.cwd), &["worktree", "add", "-q", "--detach", &det.to_string_lossy(), &first]);
-        let det = std::fs::canonicalize(det).unwrap().to_string_lossy().to_string();
+        let det = taskboardd::util::canonical(det).unwrap().to_string_lossy().to_string();
         let v = json!({"vars": {"repo": c.cwd}});
         let a = |branch: &str, worktree: &str| Aim { branch: Some(branch.into()), worktree: Some(worktree.into()), commit: None };
         // main has moved past the checkout: the round judges main's tip, on a checkout of it.
@@ -9041,7 +9042,7 @@ mod tests {
         // A branch the checkout's head isn't on is refused.
         let det2 = root.join("det2");
         git(std::path::Path::new(&c.cwd), &["worktree", "add", "-q", "--detach", &det2.to_string_lossy(), &feat]);
-        let det2 = std::fs::canonicalize(det2).unwrap().to_string_lossy().to_string();
+        let det2 = taskboardd::util::canonical(det2).unwrap().to_string_lossy().to_string();
         let e = aim(&c, &v, &a("main", &det2)).err().unwrap();
         assert!(e.contains("head isn't on main"), "{e}");
         let at = aim(&c, &v, &a("feat", &det2)).unwrap();
@@ -9365,7 +9366,7 @@ mod tests {
         let wt = dir.join("wt");
         git(&repo, &["worktree", "add", "-q", "-b", "feat/x", &wt.to_string_lossy()]);
         let found = worktree_with(&r, "feat/x").unwrap();
-        assert_eq!(std::fs::canonicalize(found).unwrap(), std::fs::canonicalize(&wt).unwrap());
+        assert_eq!(taskboardd::util::canonical(found).unwrap(), taskboardd::util::canonical(&wt).unwrap());
         assert!(worktree_with(&r, "feat/y").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9558,11 +9559,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `bash`: Git Bash on Windows, where the `bash` on PATH may be WSL's.
+    fn bash() -> std::process::Command {
+        std::process::Command::new(if cfg!(windows) { taskboardd::proc::sh() } else { "bash".into() })
+    }
+
     /// Runs this repo's scripts/release.sh with `args` and TB_RELEASE (unset when None): its exit
     /// code and stderr. A bad version makes it stop at the usage check, right after the guard.
     fn release_sh(args: &[&str], tb_release: Option<&str>) -> (i32, String) {
         let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/release.sh");
-        let mut cmd = std::process::Command::new("bash");
+        let mut cmd = bash();
         cmd.arg(script).args(args).env_remove("TB_RELEASE");
         if let Some(r) = tb_release {
             cmd.env("TB_RELEASE", r);
@@ -9619,7 +9625,7 @@ mod tests {
 
     /// Runs the checkout's release.sh for a beta, with no deploy key so it stops before anything is pushed.
     fn release_sh_in(at: &std::path::Path) -> (i32, String) {
-        let o = std::process::Command::new("bash")
+        let o = bash()
             .arg(at.join("scripts/release.sh"))
             .arg("0.1.0-beta.1")
             .env("TB_RELEASE", "v0.1.0-beta.1")

@@ -771,8 +771,8 @@ fn att_hover_rows(a: &Value, kind: &str, ftype: Option<(&'static str, String)>) 
     if is_web(url) {
         rows.push(("Link", url.to_string()));
     } else if !url.is_empty() {
-        let p = url.trim_end_matches('/');
-        match p.rsplit_once('/') {
+        let p = url.trim_end_matches(taskboardd::util::SEPARATORS);
+        match p.rsplit_once(taskboardd::util::SEPARATORS) {
             Some((dir, file)) => {
                 rows.push(("File", file.to_string()));
                 if !dir.is_empty() {
@@ -803,7 +803,7 @@ pub fn att_file_type(url: &str) -> Option<(&'static str, String)> {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     // A link's host isn't a file name: only its path counts.
     let path = if is_web(path) { path.splitn(4, '/').nth(3)? } else { path };
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = path.rsplit(taskboardd::util::SEPARATORS).next().unwrap_or(path);
     let ext = name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty())?.1.to_ascii_lowercase();
     let t = match ext.as_str() {
         "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" => "video",
@@ -2640,7 +2640,7 @@ fn context_tab(c: &Ctx, t: &Value) -> Vec<Node> {
                 .iter()
                 .map(|f| {
                     let full = js_string(f);
-                    txt_tip(full.rsplit('/').next().unwrap_or("").to_string(), St::Mono, full)
+                    txt_tip(full.rsplit(taskboardd::util::SEPARATORS).next().unwrap_or("").to_string(), St::Mono, full)
                 })
                 .collect(),
         ));

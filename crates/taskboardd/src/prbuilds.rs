@@ -41,7 +41,6 @@
 //! cancelled, and `pr_flow.hooked` the build hooks already asked.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -614,7 +613,7 @@ fn attempt(app: &App, item: &Value) -> std::result::Result<Done, (String, Again)
         let mut env = env;
         env.push(("TB_CANCELLED".into(), report.to_string_lossy().to_string()));
         let timeout = app.cfg.pr_builds.timeout_secs;
-        let o = crate::proc::run_with(Path::new("/bin/sh"), &["-c".into(), cmd.to_string()], None, timeout, &env, None);
+        let o = crate::proc::run_with(&crate::proc::sh(), &["-c".into(), cmd.to_string()], None, timeout, &env, None);
         let stopped = std::fs::read_to_string(&report).ok().map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect::<Vec<_>>());
         let _ = std::fs::remove_file(&report);
         let o = o.map_err(|_| (format!("the {provider} cancel command didn't finish in {timeout} seconds"), Again::Retry))?;

@@ -89,12 +89,19 @@ fn load(data: Option<PathBuf>, port: Option<u16>, runner: bool) -> Config {
 /// git) in front so the runner finds them the way a login shell would.
 fn widen_path() {
     let home = expand_home("~");
-    let cur = std::env::var("PATH").unwrap_or_default();
-    let mut parts: Vec<String> = [".local/bin", ".cargo/bin"].iter().map(|d| home.join(d).to_string_lossy().to_string()).collect();
-    parts.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(String::from));
-    parts.retain(|p| !cur.split(':').any(|c| c == p));
-    if !parts.is_empty() {
-        std::env::set_var("PATH", format!("{}:{cur}", parts.join(":")));
+    let cur = std::env::var_os("PATH").unwrap_or_default();
+    let have: Vec<std::path::PathBuf> = std::env::split_paths(&cur).collect();
+    let mut parts: Vec<std::path::PathBuf> = [".local", ".cargo"].iter().map(|d| home.join(d).join("bin")).collect();
+    if cfg!(unix) {
+        parts.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(std::path::PathBuf::from));
+    }
+    parts.retain(|p| !have.contains(p));
+    // PATH's own separator: `;` on Windows, whose folders have a `:` in them.
+    if parts.is_empty() {
+        return;
+    }
+    if let Ok(path) = std::env::join_paths(parts.iter().chain(&have)) {
+        std::env::set_var("PATH", path);
     }
 }
 

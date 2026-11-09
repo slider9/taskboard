@@ -740,7 +740,7 @@ fn task_conversation(t: &Row, last: Option<&Row>) -> Option<String> {
 /// The prompt runs where that terminal is, so only one in the visit's own checkout: one left in a
 /// slot the task gave back may be in another task's checkout by now.
 fn replaceable(app: &App, last: Option<Row>, cwd: &str) -> Option<Value> {
-    let root = |p: Option<&str>| crate::worktrees::root_of(p);
+    let root = |p: Option<&str>| crate::worktrees::root_of(p).map(|r| crate::util::path_key(&r));
     last.filter(|l| {
         l.s("status") != Some("gone") && !crate::jira_desk::is_desk(app, l.s("id")).unwrap_or(false) && !crate::review_triage::is_triage(app, l.s("id")).unwrap_or(false)
     })
@@ -1423,7 +1423,7 @@ pub fn note_expected(app: &App, t: &Row, rec: &Value) -> Result<()> {
         env.push(("TB_WORKTREE".into(), w.clone()));
     }
     let cmd = crate::util::expand_home(cmd.trim()).to_string_lossy().to_string();
-    let ran = crate::proc::run_with(Path::new("/bin/sh"), &["-c".into(), cmd], wt.as_deref().map(Path::new), 60.0, &env, None);
+    let ran = crate::proc::run_with(&crate::proc::sh(), &["-c".into(), cmd], wt.as_deref().map(Path::new), 60.0, &env, None);
     let (checks, error) = match ran {
         Ok(o) if o.code == Some(0) => match parse_expected(&o.stdout) {
             Ok(c) => (c, None),
@@ -2614,7 +2614,7 @@ mod tests {
         let run = |args: &[&str]| assert_eq!(crate::worktrees::git(repo, args, 30.0).code, 0, "git {args:?}");
         run(&["init", "-q"]);
         run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "one"]);
-        let slot = format!("{repo}/.claude/worktrees/slot-1");
+        let slot = crate::util::join_path(&repo, ".claude/worktrees/slot-1");
         let ctx = json!({"worktree_slot": slot}).to_string();
         let id = app.db.insert("tasks", fields!["title" => "A", "status" => "done", "pr_num" => 7, "context" => ctx]).unwrap();
         let t = board::get_task(&app, id).unwrap();
@@ -2653,7 +2653,7 @@ mod tests {
         run(&repo, &["remote", "add", "origin", &remote]);
         run(&repo, &["push", "-q", "origin", "main"]);
         let base = git(&repo, &["rev-parse", "HEAD"], GIT_SECS).out.trim().to_string();
-        let slot = format!("{repo}/.claude/worktrees/slot-1");
+        let slot = crate::util::join_path(&repo, ".claude/worktrees/slot-1");
         run(&repo, &["worktree", "add", "-q", "-b", "feat/a", &slot, "HEAD"]);
         std::fs::write(Path::new(&slot).join("app.rs"), "the change").unwrap();
         run(&slot, &["commit", "-qam", "the change"]);

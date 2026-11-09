@@ -60,8 +60,9 @@ fn top(path: &str) -> Option<String> {
     if r.code != 0 {
         return None;
     }
-    let common = r.out.trim();
-    Some(common.strip_suffix("/.git").unwrap_or(common).to_string())
+    let common = crate::util::native(r.out.trim());
+    let dot_git = format!("{}.git", std::path::MAIN_SEPARATOR);
+    Some(common.strip_suffix(&dot_git).unwrap_or(&common).to_string())
 }
 
 /// Fetches origin and fast-forwards the default branch when it's behind and that's safe. What it did,
@@ -211,7 +212,7 @@ fn checked_out(repo: &str, local: &str) -> Option<String> {
 fn worktree_on(porcelain: &str, local: &str) -> Option<String> {
     porcelain.split("\n\n").find_map(|block| {
         let at = block.lines().find_map(|l| l.strip_prefix("worktree "))?;
-        block.lines().any(|l| l.strip_prefix("branch ") == Some(local)).then(|| at.to_string())
+        block.lines().any(|l| l.strip_prefix("branch ") == Some(local)).then(|| crate::util::native(at))
     })
 }
 
@@ -350,7 +351,7 @@ mod tests {
     #[test]
     fn finds_the_worktree_on_a_branch() {
         let list = "worktree /r\nHEAD 1\nbranch refs/heads/feat\n\nworktree /r/w\nHEAD 2\nbranch refs/heads/main\n\nworktree /r/d\nHEAD 3\ndetached\n";
-        assert_eq!(worktree_on(list, "refs/heads/main").as_deref(), Some("/r/w"));
+        assert_eq!(worktree_on(list, "refs/heads/main"), Some(crate::util::native("/r/w")));
         assert_eq!(worktree_on(list, "refs/heads/master"), None);
     }
 }

@@ -360,10 +360,9 @@ fn recorded_files(app: &App, t: &Row, root: &str) -> (Vec<String>, &'static str)
             }
         }
     }
-    let (repo, root) = (t.st("repo_path"), root.trim_end_matches('/'));
-    let rel = repo.trim_end_matches('/').strip_prefix(root).and_then(|r| r.strip_prefix('/')).filter(|r| !r.is_empty() && !root.is_empty());
+    let rel = crate::util::rel_under(&t.st("repo_path"), root).filter(|r| !r.is_empty());
     match rel {
-        Some(rel) => (vec![rel.to_string()], "its repo path"),
+        Some(rel) => (vec![rel], "its repo path"),
         None => (vec![], ""),
     }
 }

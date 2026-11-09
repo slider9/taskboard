@@ -197,7 +197,7 @@ fn file(a: &Value) -> File {
         Some("video") => Some(Preview::Video),
         _ => None,
     };
-    let name = url.trim_end_matches('/').rsplit('/').next().unwrap_or(&url).to_string();
+    let name = url.trim_end_matches(taskboardd::util::SEPARATORS).rsplit(taskboardd::util::SEPARATORS).next().unwrap_or(&url).to_string();
     let when = fmt::opt_s(a, "at").and_then(fmt::parse).map(|t| fmt::local(t).format("%b %-d, %-I:%M %p").to_string());
     let detail = [Some(name).filter(|n| !n.is_empty()), when].into_iter().flatten().collect::<Vec<_>>().join(" · ");
     File {

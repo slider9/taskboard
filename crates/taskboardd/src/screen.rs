@@ -24,7 +24,8 @@ const RULES_BUDGET: usize = 60_000;
 const RULES_FILES: usize = 200;
 
 fn has_wildcard(s: &str) -> bool {
-    s.contains(['*', '?', '['])
+    // Not the `?` of a Windows path's `\\?\`.
+    s.trim_start_matches(r"\\?\").contains(['*', '?', '['])
 }
 
 /// A glob component (`*`, `?`, `[abc]`) as a regex over one file name.
@@ -61,7 +62,17 @@ fn sorted_entries(dir: &Path) -> Vec<PathBuf> {
 
 /// The files a glob names: `*`, `?` and `[…]` within a name, `**` for any depth of folders.
 pub fn glob_files(pattern: &Path) -> Vec<PathBuf> {
-    let parts: Vec<String> = pattern.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
+    // Where it starts (`/`, or on Windows `C:\`), then the parts to match below it.
+    let (mut start, mut parts) = (PathBuf::new(), Vec::<String>::new());
+    for c in pattern.components() {
+        match c {
+            std::path::Component::Prefix(_) | std::path::Component::RootDir if parts.is_empty() => start.push(c.as_os_str()),
+            c => parts.push(c.as_os_str().to_string_lossy().to_string()),
+        }
+    }
+    if start.as_os_str().is_empty() {
+        start = PathBuf::from(".");
+    }
     let mut found = vec![];
     fn walk(at: PathBuf, rest: &[String], found: &mut Vec<PathBuf>) {
         if found.len() >= RULES_FILES {
@@ -90,11 +101,7 @@ pub fn glob_files(pattern: &Path) -> Vec<PathBuf> {
             walk(at.join(first), more, found);
         }
     }
-    let (start, rest) = match parts.split_first() {
-        Some((r, rest)) if r == "/" => (PathBuf::from("/"), rest),
-        _ => (PathBuf::from("."), &parts[..]),
-    };
-    walk(start, rest, &mut found);
+    walk(start, &parts, &mut found);
     found
 }
 
@@ -241,7 +248,7 @@ mod tests {
         }
         std::fs::write(dir.join("proj-b").join("memory").join("b.md"), "b").unwrap();
         std::fs::write(dir.join("proj-b").join("memory").join("deep").join("c.md"), "c").unwrap();
-        let names = |v: Vec<PathBuf>| v.iter().map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().to_string()).collect::<Vec<_>>();
+        let names = |v: Vec<PathBuf>| v.iter().map(|p| p.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/")).collect::<Vec<_>>();
         assert_eq!(names(rule_files(&mem.to_string_lossy())), vec!["proj-a/memory/MEMORY.md", "proj-a/memory/a-note.md"]);
         assert_eq!(
             names(rule_files(&format!("{}/proj-*/memory/*.md", dir.display()))),
@@ -255,6 +262,7 @@ mod tests {
     fn tempfile_dir() -> PathBuf {
         let d = std::env::temp_dir().join(format!("tb-rules-{}-{}", std::process::id(), rand::random::<u32>()));
         std::fs::create_dir_all(&d).unwrap();
-        std::fs::canonicalize(d).unwrap()
+        // Without Windows' `\\?\`, in which `/` isn't a separator: rules are written as plain paths.
+        PathBuf::from(std::fs::canonicalize(d).unwrap().to_string_lossy().trim_start_matches(r"\\?\"))
     }
 }

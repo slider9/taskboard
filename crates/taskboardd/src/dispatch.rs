@@ -17,11 +17,11 @@ fn real(p: &str) -> String {
         return String::new();
     }
     let e = expand_home(p);
-    std::fs::canonicalize(&e).unwrap_or(e).to_string_lossy().to_string()
+    canonical(&e).unwrap_or(e).to_string_lossy().to_string()
 }
 
 fn under(path: &str, root: &str) -> bool {
-    !path.is_empty() && !root.is_empty() && (path == root || path.starts_with(&format!("{root}/")))
+    !path.is_empty() && is_under(path, root)
 }
 
 /// Whether an agent job opens a new terminal (rather than typing into an open one).

@@ -377,7 +377,7 @@ pub fn rounds(i: &Value, now: DateTime<Utc>) -> Vec<RoundView> {
 
 /// A file chip's name: the file's last part without its line.
 pub fn file_name(path: &str) -> String {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = path.rsplit(taskboardd::util::SEPARATORS).next().unwrap_or(path);
     name.split(':').next().unwrap_or(name).to_string()
 }
 

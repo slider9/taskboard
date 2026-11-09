@@ -82,7 +82,7 @@ pub(crate) fn repo_in_goal(app: &App, goal: Option<&Row>, project: &str) -> Resu
 }
 
 fn folder(repo: &str, t: &Row) -> String {
-    format!("{}/.claude/worktrees/{}", repo.trim_end_matches('/'), rf("task", t.id()))
+    crate::util::join_path(repo, &format!(".claude/worktrees/{}", rf("task", t.id())))
 }
 
 fn goal_base(app: &App, t: &Row) -> Result<Option<String>> {
@@ -323,7 +323,7 @@ fn entries(repo: &str) -> Option<Vec<Entry>> {
     let mut all: Vec<Entry> = vec![];
     for line in r.out.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
-            all.push(Entry { path: path.to_string(), branch: None, locked: false, gone: false });
+            all.push(Entry { path: crate::util::native(path), branch: None, locked: false, gone: false });
         } else if let Some(e) = all.last_mut() {
             match line.split_once(' ').map(|(k, _)| k).unwrap_or(line) {
                 "branch" => e.branch = line.strip_prefix("branch ").map(|b| b.trim_start_matches("refs/heads/").to_string()),
@@ -341,20 +341,19 @@ fn entries(repo: &str) -> Option<Vec<Entry>> {
 pub(crate) fn real(path: &str) -> String {
     let path = Path::new(path);
     for up in path.ancestors() {
-        if let Ok(r) = std::fs::canonicalize(up) {
+        if let Ok(r) = crate::util::canonical(up) {
             let rest = path.strip_prefix(up).unwrap_or(Path::new(""));
-            return r.join(rest).to_string_lossy().trim_end_matches('/').to_string();
+            return r.join(rest).to_string_lossy().trim_end_matches(SEPARATORS).to_string();
         }
     }
-    path.to_string_lossy().trim_end_matches('/').to_string()
+    path.to_string_lossy().trim_end_matches(SEPARATORS).to_string()
 }
 
 fn inside(path: &str, dir: &str) -> bool {
     if path.is_empty() || dir.is_empty() {
         return false;
     }
-    let (path, dir) = (real(path), real(dir));
-    path == dir || path.starts_with(&format!("{dir}/"))
+    crate::util::is_under(&real(path), &real(dir))
 }
 
 /// The task an agent's worktree belongs to: one whose recorded worktree is in it or whose branch it
@@ -490,8 +489,7 @@ pub fn root_of(path: Option<&str>) -> Option<String> {
     Some(format!("{}{name}", &p[..i + WORKTREES.len()]))
 }
 
-/// What separates a path's folders: `/`, and on Windows `\` too.
-pub const SEPARATORS: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+pub use crate::util::SEPARATORS;
 
 /// Another open task whose worktree this path is in (its PR still open, if it's done).
 pub fn owner(app: &App, path: &str, t: &Row) -> Result<Option<Row>> {
@@ -501,7 +499,8 @@ pub fn owner(app: &App, path: &str, t: &Row) -> Result<Option<Row>> {
         return crate::slots::held_by_other(app, &root, t);
     }
     let mine = board::task_context(t);
-    if root_of(mine.get("where").and_then(|w| w.get("worktree")).and_then(|v| v.as_str())).as_deref() == Some(root.as_str()) {
+    let same = |r: &Option<String>| r.as_deref().map(crate::util::path_key) == Some(crate::util::path_key(&root));
+    if same(&root_of(mine.get("where").and_then(|w| w.get("worktree")).and_then(|v| v.as_str()))) {
         return Ok(None);
     }
     for o in app.db.q("SELECT * FROM tasks WHERE id != ? AND context LIKE '%worktree%'", p![t.id()])? {
@@ -517,7 +516,7 @@ pub fn owner(app: &App, path: &str, t: &Row) -> Result<Option<Row>> {
             root_of(ctx.get("where").and_then(|w| w.get("worktree")).and_then(|v| v.as_str())),
             root_of(ctx.s("worktree_made")),
         ];
-        if theirs.iter().any(|r| r.as_deref() == Some(root.as_str())) {
+        if theirs.iter().any(same) {
             return Ok(Some(o));
         }
     }
