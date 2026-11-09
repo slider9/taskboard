@@ -70,12 +70,19 @@ and is executable:
 3. `~/.cargo/bin/tb` (`cargo install --path crates/taskboard-cli` puts it there)
 4. `~/.local/bin/tb` (Taskboard.app links it there on first launch; `./install.sh` copies it there)
 5. `/Applications/Taskboard.app/Contents/MacOS/tb`, then the same under `~/Applications`
+6. On Windows (Git Bash), `%LOCALAPPDATA%\Programs\Taskboard\tb.exe`
 
 Agents type `tb` whether or not `~/.local/bin` is on their PATH, because the plugin's `bin/` is on
 the Bash tool's PATH. If another program called `tb` sits in `~/.local/bin`, the app leaves it alone;
 set `TASKBOARD_TB` to the app's copy instead. A plugin installed from
 a marketplace may be copied into Claude Code's plugin cache, where step 2 can't find the repo
 build: install `tb` or set `TASKBOARD_TB`.
+
+On Windows, agents often run commands in the PowerShell tool, which can't run this shell-script shim,
+so the app keeps a copy of its `tb.exe` at `~/.local/bin/tb.exe` (a symlink would need Developer Mode)
+and refreshes it each time it starts; `~/.local/bin` has to be on the PATH, as Claude Code's own
+installer leaves it. A permission rule that allows `tb` has to cover the PowerShell tool as well as
+Bash.
 
 If no binary is found, `tb hook …` and `tb statusline` exit 0 silently, so a missing binary never
 breaks Claude Code. Any other command prints a one-line error and exits 1.

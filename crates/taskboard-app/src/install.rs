@@ -5,21 +5,21 @@
 //!   the bundle's `taskboardd serve` at login and keeps it alive while the app is closed. Then link
 //!   `~/.local/bin/tb` to the bundle's copy (the Claude plugin's `tb` shim finds it
 //!   there) unless something else already lives at that path.
+//! - **Installed on Windows** (`%LOCALAPPDATA%\Programs\Taskboard\taskboard-app.exe`, with `tb.exe`
+//!   and `plugin\` beside it): no login item yet, so run `taskboardd serve` yourself. A copy of
+//!   `tb.exe` is kept at `~/.local/bin/tb.exe` (see [`copy_tb`]).
 //! - **Dev** (`TASKBOARD_DEV=1`, or not inside a bundle, e.g. `cargo run`): nothing is
 //!   registered; run `taskboardd serve` yourself (or use `TASKBOARD_BACKEND=fake`).
 //!
 //! While another program holds the board's port (a rollback to the old board), neither happens: the
 //! banner says why, so a relaunch doesn't undo the rollback.
 //!
-//! `taskboard-app --uninstall` unregisters the agent, removes the link, takes the hooks that run this
-//! bundle's `tb` out of Claude Code's settings and withdraws the board's alert notifications (used by
-//! `scripts/dev-app.sh --uninstall`).
+//! `taskboard-app --uninstall` unregisters the agent, removes the link (on Windows, the copy), takes
+//! the hooks that run this bundle's `tb` out of Claude Code's settings and withdraws the board's alert
+//! notifications (used by `scripts/dev-app.sh --uninstall`).
 //!
 //! Everything here blocks; `start` runs it on its own thread and publishes the result in
 //! [`status`] for the banner.
-//!
-//! Elsewhere (Windows) there's no bundle, so every launch is a dev launch for now, and the login
-//! item and `tb` link calls say they're macOS only.
 #[cfg(target_os = "macos")]
 use objc2_foundation::NSString;
 #[cfg(target_os = "macos")]
@@ -56,8 +56,12 @@ pub fn in_the_way() -> Vec<String> {
 }
 
 /// The PATH agents' shells are likely to have: the app's own (bare when opened from the Finder)
-/// behind the usual tool folders, as `taskboardd serve` widens it.
+/// behind the usual tool folders, as `taskboardd serve` widens it. On Windows every app gets the
+/// user's whole PATH, as Claude Code's shells do, so it's the app's own.
 fn agent_path() -> String {
+    if cfg!(windows) {
+        return std::env::var("PATH").unwrap_or_default();
+    }
     let home = taskboardd::util::expand_home("~");
     let mut parts: Vec<String> = [".local/bin", ".cargo/bin"].iter().map(|d| home.join(d).to_string_lossy().to_string()).collect();
     parts.extend(["/opt/homebrew/bin", "/usr/local/bin"].map(String::from));
@@ -297,7 +301,7 @@ pub fn open_login_items() {}
 // ------------------------------------------------------------------ tb link
 
 fn tb_link() -> PathBuf {
-    taskboardd::util::expand_home("~/.local/bin/tb")
+    taskboardd::util::expand_home(if cfg!(windows) { "~/.local/bin/tb.exe" } else { "~/.local/bin/tb" })
 }
 
 /// A symlink to some Taskboard bundle's `tb` (this one, an older copy, Taskboard Dev): ours to
@@ -333,6 +337,47 @@ pub fn link_tb(bundle: &Path) -> Result<(), String> {
     })
 }
 
+/// Windows: keep a copy of the install's `tb.exe` at `~/.local/bin/tb.exe`, so agents' shells run
+/// it as `tb`, PowerShell's included (it can't run the plugin's shell-script shim). That folder is
+/// on the PATH where Claude Code's and Midna's installers put their own CLIs; a symlink would need
+/// Developer Mode. An earlier copy of the board's `tb` is replaced; any other `tb.exe` there is
+/// someone else's and stays.
+pub fn copy_tb(app: &Path) -> Result<(), String> {
+    copy_tb_to(&app.join("tb.exe"), &tb_link())
+}
+
+/// What a copy an agent was still running is renamed to, until it exits (see [`copy_tb_to`]).
+const TB_ASIDE: &str = ".tb-old.";
+
+fn copy_tb_to(from: &Path, to: &Path) -> Result<(), String> {
+    let new = std::fs::read(from).map_err(|e| format!("couldn't read {}: {e}", from.display()))?;
+    let dir = to.parent().ok_or("no parent")?;
+    // Copies an earlier launch moved aside, once nothing runs them.
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().starts_with(TB_ASIDE) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    match std::fs::read(to) {
+        Ok(old) if old == new => return Ok(()),
+        Ok(_) if !taskboardd::cutover::is_our_tb(to) => return Ok(()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("couldn't read {}: {e}", to.display())),
+    }
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let tmp = dir.join(format!(".tb.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, &new).map_err(|e| e.to_string())?;
+    let placed = std::fs::rename(&tmp, to).or_else(|_| {
+        // Windows won't overwrite a tb an agent is running, but it will move it aside.
+        std::fs::rename(to, dir.join(format!("{TB_ASIDE}{}.exe", std::process::id()))).and_then(|_| std::fs::rename(&tmp, to))
+    });
+    placed.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
+}
+
 // ------------------------------------------------------------------ entry points
 
 /// `taskboard-app --<verb>` commands that run without a window. None: start the app.
@@ -353,7 +398,13 @@ pub fn headless(args: &[String]) -> Option<i32> {
                 code = 1;
             }
             let link = tb_link();
-            if std::fs::read_link(&link).is_ok_and(|t| t.starts_with(&bundle)) {
+            let ours = if cfg!(windows) {
+                // The copy of this install's tb.exe (`copy_tb`).
+                std::fs::read(&link).is_ok_and(|b| std::fs::read(bundle.join("tb.exe")).is_ok_and(|t| t == b))
+            } else {
+                std::fs::read_link(&link).is_ok_and(|t| t.starts_with(&bundle))
+            };
+            if ours {
                 let _ = std::fs::remove_file(&link);
             }
             if let Err(e) = crate::hooks::uninstall(&crate::hooks::claude_dir(), &bundle) {
@@ -391,7 +442,7 @@ pub fn daemon_unreachable() {
 
 /// Start the install / login-item work for this launch (installed apps only).
 pub fn start(backend: &str) {
-    let bundle = match installed_bundle() {
+    let bundle = match installed_app() {
         Some(b) if backend != "fake" => b,
         _ => {
             set_status(LoginItem::Dev);
@@ -405,13 +456,15 @@ pub fn start(backend: &str) {
                 set_status(held);
                 return;
             }
-            set_status(register(&bundle));
+            // No login item on Windows yet: nothing to register, nothing for the banner to say.
+            set_status(if cfg!(windows) { LoginItem::Dev } else { register(&bundle) });
             // Taskboard Dev leaves the link to the real app (TASKBOARD_NO_TB_LINK in its LSEnvironment).
             if std::env::var_os("TASKBOARD_NO_TB_LINK").is_some() {
                 return;
             }
-            if let Err(e) = link_tb(&bundle) {
-                crate::log::info(format!("couldn't link tb: {e}"));
+            let placed = if cfg!(windows) { copy_tb(&bundle) } else { link_tb(&bundle) };
+            if let Err(e) = placed {
+                crate::log::info(format!("couldn't put tb in ~/.local/bin: {e}"));
             }
         })
         .ok();
@@ -470,6 +523,59 @@ mod tests {
         assert_eq!(install_dir_of(&exe), None, "a cargo build's folder: tb.exe but no plugin");
         std::fs::create_dir_all(dir.join("plugin")).unwrap();
         assert_eq!(install_dir_of(&exe), Some(dir.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What `cutover::is_our_tb` knows a built `tb` by: clap's about line is in it.
+    const OUR_TB: &[u8] = b"Report to the local task board";
+
+    fn tb_dirs(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("taskboard-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app")).unwrap();
+        std::fs::write(dir.join("app/tb.exe"), [OUR_TB, b" v2"].concat()).unwrap();
+        (dir.clone(), dir.join("app/tb.exe"), dir.join("bin/tb.exe"))
+    }
+
+    #[test]
+    fn copies_tb_and_replaces_only_an_earlier_copy_of_the_board_s() {
+        let (dir, from, to) = tb_dirs("copy-tb");
+        let read = |p: &Path| std::fs::read(p).unwrap();
+        copy_tb_to(&from, &to).unwrap();
+        assert_eq!(read(&to), read(&from), "copied, into a bin folder it made");
+        copy_tb_to(&from, &to).unwrap();
+        assert_eq!(read(&to), read(&from), "the same copy stays");
+
+        std::fs::write(&to, [OUR_TB, b" v1"].concat()).unwrap();
+        copy_tb_to(&from, &to).unwrap();
+        assert_eq!(read(&to), read(&from), "an earlier copy of the board's tb is replaced");
+
+        std::fs::write(&to, "someone else's tb").unwrap();
+        copy_tb_to(&from, &to).unwrap();
+        assert_eq!(read(&to), b"someone else's tb", "any other tb stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replaces_a_copy_an_agent_is_still_running() {
+        let (dir, from, to) = tb_dirs("running-tb");
+        // ping stands in for a tb an agent is running: Windows won't overwrite its file while it runs.
+        // The about line appended to it makes it read as the board's.
+        let ping = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\PING.EXE");
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::write(&to, [std::fs::read(ping).unwrap().as_slice(), OUR_TB].concat()).unwrap();
+        let mut running = std::process::Command::new(&to).args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let aside = || std::fs::read_dir(to.parent().unwrap()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(TB_ASIDE)).count();
+
+        copy_tb_to(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), std::fs::read(&from).unwrap());
+        assert_eq!(aside(), 1, "the running copy is moved aside");
+        let _ = running.kill();
+        let _ = running.wait();
+        copy_tb_to(&from, &to).unwrap();
+        assert_eq!(aside(), 0, "and goes on the next launch, once it has exited");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
