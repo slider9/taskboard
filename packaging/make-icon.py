@@ -7,7 +7,9 @@ purple with a yellow "DEV" band across the bottom, so it can't be mistaken for t
 
 Usage: packaging/make-icon.py packaging/assets/Taskboard.icns
        packaging/make-icon.py --dev packaging/assets/TaskboardDev.icns   (Taskboard Dev: purple, "DEV" band)
-Writes a 1024px PNG with the stdlib only, then uses sips + iconutil for the .icns sizes.
+       packaging/make-icon.py packaging/assets/Taskboard.ico             (Windows; any OS)
+Writes a 1024px PNG with the stdlib only, then uses sips + iconutil for the .icns sizes. A .ico is
+drawn at each of its sizes, stdlib only, and holds them as PNGs.
 The design is on a 100-unit grid (the body is 9..91, the macOS 824px icon body).
 """
 import math, os, struct, subprocess, sys, tempfile, zlib
@@ -88,17 +90,48 @@ def pixel(x, y, dev):
     return (*c, round(255 * body))
 
 
-def write_png(path, w, h, rows):
+def png_bytes(w, h, rows):
     def chunk(t, d):
         c = struct.pack(">I", len(d)) + t + d
         return c + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
 
     raw = b"".join(b"\x00" + bytes(v for p in row for v in p) for row in rows)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def write_png(path, w, h, rows):
     with open(path, "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n")
-        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)))
-        f.write(chunk(b"IDAT", zlib.compress(raw, 9)))
-        f.write(chunk(b"IEND", b""))
+        f.write(png_bytes(w, h, rows))
+
+
+def render(n, dev):
+    """The icon at n x n px, drawn at that size (crisper than scaling a big one down)."""
+    global U
+    U = n / 100
+    return [[pixel(x + 0.5, y + 0.5, dev) for x in range(n)] for y in range(n)]
+
+
+# The sizes Windows asks a .ico for: title bars and lists at 100-250% scale, and Explorer's tiles.
+ICO_SIZES = (16, 20, 24, 32, 40, 48, 64, 256)
+
+
+def write_ico(path, dev):
+    """A .ico of PNG images (which Windows reads since Vista), one drawn per size."""
+    images = [(n, png_bytes(n, n, render(n, dev))) for n in ICO_SIZES]
+    head = struct.pack("<HHH", 0, 1, len(images))
+    offset = len(head) + 16 * len(images)
+    entries, data = b"", b""
+    for n, png in images:
+        # Width and height 0 mean 256.
+        entries += struct.pack("<BBBBHHII", n % 256, n % 256, 0, 0, 1, 32, len(png), offset + len(data))
+        data += png
+    with open(path, "wb") as f:
+        f.write(head + entries + data)
 
 
 def main():
@@ -108,10 +141,13 @@ def main():
         print(__doc__)
         sys.exit(2)
     out = args[0]
+    if out.endswith(".ico"):
+        write_ico(out, dev)
+        print(f"wrote {out}")
+        return
     with tempfile.TemporaryDirectory() as tmp:
         master = os.path.join(tmp, "icon.png")
-        rows = [[pixel(x + 0.5, y + 0.5, dev) for x in range(N)] for y in range(N)]
-        write_png(master, N, N, rows)
+        write_png(master, N, N, render(N, dev))
         iconset = os.path.join(tmp, "icon.iconset")
         os.mkdir(iconset)
         for size in (16, 32, 128, 256, 512):

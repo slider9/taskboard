@@ -1,0 +1,3 @@
+// Windows resources for taskboard-app.exe (build.rs). GPUI's Windows backend gives every window
+// icon resource 1; Explorer and the taskbar show it too. packaging/make-icon.py draws the .ico.
+1 ICON "../../packaging/assets/Taskboard.ico"

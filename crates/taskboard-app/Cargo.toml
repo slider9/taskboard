@@ -16,6 +16,10 @@ snapshot = ["gpui-kit/test-support"]
 [dev-dependencies]
 gpui-kit = { version = "0.7", default-features = false, features = ["test-support"] }
 
+# build.rs: the Windows app icon.
+[build-dependencies]
+embed-resource = "3"
+
 [dependencies]
 taskboardd.workspace = true
 serde_json.workspace = true
