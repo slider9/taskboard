@@ -134,12 +134,36 @@ pub fn bundle_of(exe: &Path) -> Option<PathBuf> {
     (macos.file_name()? == "MacOS" && contents.file_name()? == "Contents" && app.extension()? == "app").then(|| app.to_path_buf())
 }
 
+fn dev_mode() -> bool {
+    std::env::var("TASKBOARD_DEV").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
 /// The bundle we run from, unless in dev mode.
 pub fn installed_bundle() -> Option<PathBuf> {
-    if std::env::var("TASKBOARD_DEV").is_ok_and(|v| !v.is_empty() && v != "0") {
+    if dev_mode() {
         return None;
     }
     bundle_of(&std::env::current_exe().ok()?)
+}
+
+/// Windows: `C:\…\Programs\Taskboard\taskboard-app.exe` -> `C:\…\Programs\Taskboard`, when `tb.exe`
+/// and the plugin are beside it (a cargo build's folder has no plugin, so it isn't an install).
+pub fn install_dir_of(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    (dir.join("tb.exe").is_file() && dir.join("plugin").is_dir()).then(|| dir.to_path_buf())
+}
+
+/// The installed app whose `tb` and plugin the Claude Code hooks run, unless in dev mode: the
+/// bundle on macOS, the install folder on Windows (where the login item and updater aren't set up
+/// yet, so they still go by [`installed_bundle`]).
+pub fn installed_app() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return installed_bundle();
+    }
+    if dev_mode() {
+        return None;
+    }
+    install_dir_of(&std::env::current_exe().ok()?)
 }
 
 /// The LaunchAgent plist shipped in the bundle (the first one in `Contents/Library/LaunchAgents`).
@@ -315,12 +339,16 @@ pub fn link_tb(bundle: &Path) -> Result<(), String> {
 pub fn headless(args: &[String]) -> Option<i32> {
     match args.get(1).map(String::as_str) {
         Some("--uninstall") => {
-            let Some(bundle) = bundle_of(&std::env::current_exe().ok()?) else {
-                crate::log::info("--uninstall only works from inside Taskboard.app");
+            let exe = std::env::current_exe().ok()?;
+            let Some(bundle) = (if cfg!(windows) { install_dir_of(&exe) } else { bundle_of(&exe) }) else {
+                crate::log::info("--uninstall only works from an installed Taskboard");
                 return Some(2);
             };
             let mut code = 0;
-            if let Err(e) = unregister(&bundle) {
+            // No login item on Windows yet.
+            if cfg!(target_os = "macos")
+                && let Err(e) = unregister(&bundle)
+            {
                 crate::log::info(format!("unregistering the daemon failed: {e}"));
                 code = 1;
             }
@@ -430,6 +458,19 @@ mod tests {
     fn bundle_detection() {
         assert_eq!(bundle_of(Path::new("/A/Taskboard.app/Contents/MacOS/taskboard-app")), Some(PathBuf::from("/A/Taskboard.app")));
         assert_eq!(bundle_of(Path::new("/x/target/debug/taskboard-app")), None);
+    }
+
+    #[test]
+    fn install_dir_detection() {
+        let dir = std::env::temp_dir().join(format!("taskboard-install-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("taskboard-app.exe");
+        std::fs::write(dir.join("tb.exe"), "").unwrap();
+        assert_eq!(install_dir_of(&exe), None, "a cargo build's folder: tb.exe but no plugin");
+        std::fs::create_dir_all(dir.join("plugin")).unwrap();
+        assert_eq!(install_dir_of(&exe), Some(dir.clone()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

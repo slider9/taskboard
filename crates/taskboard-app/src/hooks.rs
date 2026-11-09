@@ -1,10 +1,12 @@
 //! The Claude Code hooks, which report each session's activity to the board through `tb`, and the
-//! `task-board` plugin (`plugin/` in the repo, shipped in the bundle at `Contents/Resources/plugin`),
-//! which gives sessions the skill and the `/start` command.
+//! `task-board` plugin (`plugin/` in the repo, shipped in the bundle at `Contents/Resources/plugin`,
+//! or beside the app as `plugin\` on Windows), which gives sessions the skill and the `/start` command.
 //!
 //! The hooks are entries in Claude Code's `settings.json`, as Midna writes its own: each runs this
 //! app's `tb` at its fixed path in the bundle, so an update reaches them without a reinstall, and is
-//! guarded so a missing binary is skipped instead of failing the hook. They're checked by what they
+//! guarded so a missing binary is skipped instead of failing the hook. They're POSIX shell: Claude
+//! Code runs hook commands with `sh` on macOS and Git Bash on Windows, where the paths in them are
+//! written with forward slashes, as Claude Code writes its own. They're checked by what they
 //! say, never by a version: an update whose hooks are unchanged needs nothing. Claude's other
 //! settings and the user's own hooks are left as they are, and a file that doesn't parse is never
 //! rewritten.
@@ -96,17 +98,33 @@ pub struct Target {
 }
 
 impl Target {
-    fn of(bundle: &Path, can_install: bool) -> Target {
-        Target { plugin: bundle.join("Contents/Resources/plugin"), tb: bundle.join("Contents/MacOS/tb"), can_install }
+    /// The `tb` and plugin of the app at `app`: inside the bundle on macOS, beside the app in its
+    /// install folder on Windows.
+    fn of(app: &Path, can_install: bool) -> Target {
+        if cfg!(windows) {
+            Target { plugin: app.join("plugin"), tb: app.join("tb.exe"), can_install }
+        } else {
+            Target { plugin: app.join("Contents/Resources/plugin"), tb: app.join("Contents/MacOS/tb"), can_install }
+        }
     }
 }
 
 pub fn target() -> Option<Target> {
-    let bundle = crate::install::installed_bundle()?;
+    let app = crate::install::installed_app()?;
     if std::env::var_os("TASKBOARD_NO_TB_LINK").is_some() {
-        return Some(Target::of(Path::new("/Applications/Taskboard.app"), false));
+        return Some(Target::of(&real_app(), false));
     }
-    Some(Target::of(&bundle, true))
+    Some(Target::of(&app, true))
+}
+
+/// Where Taskboard (not Taskboard Dev) is installed.
+fn real_app() -> PathBuf {
+    if cfg!(windows) {
+        let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| dirs_home().join(r"AppData\Local"));
+        local.join(r"Programs\Taskboard")
+    } else {
+        PathBuf::from("/Applications/Taskboard.app")
+    }
 }
 
 /// Claude Code's config folder (`CLAUDE_CONFIG_DIR`, else `~/.claude`).
@@ -143,15 +161,22 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// `p` as the hooks' shell is given it: on Windows with forward slashes (`C:/Users/…`, which Git
+/// Bash reads as it is) and without the `\\?\` a canonical path starts with.
+fn shell_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if cfg!(windows) { s.trim_start_matches(r"\\?\").replace('\\', "/") } else { s.into_owned() }
+}
+
 /// The shell command for a hook: run the program if it's there, else do nothing and succeed.
 fn command(run: Run, t: &Target) -> String {
     match run {
         Run::Tb(arg) => {
-            let q = sh_quote(&t.tb.to_string_lossy());
+            let q = sh_quote(&shell_path(&t.tb));
             format!("[ -x {q} ] && exec {q} hook {arg} || true")
         }
         Run::WaitHint => {
-            let q = sh_quote(&t.plugin.join(WAIT_HINT).to_string_lossy());
+            let q = sh_quote(&shell_path(&t.plugin.join(WAIT_HINT)));
             format!("[ -x {q} ] && exec {q} || true")
         }
     }
@@ -177,9 +202,11 @@ fn entry(e: &Entry, t: &Target) -> Value {
     Value::Object(v)
 }
 
-/// A hook command this app wrote, for any copy of `tb` (an older app, one that moved).
+/// A hook command this app wrote, for any copy of `tb` (an older app, one that moved, Windows' `tb.exe`).
 fn is_ours(hook: &Value) -> bool {
-    hook["command"].as_str().is_some_and(|c| c.starts_with("[ -x '") && (c.contains("/tb' hook ") || c.contains(&format!("/{WAIT_HINT}' "))))
+    hook["command"].as_str().is_some_and(|c| {
+        c.starts_with("[ -x '") && (c.contains("/tb' hook ") || c.contains("/tb.exe' hook ") || c.contains(&format!("/{WAIT_HINT}' ")))
+    })
 }
 
 /// Our entries per event (an entry counts if any of its hooks is ours).
@@ -364,11 +391,34 @@ fn plugin_check(settings: &Value, known: &Value, installed: &Value, want: &Path)
 }
 
 /// The `claude` CLI. An app opened from Finder has a bare PATH, so look where installers put it.
+/// On Windows that's `claude.exe` (the native installer's) or npm's `claude.cmd`, else the copy the
+/// Claude desktop app runs.
 fn claude_bin() -> Option<PathBuf> {
     let home = dirs_home();
-    let mut dirs = vec![home.join(".local/bin"), home.join(".claude/local"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
+    let mut dirs = vec![home.join(".local/bin"), home.join(".claude/local")];
+    if !cfg!(windows) {
+        dirs.extend([PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")]);
+    }
     dirs.extend(std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default());
-    dirs.into_iter().map(|d| d.join("claude")).find(|p| p.is_file())
+    let names: &[&str] = if cfg!(windows) { &["claude.exe", "claude.cmd"] } else { &["claude"] };
+    dirs.iter().flat_map(|d| names.iter().map(move |n| d.join(n))).find(|p| p.is_file()).or_else(desktop_claude)
+}
+
+/// The newest copy of Claude Code the Claude desktop app keeps on Windows
+/// (`%APPDATA%\Claude\claude-code\<version>\<build>\claude.exe`), for a machine with no other.
+fn desktop_claude() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let root = PathBuf::from(std::env::var_os("APPDATA")?).join(r"Claude\claude-code");
+    std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .flat_map(|version| std::fs::read_dir(version.path()).into_iter().flatten().flatten())
+        .map(|build| build.path().join("claude.exe"))
+        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .max()
+        .map(|(_, p)| p)
 }
 
 /// Point the `taskboard` marketplace at this app, install the plugin from it (its copy has no hooks,
@@ -398,10 +448,10 @@ pub fn install(t: &Target) -> Result<(), String> {
     edit_settings(&settings, |v| with(v, t))
 }
 
-/// Take out the hooks that run a `tb` inside `bundle` (`taskboard-app --uninstall`); hooks for
-/// another copy of the app stay.
+/// Take out the hooks that run a `tb` inside `bundle` (`taskboard-app --uninstall`; the install
+/// folder on Windows); hooks for another copy of the app stay.
 pub fn uninstall(claude: &Path, bundle: &Path) -> Result<(), String> {
-    let inside = sh_quote(&bundle.to_string_lossy());
+    let inside = sh_quote(&shell_path(bundle));
     let inside = inside.trim_end_matches('\'').to_string() + "/";
     edit_settings(&claude.join("settings.json"), |v| {
         let mut v = v.clone();
@@ -443,7 +493,18 @@ mod tests {
         write(claude.join("plugins/installed_plugins.json"), json!({"version": 2, "plugins": {PLUGIN: [{"scope": "user", "version": "1.0.0"}]}}));
     }
 
+    #[cfg(not(windows))]
+    const APP: &str = "/Applications/Taskboard.app";
+    #[cfg(not(windows))]
     const CLI: &str = "/Applications/Taskboard.app/Contents/MacOS/tb";
+    #[cfg(not(windows))]
+    const HINT: &str = "/Applications/Taskboard.app/Contents/Resources/plugin/task-board/bin/wait-hint";
+    #[cfg(windows)]
+    const APP: &str = r"C:\Users\me\AppData\Local\Programs\Taskboard";
+    #[cfg(windows)]
+    const CLI: &str = "C:/Users/me/AppData/Local/Programs/Taskboard/tb.exe";
+    #[cfg(windows)]
+    const HINT: &str = "C:/Users/me/AppData/Local/Programs/Taskboard/plugin/task-board/bin/wait-hint";
 
     fn app(at: &str) -> Target {
         Target::of(Path::new(at), true)
@@ -451,7 +512,7 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn writes_the_events_and_timeouts_the_plugin_had() {
-        let t = app("/Applications/Taskboard.app");
+        let t = app(APP);
         let v = with(&json!({}), &t);
         let events: Vec<&str> = v["hooks"].as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(
@@ -464,17 +525,25 @@ mod tests {
         assert_eq!(git["hooks"][0]["if"], "Bash(git *)");
         assert_eq!(git["hooks"][0]["async"], true);
         assert_eq!(v["hooks"]["SessionEnd"][0]["hooks"][0].get("timeout"), None);
-        assert_eq!(
-            v["hooks"]["PreToolUse"][1]["hooks"][0]["command"],
-            "[ -x '/Applications/Taskboard.app/Contents/Resources/plugin/task-board/bin/wait-hint' ] && exec '/Applications/Taskboard.app/Contents/Resources/plugin/task-board/bin/wait-hint' || true"
-        );
+        assert_eq!(v["hooks"]["PreToolUse"][1]["hooks"][0]["command"], format!("[ -x '{HINT}' ] && exec '{HINT}' || true"));
         // A path with a quote in it stays one word.
-        assert!(command(Run::Tb("Stop"), &app("/Users/o'neil/Taskboard.app")).starts_with(r"[ -x '/Users/o'\''neil/Taskboard.app/Contents/MacOS/tb' ]"));
+        let quoted = command(Run::Tb("Stop"), &app("/Users/o'neil/Taskboard.app"));
+        assert!(quoted.starts_with(r"[ -x '/Users/o'\''neil/Taskboard.app/"), "{quoted}");
+    }
+
+    #[cfg(windows)]
+    #[::core::prelude::v1::test]
+    fn windows_paths_reach_git_bash_with_forward_slashes() {
+        assert_eq!(shell_path(Path::new(r"\\?\C:\Users\me\Programs\Taskboard\tb.exe")), "C:/Users/me/Programs/Taskboard/tb.exe");
+        let t = app(APP);
+        assert_eq!(command(Run::Tb("Stop"), &t), format!("[ -x '{CLI}' ] && exec '{CLI}' hook Stop || true"));
+        assert!(is_ours(&json!({"command": command(Run::Tb("Stop"), &t)})));
+        assert!(is_ours(&json!({"command": command(Run::WaitHint, &t)})));
     }
 
     #[::core::prelude::v1::test]
     fn install_keeps_the_user_s_settings_and_is_current() {
-        let t = app("/Applications/Taskboard.app");
+        let t = app(APP);
         let user = json!({"model": "opus", "statusLine": {"type": "command", "command": "mine"},
             "hooks": {"Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "/u/stop"}]}]}});
         assert!(matches!(state(&user, &t), State::None));
@@ -492,7 +561,7 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn stale_when_the_app_moves_or_an_event_is_missing() {
-        let t = app("/Applications/Taskboard.app");
+        let t = app(APP);
         let v = with(&json!({}), &app("/Volumes/Old/Taskboard.app"));
         assert!(matches!(state(&v, &t), State::Stale(w) if w.contains("another copy of tb")));
         assert_eq!(with(&v, &t), with(&json!({}), &t), "installing replaces the old app's hooks");
@@ -506,24 +575,24 @@ mod tests {
         assert!(matches!(state(&v, &t), State::Stale(w) if w.contains("differ")));
     }
 
-    // The hook commands are POSIX shell; how Claude Code on Windows runs them is still to settle.
-    #[cfg(unix)]
+    // Run as Claude Code runs them: `sh` on Unix, Git Bash on Windows.
     #[::core::prelude::v1::test]
     fn a_command_does_nothing_when_tb_is_missing() {
         for run in [Run::Tb("Stop"), Run::WaitHint] {
-            let o = Command::new("/bin/sh").arg("-c").arg(command(run, &app("/nonexistent/Taskboard.app"))).output().unwrap();
+            let o = taskboardd::proc::shell(&command(run, &app("/nonexistent/Taskboard.app"))).output().unwrap();
             assert!(o.status.success() && o.stdout.is_empty() && o.stderr.is_empty(), "{o:?}");
         }
     }
 
-    #[cfg(unix)]
     #[::core::prelude::v1::test]
     fn a_command_runs_tb_with_its_event() {
         let (t, _, target) = setup("run");
         std::fs::create_dir_all(target.tb.parent().unwrap()).unwrap();
+        // A script standing in for tb (Git Bash runs one called tb.exe as well).
         std::fs::write(&target.tb, "#!/bin/sh\necho \"$@\"\n").unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&target.tb, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        let o = Command::new("/bin/sh").arg("-c").arg(command(Run::Tb("ToolEnd"), &target)).output().unwrap();
+        let o = taskboardd::proc::shell(&command(Run::Tb("ToolEnd"), &target)).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&o.stdout), "hook ToolEnd\n");
         drop(t);
     }
@@ -653,8 +722,18 @@ mod tests {
         let (t, claude, _) = setup("claude");
         let (old, new) = (Target::of(&t.0.join("Old.app"), true), Target::of(&t.0.join("New.app"), true));
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugin");
+        fn copy(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for e in std::fs::read_dir(from).unwrap().flatten() {
+                if e.file_type().unwrap().is_dir() {
+                    copy(&e.path(), &to.join(e.file_name()));
+                } else {
+                    std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
+                }
+            }
+        }
         for d in [&old.plugin, &new.plugin] {
-            assert!(Command::new("ditto").arg(&repo).arg(d).status().unwrap().success());
+            copy(&repo, d);
         }
         // SAFETY: the only test that touches CLAUDE_CONFIG_DIR, and it's run on its own.
         unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &claude) };

@@ -34,13 +34,16 @@ elif pick "/Applications/Taskboard.app/Contents/MacOS/tb"; then
   bin=/Applications/Taskboard.app/Contents/MacOS/tb
 elif pick "$HOME/Applications/Taskboard.app/Contents/MacOS/tb"; then
   bin=$HOME/Applications/Taskboard.app/Contents/MacOS/tb
+elif [ -n "$LOCALAPPDATA" ] && pick "$LOCALAPPDATA/Programs/Taskboard/tb.exe"; then
+  # Windows (Git Bash), where the app installs to %LOCALAPPDATA%\Programs\Taskboard.
+  bin=$LOCALAPPDATA/Programs/Taskboard/tb.exe
 fi
 
 if [ -z "$bin" ]; then
   case $1 in
     hook|statusline) exit 0 ;;
   esac
-  echo "tb: taskboard binary not found; set TASKBOARD_TB or install Taskboard.app or put tb in ~/.local/bin" >&2
+  echo "tb: taskboard binary not found; set TASKBOARD_TB or install Taskboard or put tb in ~/.local/bin" >&2
   exit 1
 fi
 
