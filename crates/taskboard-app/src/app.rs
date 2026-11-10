@@ -2526,10 +2526,13 @@ mod tests {
     }
 
     /// A poll that brings nothing new doesn't redraw; one that does, a refresh, or a poll after
-    /// `AGES` without a redraw does.
+    /// `AGES` without a redraw does. On the Backlog page, which asks only for the board and the goal
+    /// list: the Board page also asks `GET /days`, which counts the sample board's running work by
+    /// the wall clock, so a few seconds after the board was seeded its answer is new.
     #[gpui_kit::test]
     fn a_poll_that_brings_nothing_new_skips_the_redraw(cx: &mut gpui_kit::TestAppContext) {
         let (w, rec) = window(cx);
+        w.update(cx, |m: &mut MainWindow, _, cx| m.go(Page::Backlog, cx)).unwrap();
         settle(cx);
         let e = w.update(cx, |_, _, cx| cx.entity()).unwrap();
         let drawn = std::rc::Rc::new(std::cell::Cell::new(0));
