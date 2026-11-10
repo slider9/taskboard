@@ -256,7 +256,8 @@ fn a_terminal_with_no_task_is_pointed_at_the_no_task_rules() {
 #[test]
 fn each_role_s_file_is_named_in_the_skill_and_holds_its_rules() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugin/task-board/skills/task-board");
-    let read = |file: &str| std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+    // As committed: a Windows checkout may have CRLF line endings.
+    let read = |file: &str| std::fs::read_to_string(dir.join(file)).unwrap_or_else(|e| panic!("{file}: {e}")).replace("\r\n", "\n");
     let core = read("SKILL.md");
     assert!(core.contains("\n## When you're on a task\n"), "reports.rs names this heading");
     for (file, heading) in [
@@ -280,7 +281,8 @@ fn each_role_s_file_is_named_in_the_skill_and_holds_its_rules() {
 fn the_skill_core_stays_within_its_size_limit() {
     const LIMIT: usize = 8 * 1024;
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugin/task-board/skills/task-board/SKILL.md");
-    let size = std::fs::read(&path).unwrap_or_else(|e| panic!("SKILL.md: {e}")).len();
+    // As committed and installed, not with a Windows checkout's CRLF line endings.
+    let size = std::fs::read(&path).unwrap_or_else(|e| panic!("SKILL.md: {e}")).iter().filter(|&&b| b != b'\r').count();
     assert!(
         size <= LIMIT,
         "SKILL.md is {size} bytes, over the {LIMIT} byte limit: every agent loads it, so move text to a topic file beside it and leave a one-line pointer saying when to read that file"

@@ -234,6 +234,8 @@ fn git_repo(b: &Board) -> String {
     std::fs::remove_dir_all(&repo).unwrap();
     git(b.dir.path(), &["init", "-q", "--bare", "-b", "main", &origin.to_string_lossy()]);
     git(b.dir.path(), &["clone", "-q", &origin.to_string_lossy(), &repo.to_string_lossy()]);
+    // Files as committed, whatever Git for Windows' core.autocrlf says.
+    git(&repo, &["config", "core.autocrlf", "false"]);
     git(&repo, &["config", "user.email", "test@example.com"]);
     git(&repo, &["config", "user.name", "Test"]);
     git(&repo, &["switch", "-q", "-c", "main"]);
@@ -264,7 +266,7 @@ fn each_task_starts_in_a_worktree_slot_off_the_base() {
         assert_eq!(git(Path::new(&folder), &["rev-parse", "HEAD"]), head);
         assert!(job.st("prompt").contains(&format!("The board gave the task the worktree slot-{n} from its pool: {folder}, detached at origin/main")), "{}", job.st("prompt"));
         assert!(job.st("prompt").contains(&format!("Its builds go in {folder}/target")), "{}", job.st("prompt"));
-        let log = b.get(&format!("tasks/T{t}"))["log"].to_string();
+        let log = log_text(&b.get(&format!("tasks/T{t}"))["log"]);
         assert!(log.contains(&format!("Made worktree slot-{n} from origin/main at {folder}")), "{log}");
     }
     let again = worktrees::ensure(&b.app, &board::get_task(&b.app, one).unwrap()).unwrap();
@@ -350,6 +352,7 @@ fn a_backport_task_starts_from_its_pr_base_and_its_pr_goes_into_it() {
 fn uncommitted_repo(b: &Board) {
     let repo = b.dir.path().join("webapp");
     git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "core.autocrlf", "false"]);
     std::fs::write(repo.join("README"), "webapp\n").unwrap();
 }
 
@@ -387,13 +390,18 @@ fn a_submit_is_refused_while_its_new_repo_has_nothing_committed() {
     assert_eq!(b.get(&format!("tasks/T{t}"))["status"], "done");
 }
 
+/// A task's log (`card["log"]`) as its entries' text, one a line.
+fn log_text(log: &Value) -> String {
+    log.as_array().into_iter().flatten().filter_map(|e| e["text"].as_str()).collect::<Vec<_>>().join("\n")
+}
+
 fn slot(b: &Board, n: i64) -> String {
-    format!("{}/.claude/worktrees/slot-{n}", b.repo())
+    taskboardd::util::join_path(&b.repo(), &format!(".claude/worktrees/slot-{n}"))
 }
 
 /// A worktree of the task's own, as the board made them before the slot pool.
 fn own_worktree(b: &Board, t: i64) {
-    let folder = format!("{}/.claude/worktrees/T{t}", b.repo());
+    let folder = taskboardd::util::join_path(&b.repo(), &format!(".claude/worktrees/T{t}"));
     git(Path::new(&b.repo()), &["worktree", "add", "-q", "--detach", &folder, "origin/main"]);
 }
 
@@ -424,7 +432,7 @@ fn a_task_takes_the_free_slot_used_last_and_passes_over_a_dirty_one() {
     runner::start_queued(&b.app).unwrap();
     assert_eq!(b.start_job(next).st("cwd"), slot(&b, 2), "the warmest free slot");
     assert!(git(Path::new(&slot(&b, 2)), &["status", "--short", "--branch"]).starts_with("## HEAD (no branch)"), "detached at the base again");
-    assert!(b.card(next)["log"].to_string().contains(&format!("Took worktree slot-2 at {}, detached at origin/main", slot(&b, 2))));
+    assert!(log_text(&b.card(next)["log"]).contains(&format!("Took worktree slot-2 at {}, detached at origin/main", slot(&b, 2))));
 
     finish(&b, next);
     std::fs::write(Path::new(&slot(&b, 2)).join("left"), "x\n").unwrap();
@@ -445,7 +453,7 @@ fn a_restarted_task_goes_back_to_the_slot_it_holds_with_its_uncommitted_work() {
     runner::start_queued(&b.app).unwrap();
     assert_eq!(b.start_job(one).st("cwd"), slot(&b, 1));
     // It worked from a subfolder, which has no .git of its own, and left uncommitted work.
-    let sub = format!("{}/ios", slot(&b, 1));
+    let sub = taskboardd::util::join_path(&slot(&b, 1), "ios");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(Path::new(&sub).join("Podfile.lock"), "x\n").unwrap();
     let mut ctx = board::task_context(&board::get_task(&b.app, one).unwrap());
@@ -502,7 +510,7 @@ fn a_parked_task_starts_again_at_its_slot_s_root() {
     b.add_session("s1");
     b.open_for("s1", one);
     b.report("hook.prompt", "s1", json!({"prompt": b.start_job(one).st("prompt")}));
-    let sub = format!("{}/ios", slot(&b, 1));
+    let sub = taskboardd::util::join_path(&slot(&b, 1), "ios");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(Path::new(&sub).join("Podfile.lock"), "x\n").unwrap();
     let mut ctx = board::task_context(&board::get_task(&b.app, one).unwrap());
@@ -639,7 +647,7 @@ fn a_start_already_waiting_on_the_cap_gives_its_slot_back() {
     assert_eq!(live_starts(&b), vec![one], "the start still waiting goes");
     let slots = b.get("slots")["slots"].clone();
     assert_eq!((slots[0]["held_by"].clone(), slots[1]["held_by"].clone()), (json!(format!("T{one}")), Value::Null), "{slots}");
-    assert!(b.card(two)["log"].to_string().contains("so it gives back its worktree slot meanwhile"), "{}", b.card(two)["log"]);
+    assert!(log_text(&b.card(two)["log"]).contains("so it gives back its worktree slot meanwhile"), "{}", b.card(two)["log"]);
     assert_eq!(b.card(two)["waiting"], "Waits for a free slot: 1 of 1 task terminals running across the board");
 }
 
@@ -672,7 +680,7 @@ fn a_finished_clean_worktree_is_removed_and_a_dirty_one_kept() {
         own_worktree(&b, t);
     }
     runner::start_queued(&b.app).unwrap();
-    let folder = |t: i64| format!("{}/.claude/worktrees/T{t}", b.repo());
+    let folder = |t: i64| taskboardd::util::join_path(&b.repo(), &format!(".claude/worktrees/T{t}"));
     std::fs::write(Path::new(&folder(dirty)).join("left"), "x\n").unwrap();
     for t in [clean, dirty] {
         b.app.db.x("UPDATE tasks SET status = 'done', session_id = NULL WHERE id = ?", p![t]).unwrap();
@@ -681,8 +689,8 @@ fn a_finished_clean_worktree_is_removed_and_a_dirty_one_kept() {
     assert!(!Path::new(&folder(clean)).exists());
     assert!(Path::new(&folder(dirty)).exists());
     assert!(Path::new(&folder(working)).exists());
-    assert!(b.card(clean)["log"].to_string().contains(&format!("Removed its worktree at {}", folder(clean))));
-    assert!(b.card(dirty)["log"].to_string().contains(&format!("Left its worktree at {}: it has uncommitted changes", folder(dirty))));
+    assert!(log_text(&b.card(clean)["log"]).contains(&format!("Removed its worktree at {}", folder(clean))));
+    assert!(log_text(&b.card(dirty)["log"]).contains(&format!("Left its worktree at {}: it has uncommitted changes", folder(dirty))));
     assert!(worktrees::clean_up(&b.app).unwrap().is_empty(), "each is looked at once");
 }
 
@@ -704,7 +712,7 @@ fn a_pr_task_keeps_its_worktree_until_its_pr_is_linked_and_finished() {
     b.app.db.x("UPDATE tasks SET no_pr = 'nothing to change' WHERE id = ?", p![canceled]).unwrap();
     b.app.db.x("UPDATE tasks SET pr_num = 3, pr_repo = 'acme/webapp', pr_state = 'MERGED', pr_phase = 'merged' WHERE id = ?", p![merged]).unwrap();
     assert_eq!(worktrees::clean_up(&b.app).unwrap(), vec![canceled, merged], "a PR task with no PR yet keeps its worktree");
-    assert!(Path::new(&format!("{}/.claude/worktrees/T{waiting}", b.repo())).exists());
+    assert!(Path::new(&taskboardd::util::join_path(&b.repo(), &format!(".claude/worktrees/T{waiting}"))).exists());
 
     b.app.db.x("UPDATE tasks SET pr_num = 4, pr_repo = 'acme/webapp', pr_state = 'OPEN', pr_phase = 'review' WHERE id = ?", p![waiting]).unwrap();
     assert!(worktrees::clean_up(&b.app).unwrap().is_empty(), "nor while its PR is open");
@@ -732,7 +740,7 @@ fn worktrees_agents_made_are_matched_to_their_task_and_removed_by_the_same_rules
     add(&wt(&format!("webapp-t{pr_open}")), None);
     add(&wt("scratch"), Some("spike"));
     std::fs::write(Path::new(&wt(&format!("webapp-t{dirty}"))).join("left"), "x\n").unwrap();
-    let ctx = json!({"where": {"worktree": format!("{}/sub", wt("elsewhere"))}}).to_string();
+    let ctx = json!({"where": {"worktree": taskboardd::util::join_path(&wt("elsewhere"), "sub")}}).to_string();
     b.app.db.x("UPDATE tasks SET context = ? WHERE id = ?", p![ctx, by_where]).unwrap();
     for t in [by_branch, by_folder, by_where, dirty, pr_open] {
         b.app.db.x("UPDATE tasks SET status = 'done', session_id = NULL WHERE id = ?", p![t]).unwrap();
@@ -749,18 +757,18 @@ fn worktrees_agents_made_are_matched_to_their_task_and_removed_by_the_same_rules
         assert!(Path::new(&kept).exists(), "{kept}");
     }
     assert_eq!(git(Path::new(&repo), &["worktree", "list"]).lines().count(), 5, "the main checkout and the four kept");
-    let log = b.card(by_branch)["log"].to_string();
-    assert!(log.contains("Removed its worktree at ") && log.contains("/webapp-fix"), "{log}");
-    let dirty_log = b.card(dirty)["log"].to_string();
+    let log = log_text(&b.card(by_branch)["log"]);
+    assert!(log.contains("Removed its worktree at ") && log.contains(&format!("{}webapp-fix", std::path::MAIN_SEPARATOR)), "{log}");
+    let dirty_log = log_text(&b.card(dirty)["log"]);
     assert!(dirty_log.contains("it has uncommitted changes"), "{dirty_log}");
-    assert!(b.card(pr_open)["log"].to_string().contains("its PR is still open"));
-    assert!(!b.card(active)["log"].to_string().contains("Left its worktree"), "an active task's timeline stays quiet");
+    assert!(log_text(&b.card(pr_open)["log"]).contains("its PR is still open"));
+    assert!(!log_text(&b.card(active)["log"]).contains("Left its worktree"), "an active task's timeline stays quiet");
     let stray = &b.get("projects")["projects"][0]["stray_worktrees"];
     assert_eq!(stray.as_array().unwrap().len(), 1, "{stray}");
-    assert!(stray[0].as_str().unwrap().ends_with("/scratch"), "{stray}");
+    assert!(stray[0].as_str().unwrap().ends_with(&format!("{}scratch", std::path::MAIN_SEPARATOR)), "{stray}");
 
     assert!(worktrees::clean_up(&b.app).unwrap().is_empty());
-    assert_eq!(b.card(dirty)["log"].to_string().matches("it has uncommitted changes").count(), dirty_log.matches("it has uncommitted changes").count(), "it says why once");
+    assert_eq!(log_text(&b.card(dirty)["log"]).matches("it has uncommitted changes").count(), dirty_log.matches("it has uncommitted changes").count(), "it says why once");
     b.app.db.x("UPDATE tasks SET pr_state = 'MERGED', pr_phase = 'merged' WHERE id = ?", p![pr_open]).unwrap();
     assert_eq!(worktrees::clean_up(&b.app).unwrap(), vec![pr_open], "once its PR is merged");
 }
@@ -790,7 +798,7 @@ fn a_stacked_task_starts_from_its_parent_s_branch_where_it_exists() {
 #[test]
 fn a_hook_from_another_tasks_worktree_leaves_the_task_where_it_was() {
     let b = new_board();
-    let wt = |n: &str| format!("{}/.claude/worktrees/{n}", b.repo());
+    let wt = |n: &str| taskboardd::util::join_path(&b.repo(), &format!(".claude/worktrees/{n}"));
     b.add_session("s1");
     b.add_session("s2");
     let a = b.task("Land the test", json!({"pickup": "manual"}));
@@ -798,10 +806,10 @@ fn a_hook_from_another_tasks_worktree_leaves_the_task_where_it_was() {
     b.report("hook.stop", "s1", json!({"cwd": wt("ct-T1"), "last_message": "Built it.", "git": {"branch": "chore/tuple", "commit": "x", "sha": "y", "uncommitted": 0}}));
     let t2 = b.task("Build on it", json!({"pickup": "manual"}));
     b.report("hook.prompt", "s2", json!({"prompt": format!("[task-board:T{t2}] go")}));
-    b.report("hook.stop", "s2", json!({"cwd": format!("{}/app", wt("ct-T2")), "last_message": "Built it.", "git": {"branch": "feature/build-on-it", "commit": "Add it", "sha": "abc", "uncommitted": 0}}));
+    b.report("hook.stop", "s2", json!({"cwd": taskboardd::util::join_path(&wt("ct-T2"), "app"), "last_message": "Built it.", "git": {"branch": "feature/build-on-it", "commit": "Add it", "sha": "abc", "uncommitted": 0}}));
     b.report("hook.pre_compact", "s2", json!({"cwd": wt("ct-T1"), "git": {"branch": "chore/tuple", "commit": "x", "sha": "y", "uncommitted": 0}}));
     let w = &b.card(t2)["context"]["where"];
-    assert_eq!((w["branch"].as_str().unwrap(), w["worktree"].as_str().unwrap()), ("feature/build-on-it", format!("{}/app", wt("ct-T2")).as_str()));
+    assert_eq!((w["branch"].as_str().unwrap(), w["worktree"].as_str().unwrap()), ("feature/build-on-it", taskboardd::util::join_path(&wt("ct-T2"), "app").as_str()));
 }
 
 #[test]
@@ -820,7 +828,7 @@ fn write_turn(b: &Board, sid: &str, prompt: &str, files: &[&str], at: &str) {
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     let mut lines = vec![json!({"type": "user", "message": {"content": prompt}, "timestamp": at})];
     for f in files {
-        lines.push(json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": format!("{}/{f}", b.repo())}}]}}));
+        lines.push(json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": taskboardd::util::join_path(&b.repo(), f)}}]}}));
     }
     std::fs::write(&file, lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
 }
@@ -1080,7 +1088,7 @@ fn submitting_gives_the_slot_back_detached_with_its_branch_kept() {
     assert_ne!(row.s("used_at").map(|s| s.to_string()), used, "its last use is recorded");
     assert!(git(Path::new(&slot(&b, 1)), &["status", "--short", "--branch"]).starts_with("## HEAD (no branch)"), "detached at the base again");
     let card = b.card(one);
-    assert!(card["log"].to_string().contains("Gave back worktree slot-1; its branch feature/one is kept for review fixes"), "{}", card["log"]);
+    assert!(log_text(&card["log"]).contains("Gave back worktree slot-1; its branch feature/one is kept for review fixes"), "{}", card["log"]);
     let ctx = board::task_context(&board::get_task(&b.app, one).unwrap());
     assert_eq!(ctx.s("worktree_branch"), Some("feature/one"));
     assert!(b.get("slots")["slots"][0]["held_by"].is_null(), "free while its terminal is still open");
@@ -1143,7 +1151,7 @@ fn failing_or_parking_gives_the_slot_back_its_uncommitted_work_saved() {
     assert!(slot_row(&b, 2).i("task_id").is_none(), "failing gives the slot back");
     assert_eq!(git(Path::new(&slot(&b, 2)), &["status", "--porcelain"]), "", "clean");
     assert_eq!(git(Path::new(&slot(&b, 2)), &["show", &format!("wip/T{two}-slot-2:loose")]), "x", "its work saved off it");
-    assert!(b.card(two)["log"].to_string().contains(&format!("to branch wip/T{two}-slot-2")), "{}", b.card(two)["log"]);
+    assert!(log_text(&b.card(two)["log"]).contains(&format!("to branch wip/T{two}-slot-2")), "{}", b.card(two)["log"]);
 }
 
 #[test]
@@ -1172,7 +1180,7 @@ fn review_fixes_reclaim_a_slot_on_the_pushed_branch() {
     let out = b.post(&format!("tasks/T{one}/slot/claim"), json!({}));
     assert_eq!(out["slot"], "slot-2", "another slot while its own is taken");
     assert_eq!(git(Path::new(&slot(&b, 2)), &["rev-parse", "--abbrev-ref", "HEAD"]), "feature/one");
-    assert!(b.card(one)["log"].to_string().contains(&format!("Made worktree slot-2 at {}, on its branch feature/one", slot(&b, 2))), "{}", b.card(one)["log"]);
+    assert!(log_text(&b.card(one)["log"]).contains(&format!("Made worktree slot-2 at {}, on its branch feature/one", slot(&b, 2))), "{}", b.card(one)["log"]);
 }
 
 /// A slot whose worktree was removed under it, its empty folder left behind.
@@ -1182,11 +1190,11 @@ fn lose_worktree(b: &Board, n: i64) {
 }
 
 fn top_level(folder: &str) -> String {
-    git(Path::new(folder), &["rev-parse", "--show-toplevel"])
+    taskboardd::util::native(&git(Path::new(folder), &["rev-parse", "--show-toplevel"]))
 }
 
 fn real(folder: &str) -> String {
-    std::fs::canonicalize(folder).unwrap().to_string_lossy().to_string()
+    taskboardd::util::canonical(folder).unwrap().to_string_lossy().to_string()
 }
 
 #[test]
@@ -1207,7 +1215,7 @@ fn a_slot_that_lost_its_worktree_is_made_again_and_never_moves_the_shared_checko
     assert_eq!(top_level(&slot(&b, 1)), real(&slot(&b, 1)), "a worktree of its own again");
     assert_eq!(git(Path::new(&slot(&b, 1)), &["rev-parse", "--abbrev-ref", "HEAD"]), "feature/one");
     assert_eq!(git(Path::new(&b.repo()), &["rev-parse", "--abbrev-ref", "HEAD"]), "main", "the shared checkout stays on main");
-    assert!(b.card(one)["log"].to_string().contains("Made worktree slot-1 again"), "{}", b.card(one)["log"]);
+    assert!(log_text(&b.card(one)["log"]).contains("Made worktree slot-1 again"), "{}", b.card(one)["log"]);
 
     lose_worktree(&b, 1);
     assert_eq!(b.post(&format!("tasks/T{one}/slot/release"), json!({}))["released"], true);
@@ -1237,7 +1245,7 @@ fn a_slot_git_no_longer_lists_is_left_with_its_files_and_the_task_gets_another()
     assert_eq!(top_level(&slot(&b, 2)), real(&slot(&b, 2)));
     assert!(Path::new(&slot(&b, 1)).join("notes").exists(), "its files are left for a look");
     assert!(b.app.db.q1("SELECT * FROM worktree_slots WHERE n = 1", p![]).unwrap().is_none(), "and it's out of the pool");
-    let log = b.card(next)["log"].to_string();
+    let log = log_text(&b.card(next)["log"]);
     assert!(log.contains("Dropped worktree slot-1 from the pool"), "{log}");
     assert_eq!(git(Path::new(&b.repo()), &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
 }
@@ -1385,7 +1393,7 @@ fn a_task_outside_a_goal_claims_a_slot_and_lands_on_the_slot_lane() {
     assert_eq!((out["brought"].clone(), out["left"].clone()), (json!([]), json!([])));
     assert_eq!(git(Path::new(&slot(&b, 1)), &["rev-parse", "HEAD"]), head);
     assert_eq!(lane(&b, t), ("slot".into(), "task".into()));
-    assert!(b.card(t)["log"].to_string().contains("Works in a worktree slot: claimed slot-1"), "{}", b.card(t)["log"]);
+    assert!(log_text(&b.card(t)["log"]).contains("Works in a worktree slot: claimed slot-1"), "{}", b.card(t)["log"]);
     assert_eq!(b.post(&format!("tasks/T{t}/slot/claim"), json!({}))["slot"], "slot-1", "claiming again keeps it");
 }
 
@@ -1411,7 +1419,7 @@ fn a_full_pool_leaves_the_lane_as_it_was() {
     let (code, _) = b.post_err(&format!("tasks/T{two}/slot/claim"), json!({}));
     assert_eq!(code, 409);
     assert_eq!(lane(&b, two), before);
-    assert!(!b.card(two)["log"].to_string().contains("Works in a worktree slot"));
+    assert!(!log_text(&b.card(two)["log"]).contains("Works in a worktree slot"));
 }
 
 #[test]
@@ -1436,7 +1444,7 @@ fn bring_moves_a_tracked_and_a_new_file_and_cleans_the_shared_copies() {
     assert_eq!(git(Path::new(&repo), &["status", "--porcelain", "--", "README", "src", "other"]), "?? other", "the shared copies are gone, others' are left");
     assert!(Path::new(out["patch"].as_str().unwrap()).exists(), "{out}");
     assert_eq!(lane(&b, t), ("slot".into(), "task".into()));
-    assert!(b.card(t)["log"].to_string().contains("bringing"), "{}", b.card(t)["log"]);
+    assert!(log_text(&b.card(t)["log"]).contains("bringing"), "{}", b.card(t)["log"]);
 }
 
 #[test]
@@ -1466,7 +1474,7 @@ fn patched(b: &Board, t: i64, file: &str, patch: Value) {
     use std::io::Write;
     let dir = b.app.cfg.data.join("hunks");
     std::fs::create_dir_all(&dir).unwrap();
-    let line = json!({"file": format!("{}/{file}", b.repo()), "patch": patch});
+    let line = json!({"file": taskboardd::util::join_path(&b.repo(), file), "patch": patch});
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join(format!("T{t}"))).unwrap();
     writeln!(f, "{line}").unwrap();
 }
@@ -1578,22 +1586,37 @@ fn leaving_hunks_no_log_has_brings_its_own_and_lists_the_rest() {
 
 #[test]
 fn a_shared_copy_that_cant_be_written_leaves_everything_as_it_was() {
-    use std::os::unix::fs::PermissionsExt;
     let b = new_board();
     let (mine, _) = shared_list(&b);
     let repo = b.repo();
     let file = Path::new(&repo).join("list");
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    read_only(&file, true);
     let before = lane(&b, mine);
 
     let (code, msg) = b.post_err(&format!("tasks/T{mine}/slot/claim"), json!({"bring": []}));
-    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    read_only(&file, false);
     assert_eq!(code, 409);
     assert!(msg.contains("couldn't take its hunks out of list") && msg.contains("the slot was given back"), "{msg}");
     assert_eq!(list_in(&repo), list_with(&[(2, "two (mine)"), (10, "ten (theirs)")]));
     assert_eq!(git(Path::new(&slot(&b, 1)), &["status", "--porcelain"]), "", "the slot is as it was made");
     assert!(slot_row(&b, 1).i("task_id").is_none(), "the slot is free again");
     assert_eq!(lane(&b, mine), before);
+}
+
+/// Makes `file` read-only (or writable again): mode 444 / 644 on Unix, the read-only attribute on Windows.
+fn read_only(file: &Path, on: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(if on { 0o444 } else { 0o644 })).unwrap();
+    }
+    #[cfg(windows)]
+    #[allow(clippy::permissions_set_readonly_false)]
+    {
+        let mut p = std::fs::metadata(file).unwrap().permissions();
+        p.set_readonly(on);
+        std::fs::set_permissions(file, p).unwrap();
+    }
 }
 
 #[test]
@@ -1661,7 +1684,7 @@ fn a_restart_clears_a_stale_copy_of_the_base_but_keeps_the_task_s_own_changes() 
     assert!(!Path::new(&dir).join("later.txt").exists(), "the stale copy is cleared");
     assert_eq!(std::fs::read_to_string(Path::new(&dir).join("change")).unwrap(), "mine\n", "its own edit stays");
     assert!(Path::new(&dir).join("mystery").exists(), "a change that may be its own stays");
-    let log = b.card(one)["log"].to_string();
+    let log = log_text(&b.card(one)["log"]);
     assert!(log.contains("Cleared 1 changed file in slot-1 that") && log.contains("2 other changed files are left"), "{log}");
     let saved = git(Path::new(&dir), &["for-each-ref", "--format=%(refname)", "refs/taskboard/backup"]);
     assert_eq!(git(Path::new(&dir), &["show", &format!("{saved}:later.txt")]), "from main", "saved before it was cleared");
@@ -1684,7 +1707,7 @@ fn a_restart_rebases_a_clean_unpushed_branch_onto_the_base() {
     let d = Path::new(&dir);
     assert_eq!(git(d, &["merge-base", "HEAD", "origin/main"]), git(d, &["rev-parse", "origin/main"]), "on top of the base");
     assert_eq!(git(d, &["rev-list", "--count", "origin/main..HEAD"]), "1", "its commit kept");
-    assert!(b.card(one)["log"].to_string().contains("Rebased feature/one in slot-1 onto origin/main: it was 1 commit behind origin/main"), "{}", b.card(one)["log"]);
+    assert!(log_text(&b.card(one)["log"]).contains("Rebased feature/one in slot-1 onto origin/main: it was 1 commit behind origin/main"), "{}", b.card(one)["log"]);
 }
 
 #[test]
@@ -1715,7 +1738,7 @@ fn a_task_holding_extra_slots_gives_back_clean_ones_and_gets_a_terminal_for_the_
     taskboardd::slot_tidy::sweep(&b.app).unwrap();
     assert!(dispatch::listing(&b.app).iter().any(|a| a["key"] == json!(format!("slots-extra:T{one}"))), "the owner hears once that terminal is gone");
 
-    let out = b.post("slots/discard", json!({"path": format!("{}/ios", slot(&b, 3))}));
+    let out = b.post("slots/discard", json!({"path": taskboardd::util::join_path(&slot(&b, 3), "ios")}));
     assert_eq!(out["files"], 1, "{out}");
     let backup = out["backup"].as_str().unwrap().to_string();
     assert!(!Path::new(&slot(&b, 3)).join("Podfile.lock").exists());

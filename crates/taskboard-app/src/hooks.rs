@@ -449,7 +449,7 @@ pub fn install(t: &Target) -> Result<(), String> {
     read_settings(&settings)?;
     let claude = claude_bin().ok_or("Couldn't find the claude command.")?;
     let run = |args: &[&str]| -> Result<(), String> {
-        let out = Command::new(&claude).args(args).output().map_err(|e| format!("Couldn't run claude: {e}"))?;
+        let out = taskboardd::proc::command_with(&claude, args).output().map_err(|e| format!("Couldn't run claude: {e}"))?;
         if out.status.success() {
             return Ok(());
         }

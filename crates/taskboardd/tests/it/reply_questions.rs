@@ -2,7 +2,6 @@
 //! against the owner's rules, answered back to the agent when they cover it, and otherwise put to the
 //! owner with an alert. A follow-up prompt doesn't settle it: asking again alerts again.
 
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -25,7 +24,7 @@ fn board_screening(verdict: Value) -> Board {
     std::fs::create_dir_all(&repo).unwrap();
     let script = dir.path().join("claude");
     std::fs::write(&script, format!("#!/bin/sh\necho '{}'\n", json!({"structured_output": verdict}))).unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&script).unwrap();
     cfg.claude = script.to_string_lossy().to_string();
     cfg.questions.screen = true;
     let app = App::for_tests(cfg);

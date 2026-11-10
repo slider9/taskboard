@@ -44,9 +44,8 @@ pub fn run_until(
     input: Option<&[u8]>,
     stop: &dyn Fn() -> bool,
 ) -> Result<Option<Output>, RunError> {
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+    let mut cmd = command_with(program, args);
+    cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.envs(env.iter().map(|(k, v)| (k, v)));
@@ -112,11 +111,115 @@ pub fn run_until(
     Ok(Some(Output { code, stdout, stderr }))
 }
 
+/// A command that runs `program`. Windows can't start a `#!` script itself (a file with no extension
+/// that starts `#!`, such as a wrapper config.toml names for `gh` or `claude`, or a test's fake), so
+/// there it runs in Git Bash: `bash <script> <args>`.
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[cfg(windows)]
+    if is_sh_script(Path::new(program.as_ref())) {
+        let mut c = Command::new(git_bash());
+        bash_args(&mut c, [program.as_ref()]);
+        return c;
+    }
+    Command::new(program)
+}
+
+/// `command(program)` with `args`, written the way the program reads them: through `bash_args` when it
+/// runs in Git Bash.
+pub fn command_with<I, S>(program: impl AsRef<std::ffi::OsStr>, args: I) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut cmd = command(program.as_ref());
+    if runs_in_git_bash(Path::new(program.as_ref())) {
+        bash_args(&mut cmd, args);
+    } else {
+        cmd.args(args);
+    }
+    cmd
+}
+
+/// `program` is Git Bash, or a script `command` runs in it: on Windows its arguments go through
+/// `bash_args`.
+fn runs_in_git_bash(program: &Path) -> bool {
+    #[cfg(windows)]
+    return program == git_bash() || is_sh_script(program);
+    #[cfg(unix)]
+    return {
+        let _ = program;
+        false
+    };
+}
+
+/// Adds `args` to a command that runs Git Bash (`sh()`, `shell`, a script `command` runs). On Windows
+/// Git Bash reads its command line the way Cygwin does, not the way Rust writes it: in quotes `\\` is
+/// one backslash, and outside them `'` quotes, `*`, `{a,b}` and `~` expand and `@file` reads a file. So
+/// each argument goes in double quotes with `\` and `"` escaped, every other character taken as it is.
+/// One that starts with a drive (`C:`) keeps its backslashes as written once inside quotes, so its
+/// letter goes before them. Elsewhere it's `args`.
+pub fn bash_args<I, S>(cmd: &mut Command, args: I) -> &mut Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        for a in args {
+            cmd.raw_arg(cygwin_quoted(&a.as_ref().to_string_lossy()));
+        }
+        cmd
+    }
+    #[cfg(unix)]
+    cmd.args(args)
+}
+
+/// `arg` written for a Cygwin program's command line (`bash_args`).
+#[cfg_attr(unix, allow(dead_code))]
+fn cygwin_quoted(arg: &str) -> String {
+    let b = arg.as_bytes();
+    let drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    let (head, rest) = arg.split_at(if drive { 1 } else { 0 });
+    let mut out = String::with_capacity(arg.len() + 4);
+    out.push_str(head);
+    out.push('"');
+    for c in rest.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// `p` is a script given by its path (not a bare name looked up on PATH) whose file starts `#!` and
+/// has no extension: one Windows runs through Git Bash (`command`).
+fn is_sh_script(p: &Path) -> bool {
+    let by_path = p.parent().is_some_and(|d| !d.as_os_str().is_empty());
+    let mut head = [0u8; 2];
+    by_path && p.extension().is_none() && std::fs::File::open(p).and_then(|mut f| f.read_exact(&mut head)).is_ok() && &head == b"#!"
+}
+
+/// Lets `path` run as a program: executable on Unix. Nothing on Windows, where a `#!` script runs
+/// through Git Bash (`command`) and any other program runs by its extension.
+pub fn make_runnable(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(windows)]
+    let _ = path;
+    Ok(())
+}
+
 /// A command that runs `script` in a shell: `/bin/sh -c` on Unix, Git Bash's `bash -c` on Windows, so
 /// the same POSIX commands in config.toml run on both.
 pub fn shell(script: &str) -> Command {
     let mut c = Command::new(sh());
-    c.args(["-c", script]);
+    bash_args(&mut c, ["-c", script]);
     c
 }
 
@@ -240,10 +343,12 @@ impl Drop for Group {
 }
 
 /// Finds a command on PATH (or returns the path as given when it has a slash). On Windows a name
-/// without an extension is looked for with each of PATHEXT's (`git` is `git.exe`, `npm` is `npm.cmd`).
+/// without an extension is looked for with each of PATHEXT's (`git` is `git.exe`, `npm` is `npm.cmd`);
+/// a path to a `#!` script with none beside it is that script (`command` runs it in Git Bash).
 pub fn which(name: &str) -> Option<std::path::PathBuf> {
     if name.contains('/') || (cfg!(windows) && name.contains('\\')) {
-        return runnable_as(&crate::util::expand_home(name));
+        let p = crate::util::expand_home(name);
+        return runnable_as(&p).or_else(|| is_sh_script(&p).then_some(p));
     }
     let path = std::env::var_os("PATH")?;
     let extra: &[&str] = if cfg!(windows) { &["~/.local/bin"] } else { &["~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"] };
@@ -288,8 +393,61 @@ mod tests {
         // npm's layout: a shell script with no extension beside the .cmd Windows runs.
         std::fs::write(dir.path().join("tool"), "#!/bin/sh\n").unwrap();
         assert_eq!(runnable_as(&dir.path().join("tool")), None);
+        let path = dir.path().join("tool").to_string_lossy().to_string();
+        assert_eq!(which(&path), Some(dir.path().join("tool")), "by its path, a lone script runs in Git Bash");
         std::fs::write(dir.path().join("tool.cmd"), "@echo off\n").unwrap();
         assert_eq!(runnable_as(&dir.path().join("tool")), Some(dir.path().join("tool.cmd")));
         assert_eq!(runnable_as(&dir.path().join("tool.cmd")), Some(dir.path().join("tool.cmd")));
+        assert_eq!(which(&path), Some(dir.path().join("tool.cmd")), "the .cmd beside it comes first");
+    }
+
+    #[test]
+    fn a_sh_script_runs_by_its_path_on_every_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("fake");
+        std::fs::write(&fake, "#!/bin/sh\necho \"said $1 and $2\"\nexit 3\n").unwrap();
+        make_runnable(&fake).unwrap();
+        let args = ["one".to_string(), r#"{"id": "C:\\x y"}"#.to_string()];
+        let o = run(&fake, &args, None, 10.0).ok().expect("it ran");
+        assert_eq!((o.code, o.stdout.trim()), (Some(3), r#"said one and {"id": "C:\\x y"}"#));
+        assert!(!is_sh_script(Path::new("fake")), "a bare name is looked up, not read from here");
+    }
+
+    /// Words Git Bash's own command-line reading would change if Rust's quoting reached it.
+    const AWKWARD: &[&str] = &[
+        r#"{"id": "C:\\x y"}"#,
+        r"C:\Users\me\a b",
+        r#"C:\x "quoted" \\two\\"#,
+        "it's",
+        "*.rs",
+        "{a,b}",
+        "~/x",
+        "@args",
+        r"\\server\share\",
+        r#"ends with \"#,
+        "",
+        "{}",
+        "naïve ünïcode",
+        "two\nlines",
+    ];
+
+    #[test]
+    fn git_bash_gets_every_argument_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("x.rs"), "").unwrap();
+        let args: Vec<String> = AWKWARD.iter().map(|s| s.to_string()).collect();
+        let script = r#"for a in "$@"; do printf '[%s]' "$a"; done"#;
+        let mut all = vec!["-c".to_string(), script.to_string(), "sh".to_string()];
+        all.extend(args.iter().cloned());
+        let want: String = AWKWARD.iter().map(|a| format!("[{a}]")).collect();
+        let o = run_with(&sh(), &all, Some(dir.path()), 10.0, &[], None).ok().expect("it ran");
+        assert_eq!(o.stdout, want, "{}", o.stderr);
+        let o = shell(&format!("printf '[%s]' {}", r#""C:\\x \\\\y""#)).current_dir(dir.path()).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&o.stdout), r"[C:\x \\y]", "a script's own backslashes");
+        let fake = dir.path().join("fake");
+        std::fs::write(&fake, format!("#!/bin/sh\n{script}\n")).unwrap();
+        make_runnable(&fake).unwrap();
+        let o = run(&fake, &args, Some(dir.path()), 10.0).ok().expect("it ran");
+        assert_eq!(o.stdout, want, "{}", o.stderr);
     }
 }

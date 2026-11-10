@@ -20,8 +20,7 @@ fn board_with(f: impl FnOnce(&mut Config)) -> Board {
     cfg.backlog.ai = true;
     let claude = dir.path().join("fake-claude");
     std::fs::write(&claude, "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" >> \"$d/all-args.txt\"\necho '{\"structured_output\": {}}'\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&claude).unwrap();
     cfg.claude = claude.to_string_lossy().to_string();
     f(&mut cfg);
     Board { app: App::for_tests(cfg), dir }

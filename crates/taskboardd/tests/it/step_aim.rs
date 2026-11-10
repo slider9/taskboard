@@ -270,7 +270,9 @@ fn refusals_and_handoffs_fill_head_and_worktree() {
     b.report("tb.step_aim", json!({"worktree": repo.to_string_lossy()})).unwrap();
     let head = git(&repo, &["rev-parse", "HEAD"]);
     let left = steps::missing(&b.app, &b.row(id), &[steps::Before::Pr]).unwrap();
-    let want = format!("review {} {head}", repo.to_string_lossy());
+    // The folder as one shell word (quoted when it has backslashes, as on Windows).
+    let folder = steps::fill_shell("{worktree}", &[("worktree".to_string(), repo.to_string_lossy().to_string())].into());
+    let want = format!("review {folder} {head}");
     let r = steps::refusal_for(&b.app, &b.row(id), "opening the PR", &left);
     assert!(r.contains(&want), "{r}");
     let h = steps::handoff_block(&b.app, &b.row(id), "tb", true);

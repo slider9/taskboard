@@ -1,7 +1,6 @@
 //! One pass of the Midna sync against a fake `midna` CLI: a close-event read that fails doesn't
 //! stop the terminal list from being read.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use serde_json::json;
@@ -19,7 +18,7 @@ fn fake_midna(dir: &Path, events: &str) -> std::path::PathBuf {
         "#!/bin/sh\ncase \"$2\" in\n  events.list) {events} ;;\n  session.list) echo '{sessions}' ;;\n  project.list) echo '[]' ;;\n  *) echo '{{}}' ;;\nesac\n"
     );
     std::fs::write(&exe, script).unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&exe).unwrap();
     exe
 }
 

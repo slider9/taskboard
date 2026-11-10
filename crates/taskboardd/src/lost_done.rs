@@ -424,7 +424,7 @@ esac
 "#,
         )
         .unwrap();
-        std::process::Command::new("chmod").arg("+x").arg(&gh).status().unwrap();
+        crate::proc::make_runnable(&gh).unwrap();
         let mut cfg = Config::for_tests(data.path());
         cfg.pr.gh = gh.to_string_lossy().to_string();
         let app = App::for_tests(cfg);

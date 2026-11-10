@@ -736,8 +736,7 @@ pub fn github_login(app: &App) -> Result<Value> {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| ApiError::new(500, format!("Couldn't make a folder for the sign-in: {e}")))?;
     let scopes = required_scopes(Provider::Github).join(",");
-    let mut cmd = Command::new(&bin);
-    cmd.args(["auth", "login", "--web", "--hostname", "github.com", "--insecure-storage", "--scopes", &scopes]);
+    let mut cmd = proc::command_with(&bin, ["auth", "login", "--web", "--hostname", "github.com", "--insecure-storage", "--scopes", &scopes]);
     isolated_gh(&mut cmd, &dir);
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|e| ApiError::new(500, format!("Couldn't run gh: {e}")))?;
     let mut stderr = child.stderr.take().unwrap();
@@ -820,8 +819,7 @@ pub fn github_login(app: &App) -> Result<Value> {
 /// After a browser sign-in: the token gh wrote into the throwaway folder, checked with GitHub and kept
 /// as Taskboard's.
 fn take_login_token(cfg: &Config, bin: &Path, dir: &Path) -> std::result::Result<(), String> {
-    let mut cmd = Command::new(bin);
-    cmd.args(["auth", "token", "--hostname", "github.com"]);
+    let mut cmd = proc::command_with(bin, ["auth", "token", "--hostname", "github.com"]);
     isolated_gh(&mut cmd, dir);
     let o = cmd.stdin(Stdio::null()).output().map_err(|e| format!("Couldn't run gh: {e}"))?;
     let token = String::from_utf8_lossy(&o.stdout).trim().to_string();

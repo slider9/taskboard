@@ -1,7 +1,6 @@
 //! A task's terminal tab in Midna follows the task: In review, Done, Question, Alert, Task failed and
 //! Waiting, set with Midna's `session.set_status`; its Summary entry gets the task's panel (`summary.annotate`).
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -21,12 +20,12 @@ struct Board {
 fn fake_midna(dir: &Path) -> std::path::PathBuf {
     let exe = dir.join("midna");
     let script = format!(
-        "#!/bin/sh\necho \"$2 $3\" >> {log}\ncase \"$2\" in\n  trigger.list) cat {list} 2>/dev/null || echo '[]' ;;\n  session.list) echo '[]' ;;\n  project.list) echo '[]' ;;\n  events.list) echo '[]' ;;\n  *) echo '{{}}' ;;\nesac\n",
+        "#!/bin/sh\necho \"$2 $3\" >> '{log}'\ncase \"$2\" in\n  trigger.list) cat '{list}' 2>/dev/null || echo '[]' ;;\n  session.list) echo '[]' ;;\n  project.list) echo '[]' ;;\n  events.list) echo '[]' ;;\n  *) echo '{{}}' ;;\nesac\n",
         log = dir.join("calls").display(),
         list = dir.join("triggers").display(),
     );
     std::fs::write(&exe, script).unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&exe).unwrap();
     exe
 }
 

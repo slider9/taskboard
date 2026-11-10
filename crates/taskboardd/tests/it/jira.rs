@@ -33,8 +33,7 @@ fn board_with(f: impl FnOnce(&mut Config, &std::path::Path)) -> Board {
 fn fake_claude(cfg: &mut Config, dir: &std::path::Path) {
     let path = dir.join("fake-claude");
     std::fs::write(&path, "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" > \"$d/args.txt\"\ncat \"$d/args.txt\" >> \"$d/all-args.txt\"\ncat \"$d/answer.json\"\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&path).unwrap();
     cfg.claude = path.to_string_lossy().to_string();
 }
 

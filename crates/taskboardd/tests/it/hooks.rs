@@ -25,8 +25,10 @@ fn board(file: Value) -> Board {
     let repo = dir.path().join("webapp");
     std::fs::create_dir_all(&repo).unwrap();
     let seen = dir.path().join("seen.jsonl");
-    let record = format!("cat >> {} && echo >> {}", seen.display(), seen.display());
-    std::fs::write(hooks::path(&cfg), file.to_string().replace("RECORD", &record)).unwrap();
+    let record = format!("cat >> '{0}' && echo >> '{0}'", seen.display());
+    // Written into a JSON string, so a Windows path's backslashes are escaped.
+    let record = json!(record).to_string();
+    std::fs::write(hooks::path(&cfg), file.to_string().replace("RECORD", record.trim_matches('"'))).unwrap();
     let app = App::for_tests(cfg);
     app.db.set_setting("midna_projects", Some(&json!([{"name": "webapp", "path": repo.to_string_lossy()}]).to_string())).unwrap();
     midna::sync(&app, &[json!({"id": "s1", "name": "Term", "agent": "claude", "cwd": repo.to_string_lossy(), "status": {"state": "working"}})], &[]).unwrap();

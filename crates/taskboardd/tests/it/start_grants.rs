@@ -2,7 +2,6 @@
 //! made, with no one typing in it. The grant is the owner's alone to set, and only Midna's own record of
 //! which trigger opened a terminal counts.
 
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -28,7 +27,7 @@ fn board() -> Board {
     let triggers = dir.path().join("triggers.json");
     std::fs::write(&triggers, NIGHTLY).unwrap();
     std::fs::write(&exe, format!("#!/bin/sh\nif [ \"$2\" = trigger.list ]; then cat '{}'; fi\n", triggers.display())).unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&exe).unwrap();
     cfg.midna = exe;
     let repo = dir.path().join("webapp");
     std::fs::create_dir_all(&repo).unwrap();

@@ -197,7 +197,7 @@ fn files_in_the_boards_folder_need_no_config() {
     });
     let api = planning_for(&app, "project", "api");
     assert_eq!((api["from"].as_str(), api["text"].as_str()), (Some("project"), Some("One task per endpoint.")));
-    assert_eq!(api["path"].as_str().unwrap(), d.path().join("planning/api.md").to_string_lossy());
+    assert_eq!(api["path"].as_str().unwrap(), d.path().join("planning").join("api.md").to_string_lossy());
     let web = planning_for(&app, "project", "webapp");
     assert_eq!((web["from"].as_str(), web["text"].as_str()), (Some("board"), Some("One task per screen.")));
     assert_eq!(web["skipped"], json!([]), "an empty file in its usual place is a placeholder, not a mistake");

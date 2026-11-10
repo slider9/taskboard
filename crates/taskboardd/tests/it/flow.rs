@@ -203,10 +203,10 @@ fn a_terminal_lost_for_no_named_reason_says_what_midna_saw() {
     let exe = fake.path().join("midna");
     std::fs::write(
         &exe,
-        "#!/bin/sh\ncase \"$2\" in\n  session.get) echo '{\"created_at\": \"2020-01-01T00:00:00Z\", \"status\": {\"state\": \"exited\", \"exit_code\": 1}}' ;;\n  session.read) echo '{\"text\": \"panicked at src/main.rs\\\\n───\\\\n\"}' ;;\n  *) echo '{}' ;;\nesac\n",
+        "#!/bin/sh\ncase \"$2\" in\n  session.get) echo '{\"created_at\": \"2020-01-01T00:00:00Z\", \"status\": {\"state\": \"exited\", \"exit_code\": 1}}' ;;\n  session.read) printf '%s\\n' '{\"text\": \"panicked at src/main.rs\\n───\\n\"}' ;;\n  *) echo '{}' ;;\nesac\n",
     )
     .unwrap();
-    std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&exe).unwrap();
     let b = board_with(|c| c.midna = exe);
     let id = new_task(&b, "Long job", json!({}));
     b.add_session("s1", "working");

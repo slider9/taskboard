@@ -75,7 +75,7 @@ fn work_in_another_repo_marks_the_task_once_and_clears_back_home() {
     let b = board();
     let id = b.taken();
     b.report("hook.stop", json!({"cwd": b.path("other")}));
-    let top = std::fs::canonicalize(b.path("other")).unwrap().to_string_lossy().into_owned();
+    let top = taskboardd::util::canonical(b.path("other")).unwrap().to_string_lossy().into_owned();
     assert_eq!(b.outside(id)["path"], json!(top));
     assert_eq!(b.alerts(id), 1);
     b.report("hook.stop", json!({"cwd": b.path("other")}));

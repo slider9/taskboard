@@ -387,10 +387,9 @@ fn the_comment_guard_skips_the_project_folder_for_a_task_with_no_pr_and_no_workt
 
 /// A `midna` that logs each call's method and params and answers `{}`.
 fn fake_midna(dir: &Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let exe = dir.join("midna");
     std::fs::write(&exe, format!("#!/bin/sh\necho \"$2 $3\" >> '{}'\necho '{{}}'\n", dir.join("calls.log").display())).unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&exe).unwrap();
     exe
 }
 

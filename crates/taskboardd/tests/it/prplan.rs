@@ -122,7 +122,7 @@ fn fake_gh(dir: &Path) -> std::path::PathBuf {
         format!("#!/bin/sh\necho \"$@\" >> '{}'\ncat >> '{}.stdin' 2>/dev/null\necho https://github.com/acme/webapp/pull/77\n", log.display(), log.display()),
     )
     .unwrap();
-    Command::new("chmod").arg("+x").arg(&gh).status().unwrap();
+    taskboardd::proc::make_runnable(&gh).unwrap();
     gh
 }
 

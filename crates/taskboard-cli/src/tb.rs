@@ -2795,9 +2795,8 @@ impl Ctx {
         if self.session.is_empty() {
             return None;
         }
-        let mut cmd = std::process::Command::new(self.midna.as_ref()?);
-        cmd.args(args)
-            .env("MIDNA_SESSION", &self.session)
+        let mut cmd = taskboardd::proc::command_with(self.midna.as_ref()?, args);
+        cmd.env("MIDNA_SESSION", &self.session)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -4508,7 +4507,8 @@ fn run_release_script(script: &str, name: &str, dir: Option<&str>, replaces: boo
     let top = release_checkout(dir);
     out(&format!("Running the release script in {top}: {script} {name}"));
     let mut cmd = std::process::Command::new(taskboardd::proc::sh());
-    cmd.arg("-c").arg(format!("{script} \"$1\"")).arg("sh").arg(name).current_dir(&top).env("TB_RELEASE", name).env_remove("TB_RELEASE_REPLACE");
+    taskboardd::proc::bash_args(&mut cmd, ["-c", &format!("{script} \"$1\""), "sh", name]);
+    cmd.current_dir(&top).env("TB_RELEASE", name).env_remove("TB_RELEASE_REPLACE");
     if replaces {
         cmd.env("TB_RELEASE_REPLACE", "1");
     }
@@ -8543,8 +8543,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
-    // Its fake midna is a shell script.
-    #[cfg(unix)]
+    // Its fake midna is a shell script (run in Git Bash on Windows).
     #[test]
     fn tb_question_under_test_never_runs_midna() {
         // tb question alerts only through the Ctx's midna, whatever MIDNA_SESSION the test inherited, and test
@@ -8554,7 +8553,7 @@ mod tests {
         let log = data.join("midna.log");
         let fake = data.join("midna");
         std::fs::write(&fake, format!("#!/bin/sh\necho \"$MIDNA_SESSION $*\" >> '{}'\n", log.display())).unwrap();
-        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        taskboardd::proc::make_runnable(&fake).unwrap();
         assert_eq!(run_cmd(&c, Cli::try_parse_from(["tb", "question", "Which base?"]).unwrap().cmd), Ok(0));
         assert!(!log.exists(), "no midna, no alert");
 

@@ -2,7 +2,6 @@
 //! whose it is (with a headless fault check), only theirs gets a fix task and an urgent alert, `tb
 //! master` overrides it, a finished fix that left it red alerts again, and green closes it.
 
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -165,7 +164,7 @@ fn the_fault_check_reads_the_evidence() {
             "#!/bin/sh\necho '{\"structured_output\": {\"verdict\": \"not_ours\", \"why\": \"The test is flaky on main.\", \"proof\": [\"https://ci/7\", \"flaky\"]}}'\n",
         )
         .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        taskboardd::proc::make_runnable(&script).unwrap();
         c.claude = script.to_string_lossy().to_string();
         c.master.fault_check = true;
     });
@@ -182,7 +181,7 @@ fn with_check(body: &str) -> (Board, tempfile::TempDir) {
     board_with(move |c, dir| {
         let script = dir.join("claude");
         std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        taskboardd::proc::make_runnable(&script).unwrap();
         c.claude = script.to_string_lossy().to_string();
         c.master.fault_check = true;
     })
@@ -633,7 +632,7 @@ fn the_fault_check_s_title_names_the_fix_task() {
             "#!/bin/sh\necho '{\"structured_output\": {\"verdict\": \"ours\", \"why\": \"The new Gradle plugin pins an NDK that no longer downloads.\", \"title\": \"Android NDK download failed\"}}'\n",
         )
         .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        taskboardd::proc::make_runnable(&script).unwrap();
         c.claude = script.to_string_lossy().to_string();
         c.master.fault_check = true;
     });

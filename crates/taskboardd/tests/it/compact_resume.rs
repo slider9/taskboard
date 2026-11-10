@@ -1,7 +1,6 @@
 //! A cold conversation resumed in a new terminal opens at once and compacts in the tab: `/compact` is
 //! queued ahead of the prompt, with no headless compact holding the terminal back.
 
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -37,11 +36,11 @@ fn board_with(last_at: &str, refuse: &str) -> Board {
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&midna_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&midna_exe).unwrap();
     cfg.midna = midna_exe;
     let claude_exe = dir.path().join("fake-claude");
     std::fs::write(&claude_exe, "#!/bin/sh\ntouch \"$(dirname \"$0\")/headless\"\n").unwrap();
-    std::fs::set_permissions(&claude_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&claude_exe).unwrap();
     cfg.claude = claude_exe.to_string_lossy().to_string();
     let file = taskboardd::transcript::transcript_file(&cfg.claude_projects, &repo.to_string_lossy(), "c1");
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();

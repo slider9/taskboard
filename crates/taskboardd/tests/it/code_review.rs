@@ -162,7 +162,7 @@ fn fake_gh(dir: &Path) -> PathBuf {
     let log = dir.join("gh.log");
     let body = dir.join("pr-body");
     std::fs::write(&gh, format!("#!/bin/sh\necho \"$@\" >> '{}'\ncat > '{}'\necho https://github.com/acme/webapp/pull/77\n", log.display(), body.display())).unwrap();
-    Command::new("chmod").arg("+x").arg(&gh).status().unwrap();
+    taskboardd::proc::make_runnable(&gh).unwrap();
     gh
 }
 

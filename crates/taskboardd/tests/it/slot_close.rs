@@ -2,7 +2,6 @@
 //! agent terminal open on exit for that close: Midna's cleanup would remove the slot's worktree.
 //! Every slot's path also goes in Midna's `cleanup.keep`, for a terminal elsewhere that worked in it.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -26,15 +25,17 @@ fn new_board(runner: bool) -> Board {
     let slot = format!("{plain}/.claude/worktrees/slot-1");
     std::fs::create_dir_all(&slot).unwrap();
     let exited = json!([{"id": "S-slot", "name": "T1 Fix", "agent": "", "cwd": slot, "status": {"state": "idle", "reason": "claude exited"}}]);
+    // As JSON, so a Windows path's backslashes are escaped.
+    let (in_slot, in_plain) = (json!({"cwd": format!("{slot}/crates")}), json!({"cwd": plain}));
     let exe = dir.path().join("fake-midna");
     std::fs::write(
         &exe,
         format!(
-            "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s %s\\n' \"$2\" \"$3\" >> \"$d/calls\"\ncase \"$2 $3\" in\n  session.open*) echo '{{\"id\": \"S9\"}}' ;;\n  session.get*S-slot*) echo '{{\"cwd\": \"{slot}/crates\"}}' ;;\n  session.get*) echo '{{\"cwd\": \"{plain}\"}}' ;;\n  session.list*) echo '{exited}' ;;\n  project.list*|events.list*) echo '[]' ;;\n  settings.set*cleanup.keep*) echo \"$3\" > \"$d/set\"; echo '{{}}' ;;\n  settings.get*cleanup.keep*) if [ -f \"$d/set\" ]; then sed 's/.*\"value\":\\(\\[.*\\]\\).*/{{\"value\":\\1}}/' \"$d/set\"; else echo '{{\"value\": [\"main\"]}}'; fi ;;\n  *) echo '{{}}' ;;\nesac\n"
+            "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s %s\\n' \"$2\" \"$3\" >> \"$d/calls\"\ncase \"$2 $3\" in\n  session.open*) echo '{{\"id\": \"S9\"}}' ;;\n  session.get*S-slot*) echo '{in_slot}' ;;\n  session.get*) echo '{in_plain}' ;;\n  session.list*) echo '{exited}' ;;\n  project.list*|events.list*) echo '[]' ;;\n  settings.set*cleanup.keep*) echo \"$3\" > \"$d/set\"; echo '{{}}' ;;\n  settings.get*cleanup.keep*) if [ -f \"$d/set\" ]; then sed 's/.*\"value\":\\(\\[.*\\]\\).*/{{\"value\":\\1}}/' \"$d/set\"; else echo '{{\"value\": [\"main\"]}}'; fi ;;\n  *) echo '{{}}' ;;\nesac\n"
         ),
     )
     .unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&exe).unwrap();
     let mut cfg = Config::for_tests(dir.path());
     cfg.midna = exe;
     cfg.runner = runner;
@@ -131,5 +132,6 @@ fn a_refused_settings_set_is_asked_again_on_the_next_sync() {
     midna::sync_once(&b.app).unwrap();
     let sets = b.calls("settings.set").into_iter().filter(|c| c["key"] == "cleanup.keep").count();
     assert_eq!(sets, 2, "the refused set is tried again");
-    assert_eq!(std::fs::read_to_string(b.dir.path().join("set")).unwrap().contains(&b.slot), true);
+    let set: Value = serde_json::from_str(&std::fs::read_to_string(b.dir.path().join("set")).unwrap()).unwrap();
+    assert!(set["value"].as_array().unwrap().iter().any(|p| p.as_str().is_some_and(|p| p.contains(&b.slot))), "{set}");
 }

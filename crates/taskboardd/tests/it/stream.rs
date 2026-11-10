@@ -496,7 +496,7 @@ fn hours_off(b: &Board) {
 fn a_webhook_relay_s_quiet_doesn_t_make_the_source_unhealthy() {
     let marker = tempfile::tempdir().unwrap();
     let ran = marker.path().join("restarted");
-    let cmd = format!("touch {}", ran.display());
+    let cmd = format!("touch '{}'", ran.display());
     let b = board_with(|c| {
         c.feed.on = true;
         c.feed.silent_secs = 20.0;
@@ -527,7 +527,7 @@ fn a_webhook_relay_s_quiet_doesn_t_make_the_source_unhealthy() {
 fn a_silent_listener_relay_still_restarts_the_source() {
     let marker = tempfile::tempdir().unwrap();
     let ran = marker.path().join("restarted");
-    let cmd = format!("touch {}", ran.display());
+    let cmd = format!("touch '{}'", ran.display());
     let b = board_with(|c| {
         c.feed.on = true;
         c.feed.silent_secs = 20.0;

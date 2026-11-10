@@ -1,7 +1,6 @@
 //! Alerts raised as free text get a short title and suggested fixes from Haiku, off the hot path; when
 //! Haiku can't help, or the switch is off, they stay plain text.
 
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -21,7 +20,7 @@ fn board(out: &str, on: bool) -> Board {
     let mut cfg = Config::for_tests(dir.path());
     let script = dir.path().join("claude");
     std::fs::write(&script, format!("#!/bin/sh\necho '{out}'\n")).unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&script).unwrap();
     cfg.claude = script.to_string_lossy().to_string();
     cfg.alerts.suggest = on;
     let app = App::for_tests(cfg);

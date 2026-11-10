@@ -119,10 +119,9 @@ fn a_green_pr_nobody_can_review_reads_stuck_and_alerts_the_owner_once() {
 
 /// A `midna` that logs each call's method and params and opens terminal s9.
 fn fake_midna(dir: &std::path::Path) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let exe = dir.join("midna");
     std::fs::write(&exe, format!("#!/bin/sh\necho \"$2 $3\" >> '{}'\necho '{{\"id\": \"s9\"}}'\n", dir.join("calls.log").display())).unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&exe).unwrap();
     exe
 }
 

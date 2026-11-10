@@ -1,7 +1,6 @@
 //! Board notifications go as the `board` kind, which Midna refuses until it has it: a send adds the
 //! kind and sends again, once.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
@@ -19,7 +18,7 @@ fn fake_midna(dir: &Path, has_kind: bool) -> PathBuf {
         "#!/bin/sh\necho \"$2\" >> '{calls}'\ncase \"$2\" in\n  notify.kinds.add) touch '{kind}'; echo '{{}}' ;;\n  notify.send) if [ -e '{kind}' ]; then echo '{{\"id\":\"n1\"}}'; else echo 'midna: no kind `board` to send as; kinds you can send to: agent, none added yet (notify.kinds.add)' >&2; exit 2; fi ;;\n  *) echo '{{}}' ;;\nesac\n"
     );
     std::fs::write(&exe, script).unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&exe).unwrap();
     exe
 }
 
@@ -53,7 +52,7 @@ fn another_refusal_is_not_retried() {
     let dir = tempfile::tempdir().unwrap();
     let exe = dir.path().join("midna");
     std::fs::write(&exe, format!("#!/bin/sh\necho \"$2\" >> '{}'\necho 'midna: too many notifications' >&2; exit 1\n", dir.path().join("calls").display())).unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&exe).unwrap();
     let e = midna::notify_send(&exe, &params()).unwrap_err();
     assert_eq!(e.to_string(), "too many notifications");
     assert_eq!(calls(dir.path()), ["notify.send"]);

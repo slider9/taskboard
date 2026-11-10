@@ -2,7 +2,6 @@
 //! along on `/state`, and the work hours are keep-awake's schedule. A fake `midna` script stands in
 //! for the CLI.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -18,7 +17,7 @@ fn fake_midna(dir: &Path, body: &str) -> std::path::PathBuf {
     let exe = dir.join("midna");
     let log = dir.join("calls.log");
     std::fs::write(&exe, format!("#!/bin/sh\necho \"$2 $3\" >> '{}'\n{body}\n", log.display())).unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&exe).unwrap();
     exe
 }
 

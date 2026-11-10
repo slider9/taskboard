@@ -24,8 +24,7 @@ fn board_with(f: impl FnOnce(&mut Config)) -> Board {
     cfg.jira.via = "claude".into();
     let claude = dir.path().join("fake-claude");
     std::fs::write(&claude, "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" >> \"$d/all-args.txt\"\ncat \"$d/answer.json\"\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&claude).unwrap();
     cfg.claude = claude.to_string_lossy().to_string();
     f(&mut cfg);
     let repo = dir.path().join("webapp");

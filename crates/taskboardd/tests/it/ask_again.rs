@@ -73,7 +73,7 @@ fn the_terminal_opened_to_ask_again_is_focused() {
         "#!/bin/sh\nprintf '%s %s\\n' \"$2\" \"$3\" >> \"$(dirname \"$0\")/calls\"\nif [ \"$2\" = session.open ]; then echo '{\"id\": \"S9\"}'; exit 0; fi\necho '{}'\n",
     )
     .unwrap();
-    std::fs::set_permissions(&midna_exe, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&midna_exe).unwrap();
     cfg.midna = midna_exe;
     let app = App::for_tests(cfg);
     let path = repo.to_string_lossy().to_string();

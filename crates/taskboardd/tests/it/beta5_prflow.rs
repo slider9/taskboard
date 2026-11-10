@@ -115,7 +115,7 @@ fn fake_gh(dir: &Path) -> std::path::PathBuf {
         ),
     )
     .unwrap();
-    Command::new("chmod").arg("+x").arg(&gh).status().unwrap();
+    taskboardd::proc::make_runnable(&gh).unwrap();
     gh
 }
 

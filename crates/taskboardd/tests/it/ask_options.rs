@@ -146,9 +146,13 @@ struct FakeMidna {
 fn fake_midna(replies: Vec<Value>) -> FakeMidna {
     use std::io::{BufRead, BufReader, Write};
     // Short: a Unix socket's path has a length limit.
-    let dir = tempfile::Builder::new().prefix("m").tempdir_in("/tmp").unwrap();
+    let dir = tempfile::Builder::new().prefix("m").tempdir_in(if cfg!(windows) { std::env::temp_dir() } else { "/tmp".into() }).unwrap();
     let sock = dir.path().join("s.sock");
+    #[cfg(unix)]
     let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    // Windows 10's AF_UNIX, as Midna listens there and the board connects (`midna::rpc`).
+    #[cfg(windows)]
+    let listener = uds_windows::UnixListener::bind(&sock).unwrap();
     let got = Arc::new(std::sync::Mutex::new(Vec::new()));
     let seen = got.clone();
     std::thread::spawn(move || {
@@ -228,7 +232,9 @@ fn a_pick_says_why_midna_turned_it_down() {
     let pick = || b.post_err("/tasks/T1/pick", json!({"answers": [[0], [1]]}));
     let (code, msg) = pick();
     assert_eq!(code, 403);
-    assert!(msg.contains("Add com.mrgnhnt.taskboard.daemon to Midna's agents.trusted_clients"), "{msg}");
+    // On Windows Midna trusts a client by its path: this test binary's.
+    let me = if cfg!(windows) { taskboardd::util::canonical(std::env::current_exe().unwrap()).unwrap().display().to_string() } else { "com.mrgnhnt.taskboard.daemon".into() };
+    assert!(msg.contains(&format!("Add {me} to Midna's agents.trusted_clients")), "{msg}");
     let (code, msg) = pick();
     assert_eq!(code, 409);
     assert!(msg.contains("the picker shows another question"), "{msg}");
