@@ -26,7 +26,6 @@
 //! `claude` CLI, which keeps Claude Code's own files consistent, then writes the hook entries.
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 pub const PLUGIN: &str = "task-board@taskboard";
 const MARKETPLACE: &str = "taskboard";

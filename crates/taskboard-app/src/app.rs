@@ -1971,13 +1971,20 @@ fn banner(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> Vec<AnyEle
         );
     }
     match crate::install::status() {
-        crate::install::LoginItem::RequiresApproval => out.push(
-            bar(t.warn_soft, t.warn_text, t.warn_line)
-                .child(kit::dot(t.warn, 8.))
-                .child(div().flex_1().min_w_0().child("The board runs in the background as a login item. Switch on Taskboard in System Settings ▸ Login Items."))
-                .child(kit::btn_small(t, "open-login-items", "Open Login Items").on_click(|_, _, _| crate::install::open_login_items()))
-                .into_any_element(),
-        ),
+        crate::install::LoginItem::RequiresApproval => {
+            let (text, button) = if cfg!(windows) {
+                ("The board runs in the background, started when you sign in. Switch on Taskboard in Settings ▸ Apps ▸ Startup, or it won't run after a restart.", "Open Startup apps")
+            } else {
+                ("The board runs in the background as a login item. Switch on Taskboard in System Settings ▸ Login Items.", "Open Login Items")
+            };
+            out.push(
+                bar(t.warn_soft, t.warn_text, t.warn_line)
+                    .child(kit::dot(t.warn, 8.))
+                    .child(div().flex_1().min_w_0().child(text))
+                    .child(kit::btn_small(t, "open-login-items", button).on_click(|_, _, _| crate::install::open_login_items()))
+                    .into_any_element(),
+            )
+        }
         crate::install::LoginItem::Blocked => out.push(
             bar(t.warn_soft, t.warn_text, t.warn_line)
                 .child(kit::dot(t.warn, 8.))

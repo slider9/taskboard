@@ -6,7 +6,8 @@
 //!   `~/.local/bin/tb` to the bundle's copy (the Claude plugin's `tb` shim finds it
 //!   there) unless something else already lives at that path.
 //! - **Installed on Windows** (`%LOCALAPPDATA%\Programs\Taskboard\taskboard-app.exe`, with `tb.exe`
-//!   and `plugin\` beside it): no login item yet, so run `taskboardd serve` yourself. A copy of
+//!   and `plugin\` beside it): a startup entry runs the daemon under `taskboard-app.exe --daemon`,
+//!   which starts it now too, and the link scheme opens this app (see `win.rs`). A copy of
 //!   `tb.exe` is kept at `~/.local/bin/tb.exe` (see [`copy_tb`]).
 //! - **Dev** (`TASKBOARD_DEV=1`, or not inside a bundle, e.g. `cargo run`): nothing is
 //!   registered; run `taskboardd serve` yourself (or use `TASKBOARD_BACKEND=fake`).
@@ -16,7 +17,9 @@
 //!
 //! `taskboard-app --uninstall` unregisters the agent, removes the link (on Windows, the copy), takes
 //! the hooks that run this bundle's `tb` out of Claude Code's settings and withdraws the board's alert
-//! notifications (used by `scripts/dev-app.sh --uninstall`).
+//! notifications (used by `scripts/dev-app.sh --uninstall`). On Windows it also quits the app and
+//! stops the daemon, so the uninstaller can delete them; `--stop` does just that (before an
+//! installer replaces them).
 //!
 //! Everything here blocks; `start` runs it on its own thread and publishes the result in
 //! [`status`] for the banner.
@@ -33,8 +36,9 @@ pub enum LoginItem {
     Dev,
     Checking,
     Enabled,
-    /// Registered, but the human must switch it on in System Settings ▸ Login Items.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Registered, but the human must switch it on in System Settings ▸ Login Items (on Windows,
+    /// switched off in Settings ▸ Apps ▸ Startup: it runs now, but not at the next sign-in).
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     RequiresApproval,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     NotRegistered,
@@ -157,9 +161,9 @@ pub fn install_dir_of(exe: &Path) -> Option<PathBuf> {
     (dir.join("tb.exe").is_file() && dir.join("plugin").is_dir()).then(|| dir.to_path_buf())
 }
 
-/// The installed app whose `tb` and plugin the Claude Code hooks run, unless in dev mode: the
-/// bundle on macOS, the install folder on Windows (where the login item and updater aren't set up
-/// yet, so they still go by [`installed_bundle`]).
+/// The installed app, unless in dev mode: the bundle on macOS, the install folder on Windows. Its
+/// daemon is registered and restarted, it updates itself, and the Claude Code hooks run its `tb`
+/// and plugin.
 pub fn installed_app() -> Option<PathBuf> {
     if !cfg!(windows) {
         return installed_bundle();
@@ -277,25 +281,48 @@ pub fn open_login_items() {
     unsafe { SMAppService::openSystemSettingsLoginItems() };
 }
 
-#[cfg(not(target_os = "macos"))]
-const MACOS_ONLY: &str = "Starting the daemon at login is only set up on macOS.";
+/// Windows: the startup entry and link scheme, and the daemon running now (`win.rs`).
+#[cfg(windows)]
+pub fn register(dir: &Path) -> LoginItem {
+    crate::win::register(dir, &crate::win::Manifest::read(dir))
+}
 
-#[cfg(not(target_os = "macos"))]
+/// Windows: the daemon ended and started again by its supervisor, on the binary now in the install.
+#[cfg(windows)]
+pub fn restart_daemon(dir: &Path) -> Result<(), String> {
+    crate::win::restart_daemon(dir, &crate::win::Manifest::read(dir))
+}
+
+#[cfg(windows)]
+pub fn unregister(dir: &Path) -> Result<(), String> {
+    crate::win::unregister(dir, &crate::win::Manifest::read(dir))
+}
+
+/// Windows: Settings ▸ Apps ▸ Startup.
+#[cfg(windows)]
+pub fn open_login_items() {
+    crate::win::open_startup_apps()
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+const NOT_SET_UP: &str = "Starting the daemon at login is only set up on macOS and Windows.";
+
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn register(_bundle: &Path) -> LoginItem {
-    LoginItem::Failed(MACOS_ONLY.into())
+    LoginItem::Failed(NOT_SET_UP.into())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn restart_daemon(_bundle: &Path) -> Result<(), String> {
-    Err(MACOS_ONLY.into())
+    Err(NOT_SET_UP.into())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn unregister(_bundle: &Path) -> Result<(), String> {
-    Err(MACOS_ONLY.into())
+    Err(NOT_SET_UP.into())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn open_login_items() {}
 
 // ------------------------------------------------------------------ tb link
@@ -390,10 +417,13 @@ pub fn headless(args: &[String]) -> Option<i32> {
                 return Some(2);
             };
             let mut code = 0;
-            // No login item on Windows yet.
-            if cfg!(target_os = "macos")
-                && let Err(e) = unregister(&bundle)
-            {
+            // Windows: the app and daemon run from the files the uninstaller is about to delete.
+            #[cfg(windows)]
+            if !crate::win::shut_down(&bundle, &crate::win::Manifest::read(&bundle)) {
+                crate::log::info("something from the install is still running");
+                code = 1;
+            }
+            if let Err(e) = unregister(&bundle) {
                 crate::log::info(format!("unregistering the daemon failed: {e}"));
                 code = 1;
             }
@@ -418,6 +448,26 @@ pub fn headless(args: &[String]) -> Option<i32> {
             println!("taskboard-app {}", env!("CARGO_PKG_VERSION"));
             Some(0)
         }
+        // Windows: what the startup entry runs; keeps the daemon running.
+        #[cfg(windows)]
+        Some("--daemon") => Some(crate::win::supervise()),
+        // Windows: quit the app and stop the daemon, so an installer can replace them.
+        #[cfg(windows)]
+        Some("--stop") => {
+            let Some((dir, m)) = crate::win::install() else {
+                crate::log::info("--stop only works from an installed Taskboard");
+                return Some(2);
+            };
+            Some(if crate::win::shut_down(&dir, &m) { 0 } else { 1 })
+        }
+        // Windows: an update's relaunch. Waits for the app it replaced to exit, then starts as usual.
+        #[cfg(windows)]
+        Some("--after") => {
+            if let Some(pid) = args.get(2).and_then(|p| p.parse().ok()) {
+                crate::win::wait_exit(pid, Duration::from_secs(60));
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -426,10 +476,10 @@ pub fn headless(args: &[String]) -> Option<i32> {
 /// failing after that (a dev reinstall's bootout racing the launch), so look again, at most every
 /// 20s: a registration launchd can't start is made again (see [`register`]).
 pub fn daemon_unreachable() {
-    if status() != LoginItem::Enabled {
+    if !matches!(status(), LoginItem::Enabled) && !(cfg!(windows) && status() == LoginItem::RequiresApproval) {
         return;
     }
-    let Some(bundle) = installed_bundle() else { return };
+    let Some(bundle) = installed_app() else { return };
     {
         let mut last = RECHECKED.lock().unwrap_or_else(|e| e.into_inner());
         if last.is_some_and(|t| t.elapsed() < Duration::from_secs(20)) {
@@ -456,8 +506,7 @@ pub fn start(backend: &str) {
                 set_status(held);
                 return;
             }
-            // No login item on Windows yet: nothing to register, nothing for the banner to say.
-            set_status(if cfg!(windows) { LoginItem::Dev } else { register(&bundle) });
+            set_status(register(&bundle));
             // Taskboard Dev leaves the link to the real app (TASKBOARD_NO_TB_LINK in its LSEnvironment).
             if std::env::var_os("TASKBOARD_NO_TB_LINK").is_some() {
                 return;

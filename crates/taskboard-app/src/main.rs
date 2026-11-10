@@ -18,6 +18,10 @@
 //! - `TASKBOARD_SNAPSHOT=out.png` (feature `snapshot`) — draw the window offscreen, save, quit;
 //!   `TASKBOARD_SNAPSHOT_MOUSE=x,y` moves the mouse there first (hover cards and tooltips),
 //!   `TASKBOARD_SNAPSHOT_CLICK=x,y;x,y` clicks there in turn first (menus and opened rows).
+//!
+//! A release build on Windows is a windowed program: no console opens with it, so its daemon
+//! supervisor (`--daemon`) runs unseen. Debug builds keep the console, for `cargo run`.
+#![cfg_attr(all(windows, not(test), not(debug_assertions)), windows_subsystem = "windows")]
 mod app;
 mod backend;
 mod fingerprint;
@@ -32,6 +36,8 @@ mod parity;
 mod theme;
 mod ui;
 mod updater;
+#[cfg(windows)]
+mod win;
 
 use gpui_kit::*;
 use theme::Theme;
@@ -82,12 +88,34 @@ fn main() {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN)
     };
+    let args: Vec<String> = std::env::args().collect();
+    #[cfg(windows)]
+    {
+        // The install's environment (Taskboard Dev's data folder and port) before anything reads it.
+        win::apply_env();
+        if args.get(1).is_some_and(|a| a.starts_with("--") && a != "--after") {
+            win::attach_console();
+        }
+    }
     log::init();
-    if let Some(code) = install::headless(&std::env::args().collect::<Vec<_>>()) {
+    if let Some(code) = install::headless(&args) {
         std::process::exit(code);
     }
     let backend = backend::from_env();
+    // Windows: one app per install. A second launch (a clicked link, the Start menu again) hands its
+    // links to the first and goes.
+    #[cfg(windows)]
+    let claimed = match win::install() {
+        Some((_, m)) if backend.label() != "fake" => match win::claim(&m, &win::links(&args)) {
+            win::Claim::HandedOver => std::process::exit(0),
+            win::Claim::First(lock, listener) => Some((lock, listener)),
+            win::Claim::Alone => None,
+        },
+        _ => None,
+    };
     log::info(format!("started v{} ({} backend)", env!("CARGO_PKG_VERSION"), backend.label()));
+    #[cfg(windows)]
+    updater::clean_up();
     // The reader's UI state (the web board's localStorage); the sample board keeps it in memory.
     prefs::init(backend.label() != "fake");
     let size_env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
@@ -95,6 +123,20 @@ fn main() {
     // `taskboard://…` links (clicked notifications) can arrive before the window exists, so
     // they wait in a channel.
     let (link_tx, link_rx) = async_channel::unbounded::<Vec<String>>();
+    // Windows has no open-URL event: a link arrives as this launch's argument, or from a later
+    // launch over the install's pipe.
+    #[cfg(windows)]
+    {
+        let links = win::links(&args);
+        if !links.is_empty() {
+            let _ = link_tx.try_send(links);
+        }
+        if let Some((lock, listener)) = claimed {
+            win::listen(listener, link_tx.clone());
+            // Held until the process exits.
+            std::mem::forget(lock);
+        }
+    }
     let application = gpui_kit::application();
     application.on_open_urls(move |urls| drop(link_tx.try_send(urls)));
     application.run(move |cx| {
@@ -196,7 +238,15 @@ fn main() {
         cx.spawn(async move |cx| {
             while let Ok(urls) = link_rx.recv().await {
                 cx.update(|cx| {
+                    // Windows: the uninstaller or an installer asking the app to go (`--stop`).
+                    if urls.iter().any(|u| u == "--quit") {
+                        return cx.quit();
+                    }
                     cx.activate(true);
+                    // GPUI's Windows backend doesn't activate the app, only a window.
+                    if cfg!(windows) {
+                        let _ = handle.update(cx, |_, window, _| window.activate_window());
+                    }
                     for u in &urls {
                         let _ = handle.update(cx, |m, _, cx| m.open_link(u, cx));
                     }

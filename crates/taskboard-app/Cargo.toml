@@ -32,6 +32,12 @@ libc = "0.2"
 ring = "0.17"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
+# src/win.rs: the startup entry and link scheme (registry), the daemon's supervisor (processes,
+# named mutexes and events) and the pipe a second launch hands its links over on.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+
 # install (src/install.rs): register the daemon's LaunchAgent with SMAppService
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

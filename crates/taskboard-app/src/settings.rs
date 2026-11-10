@@ -1335,7 +1335,7 @@ impl SettingsWindow {
             (Some(_), true) => format!("Doesn't match the app. Restart it to run {}.", updater::VERSION),
             (Some(i), false) => format!("Up {} · pid {}", crate::fmt::span(i["uptime_secs"].as_i64().unwrap_or(0) / 60), i["pid"].as_u64().unwrap_or(0)),
         };
-        let restart = crate::install::installed_bundle().is_some().then(|| {
+        let restart = crate::install::installed_app().is_some().then(|| {
             if self.sys_busy {
                 kit::disabled(small(kit::btn_small(t, "sys-restart", "Restarting…")))
             } else {
@@ -1382,7 +1382,7 @@ impl SettingsWindow {
 
     /// Restart the daemon: to run the binary in the app now (after an update it hadn't picked up), or to unstick it.
     fn restart_daemon(&mut self, cx: &mut Context<Self>) {
-        let Some(bundle) = crate::install::installed_bundle() else { return };
+        let Some(bundle) = crate::install::installed_app() else { return };
         self.sys_busy = true;
         self.sys_note = None;
         cx.notify();

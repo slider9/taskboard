@@ -20,7 +20,7 @@ It's built like Midna: a daemon that owns the work, a CLI for agents, and a GPUI
 | `crates/taskboardd` | The daemon: SQLite, the JSON API on `http://127.0.0.1:8792/tasks/api`, the runner that starts terminals, and the Midna sync. The app runs it as a LaunchAgent, so it keeps working while the window is closed. |
 | `crates/taskboard-cli` | `tb`: the agent CLI (`tb` inside Claude sessions), the Claude Code hooks (`tb hook <Event>`) and the status line (`tb statusline`). |
 | `crates/taskboard-app` | `Taskboard.app`: the native window (GPUI via `gpui-kit`): board, goals, backlog, sessions, task and issue panels, forms, work hours. |
-| `packaging/`, `scripts/` | `build-app.sh` assembles and signs `Taskboard.app`; `install-app.sh` installs it to /Applications; `dev-app.sh` installs a separate "Taskboard Dev". |
+| `packaging/`, `scripts/` | `build-app.sh` assembles and signs `Taskboard.app`; `install-app.sh` installs it to /Applications; `dev-app.sh` installs a separate "Taskboard Dev". On Windows, `packaging/windows/build.sh` builds the install folder, update zip and installer, and the two scripts install to `%LOCALAPPDATA%\Programs`. |
 | `docs/API.md` | The JSON API the app (and `tb`) rely on. |
 | `docs/CUTOVER.md` | Moving over from the old Python board: stop it, `taskboardd import` its `tasks.db`, swap the plugin, start. |
 | `docs/PARITY.md` | The audit of the app against the web board it replaced, with the tests that hold each behaviour. |
@@ -41,6 +41,12 @@ update); the tooltip says which.
 
 If macOS asks, switch Taskboard on in System Settings ▸ General ▸ Login Items (the app shows a banner until you do).
 `/Applications/Taskboard.app/Contents/MacOS/taskboardd init` writes a starting config.
+
+**Windows**: run the release's `Taskboard-<version>-windows-x64-setup.exe`. It's per user and needs no admin. It
+installs to `%LOCALAPPDATA%\Programs\Taskboard` and adds a Start menu entry and an uninstaller in Settings ▸ Apps. When
+the app opens it does what macOS's login item and link handler do: a startup entry runs the daemon whenever you sign in
+(and keeps it running), `taskboard://` links open the app, and a copy of `tb.exe` goes in `~\.local\bin`. From a
+checkout, `scripts/install-app.sh` in Git Bash builds and installs the same folder without the installer.
 
 Coming from the old board? Follow `docs/CUTOVER.md` first: it holds the same port, and
 `taskboardd import` brings its tasks, goals and backlog over with their numbers.
@@ -137,4 +143,6 @@ repo with write access: `ssh-keygen -t ed25519 -N "" -f ~/.ssh/taskboard-release
 
 1. `claude plugin uninstall task-board@taskboard` and `claude plugin marketplace remove taskboard`.
 2. `/Applications/Taskboard.app/Contents/MacOS/taskboard-app --uninstall` (stops and unregisters the daemon, removes the `tb` link), then delete the app.
+   On Windows, uninstall Taskboard in Settings ▸ Apps: it runs `taskboard-app.exe --uninstall` (quits the app, stops
+   the daemon, takes out its startup entry, link scheme and `tb.exe` copy) and deletes the install.
 3. If you don't want the data, delete `~/.config/taskboard`.

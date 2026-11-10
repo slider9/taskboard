@@ -31,6 +31,21 @@ it checks the archive against GitHub's sha256 for it, unpacks it, checks the app
 notarization and team, and swaps it in. A release without the archive isn't offered as an update.
 It used to install from the DMG, but mounting and unmounting a fresh DMG took about 14 seconds.
 
+A `windows-2022` job runs alongside, with the files checked out as they are in the repo (LF). It
+checks the version, then `packaging/windows/build.sh --zip --installer` builds:
+
+- `Taskboard-<version>-windows-x64-setup.exe`, the installer (Inno Setup,
+  `packaging/windows/Taskboard.iss`). It's per user and needs no admin: the app goes in
+  `%LOCALAPPDATA%\Programs\Taskboard`, with a Start menu entry and an uninstaller.
+- `Taskboard-<version>-windows-x64.zip`, the same install folder, for the updater. It checks the zip
+  against GitHub's sha256, then that its `install.json` names the app and the release's version, and
+  swaps the files in.
+
+Neither is code-signed yet, so Windows SmartScreen warns about the installer the first time.
+Once releases are signed, an install updates only to programs signed by the same publisher.
+
+A last job publishes the release with the macOS and Windows files.
+
 ## Repository secrets and variables
 
 The same Apple credentials as Midna's release workflow.
@@ -53,6 +68,15 @@ packaging/notarize.sh dist/1.1.0/Taskboard.app            # OPT-IN: uploads to A
 
 `notarize.sh` uses the keychain profile `taskboard-notary` locally
 (`xcrun notarytool store-credentials taskboard-notary --apple-id … --team-id U2G2XV3688`).
+
+On Windows, in Git Bash (`--installer` needs Inno Setup 6):
+
+```sh
+packaging/windows/build.sh --version 1.1.0 --out dist/1.1.0 --zip --installer
+```
+
+`scripts/install-app.sh` and `scripts/dev-app.sh` work on Windows too: they build the install
+folder and put it in `%LOCALAPPDATA%\Programs\Taskboard` (or `Taskboard Dev`) without the installer.
 
 ## DMG window
 

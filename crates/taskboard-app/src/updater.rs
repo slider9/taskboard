@@ -15,6 +15,15 @@
 //!
 //! Only an installed, Developer ID-signed Taskboard.app updates itself: Taskboard Dev (ad-hoc), a
 //! `cargo run` and the sample board never do.
+//!
+//! **Windows**: the release's `Taskboard-<version>-windows-x64.zip` holds the install folder
+//! (`packaging/windows/build.sh`). It must match GitHub's digest; it's unpacked inside the install
+//! (`.update`), and its `install.json` must name the same id and the release's version. When the
+//! running install is Authenticode-signed, the new programs must be signed by the same publisher.
+//! Windows won't replace a running program but will rename it, so each file the new version has is
+//! moved into the install and the old one moved aside (`.old-<pid>`), all undone if one fails;
+//! what's aside goes at the next launch, once nothing runs it. Only the real Taskboard (`install.json`'s
+//! id) updates itself.
 use serde_json::Value;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -27,6 +36,9 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASES: &str = "https://api.github.com/repos/mrgnhnt96/taskboard/releases?per_page=30";
 pub const RELEASES_PAGE: &str = "https://github.com/mrgnhnt96/taskboard/releases";
 const BUNDLE_ID: &str = "com.mrgnhnt.taskboard";
+/// How a release's update archive for this platform is named: `Taskboard-1.2.0.app.tar.gz`,
+/// `Taskboard-1.2.0-windows-x64.zip`.
+const ARCHIVE_SUFFIX: &str = if cfg!(windows) { "-windows-x64.zip" } else { ".app.tar.gz" };
 const FIRST_CHECK: Duration = Duration::from_secs(20);
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
@@ -109,7 +121,7 @@ pub fn pick(releases: &Value, current: &str) -> Option<Release> {
         .filter(|r| r["draft"] != true && (beta || r["prerelease"] != true))
         .filter_map(|r| {
             let version = r["tag_name"].as_str()?.trim_start_matches('v').to_string();
-            let asset = r["assets"].as_array()?.iter().find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(".app.tar.gz")))?;
+            let asset = r["assets"].as_array()?.iter().find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(ARCHIVE_SUFFIX)))?;
             Some(Release {
                 page: r["html_url"].as_str().unwrap_or(RELEASES_PAGE).to_string(),
                 archive: asset["browser_download_url"].as_str()?.to_string(),
@@ -141,8 +153,8 @@ fn fetch_releases() -> Result<Value, String> {
 /// Download the archive to `dir`, hashing as it goes; refused unless it matches GitHub's digest.
 fn download(r: &Release, dir: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let dest = dir.join(format!("Taskboard-{}.app.tar.gz", r.version));
-    let part = dir.join(format!("Taskboard-{}.app.tar.gz.part", r.version));
+    let dest = dir.join(format!("Taskboard-{}{ARCHIVE_SUFFIX}", r.version));
+    let part = dir.join(format!("Taskboard-{}{ARCHIVE_SUFFIX}.part", r.version));
     let resp = agent().get(&r.archive).call().map_err(|e| format!("Download failed: {e}"))?;
     let mut reader = resp.into_reader();
     let mut f = std::fs::File::create(&part).map_err(|e| e.to_string())?;
@@ -173,18 +185,21 @@ fn download(r: &Release, dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// An Info.plist as JSON.
+#[cfg(not(windows))]
 fn read_plist(path: &Path) -> Option<Value> {
     let o = Command::new("/usr/bin/plutil").args(["-convert", "json", "-o", "-"]).arg(path).output().ok()?;
     o.status.success().then(|| serde_json::from_slice(&o.stdout).ok()).flatten()
 }
 
 /// The Developer ID team a bundle is signed by (None: ad-hoc or unsigned).
+#[cfg(not(windows))]
 pub fn team_id(app: &Path) -> Option<String> {
     let o = Command::new("/usr/bin/codesign").args(["-dv", "--verbose=2"]).arg(app).output().ok()?;
     String::from_utf8_lossy(&o.stderr).lines().find_map(|l| l.strip_prefix("TeamIdentifier=")).filter(|t| *t != "not set").map(str::to_string)
 }
 
 /// Unpack the app from the archive into `dir` and check it (see the module docs).
+#[cfg(not(windows))]
 fn stage(archive: &Path, dir: &Path, version: &str, installed: &Path) -> Result<PathBuf, String> {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -225,23 +240,44 @@ fn off_reason(backend: &str) -> Option<String> {
     if backend == "fake" {
         return Some("The sample board doesn't update.".into());
     }
-    if !cfg!(target_os = "macos") {
-        return Some("Only the macOS app updates itself so far.".into());
+    #[cfg(windows)]
+    {
+        let Some((_, m)) = crate::win::install() else {
+            return Some("A dev build: it isn't running from an installed Taskboard.".into());
+        };
+        (m.id != BUNDLE_ID).then(|| "Taskboard Dev updates with scripts/dev-app.sh.".into())
     }
-    let Some(bundle) = crate::install::installed_bundle() else {
-        return Some("A dev build: it isn't running from Taskboard.app.".into());
-    };
-    if read_plist(&bundle.join("Contents/Info.plist")).is_none_or(|i| i["CFBundleIdentifier"] != BUNDLE_ID) {
-        return Some("Taskboard Dev updates with scripts/dev-app.sh.".into());
+    #[cfg(not(windows))]
+    {
+        if !cfg!(target_os = "macos") {
+            return Some("Only the macOS and Windows apps update themselves.".into());
+        }
+        let Some(bundle) = crate::install::installed_bundle() else {
+            return Some("A dev build: it isn't running from Taskboard.app.".into());
+        };
+        if read_plist(&bundle.join("Contents/Info.plist")).is_none_or(|i| i["CFBundleIdentifier"] != BUNDLE_ID) {
+            return Some("Taskboard Dev updates with scripts/dev-app.sh.".into());
+        }
+        if team_id(&bundle).is_none() {
+            return Some("This copy isn't a signed release build.".into());
+        }
+        None
     }
-    if team_id(&bundle).is_none() {
-        return Some("This copy isn't a signed release build.".into());
-    }
-    None
 }
 
+/// Where the download goes.
 fn cache_dir() -> PathBuf {
+    #[cfg(windows)]
+    if let Some((_, m)) = crate::win::install() {
+        return crate::win::local_dir(&m).join("updates");
+    }
     taskboardd::util::expand_home("~/Library/Caches/com.mrgnhnt.taskboard/updates")
+}
+
+/// Where the new app is unpacked and checked: on Windows inside the install, so it moves into place
+/// without a copy.
+fn staging_dir(installed: &Path, cache: &Path) -> PathBuf {
+    if cfg!(windows) { installed.join(".update") } else { cache.join("staged") }
 }
 
 /// One check: find a newer release, then download, check and stage it.
@@ -268,7 +304,7 @@ fn check(bundle: &Path) {
     set(State::Downloading { version: r.version.clone() });
     let dir = cache_dir();
     let staged = download(&r, &dir).and_then(|archive| {
-        let app = stage(&archive, &dir.join("staged"), &r.version, bundle);
+        let app = stage(&archive, &staging_dir(bundle, &dir), &r.version, bundle);
         let _ = std::fs::remove_file(&archive);
         app
     });
@@ -288,7 +324,7 @@ pub fn start(backend: &str) {
     if let Some(why) = off_reason(backend) {
         return set(State::Off(why));
     }
-    let Some(bundle) = crate::install::installed_bundle() else { return };
+    let Some(bundle) = crate::install::installed_app() else { return };
     let (tx, rx): (Sender<()>, Receiver<()>) = channel();
     let _ = WAKE.set(Mutex::new(tx));
     let _ = std::thread::Builder::new().name("updater".into()).spawn(move || {
@@ -329,13 +365,7 @@ pub fn apply() -> Result<(), String> {
         if let Err(e) = crate::install::restart_daemon(&installed) {
             crate::log::info(format!("restarting the daemon after the update: {e}"));
         }
-        Command::new("/bin/sh")
-            .args(["-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"$2\"", "relaunch"])
-            .arg(std::process::id().to_string())
-            .arg(&installed)
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| format!("Couldn't relaunch: {e}"))
+        relaunch(&installed).map_err(|e| format!("Couldn't relaunch: {e}"))
     });
     if let Err(e) = &done {
         set(State::Failed { error: e.clone(), at: now() });
@@ -343,7 +373,25 @@ pub fn apply() -> Result<(), String> {
     done
 }
 
+/// Opens the new app once this process is gone.
+#[cfg(not(windows))]
+fn relaunch(installed: &Path) -> std::io::Result<()> {
+    Command::new("/bin/sh")
+        .args(["-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.2; done; /usr/bin/open \"$2\"", "relaunch"])
+        .arg(std::process::id().to_string())
+        .arg(installed)
+        .spawn()
+        .map(|_| ())
+}
+
+/// Windows: the new app, told to wait for this one to exit (`--after`) before it starts.
+#[cfg(windows)]
+fn relaunch(installed: &Path) -> std::io::Result<()> {
+    crate::win::spawn_detached(Command::new(installed.join(crate::win::APP_EXE)).arg("--after").arg(std::process::id().to_string()))
+}
+
 /// Move `staged` next to `installed` (same volume), exchange the two atomically and delete the old one.
+#[cfg(not(windows))]
 fn swap_in(staged: &Path, installed: &Path) -> Result<(), String> {
     let parent = installed.parent().ok_or("The app has no parent folder.")?;
     let side = parent.join(format!(".Taskboard.update-{}.app", std::process::id()));
@@ -363,10 +411,10 @@ fn swap_in(staged: &Path, installed: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Never reached elsewhere: only the macOS app updates itself (`off_reason`).
-#[cfg(not(target_os = "macos"))]
+/// Never reached elsewhere: only the macOS and Windows apps update themselves (`off_reason`).
+#[cfg(not(any(target_os = "macos", windows)))]
 fn swap(_a: &Path, _b: &Path) -> Result<(), String> {
-    Err("Only the macOS app updates itself so far.".into())
+    Err("Only the macOS and Windows apps update themselves.".into())
 }
 
 #[cfg(target_os = "macos")]
@@ -392,6 +440,130 @@ fn swap(a: &Path, b: &Path) -> Result<(), String> {
     Err(format!("Swapping in the new app failed: {err}"))
 }
 
+// ------------------------------------------------------------------ Windows
+
+/// The new install folder, unpacked from the archive into `dir`, if it checks out (see the module docs).
+#[cfg(windows)]
+fn stage(archive: &Path, dir: &Path, version: &str, installed: &Path) -> Result<PathBuf, String> {
+    use crate::win::{APP_EXE, DAEMON_EXE, MANIFEST, Manifest};
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    // Windows' own tar (10 1803 and later) reads zips.
+    let tar = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows")).join(r"System32\tar.exe");
+    let unpacked = Command::new(tar).arg("-xf").arg(archive).arg("-C").arg(dir).output().map_err(|e| e.to_string())?;
+    if !unpacked.status.success() {
+        return Err(format!("Couldn't unpack the update: {}", String::from_utf8_lossy(&unpacked.stderr).trim()));
+    }
+    let app = dir.join("Taskboard");
+    let programs = [APP_EXE, DAEMON_EXE, "tb.exe"];
+    if !app.join(MANIFEST).is_file() || !app.join("plugin").is_dir() || programs.iter().any(|p| !app.join(p).is_file()) {
+        return Err("The update isn't a whole Taskboard install.".into());
+    }
+    let m = Manifest::read(&app);
+    if m.id != BUNDLE_ID {
+        return Err(format!("The new app is {}, not {BUNDLE_ID}.", m.id));
+    }
+    if m.version.as_deref() != Some(version) {
+        return Err(format!("The new app says it's {}; the release is {version}.", m.version.as_deref().unwrap_or("no version")));
+    }
+    // A signed install takes only programs signed by the same publisher.
+    if let Some(want) = publisher(&installed.join(APP_EXE)) {
+        for p in programs {
+            let got = publisher(&app.join(p));
+            if got.as_deref() != Some(want.as_str()) {
+                return Err(format!("The new {p} is signed by {}, this install by {want}.", got.as_deref().unwrap_or("nobody")));
+            }
+        }
+    }
+    Ok(app)
+}
+
+/// Who signed a program, when Windows finds its Authenticode signature valid.
+#[cfg(windows)]
+fn publisher(exe: &Path) -> Option<String> {
+    let script = "$s = Get-AuthenticodeSignature -LiteralPath $env:TASKBOARD_SIGNED; if ($s.Status -eq 'Valid') { $s.SignerCertificate.Subject }";
+    let o = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script]).env("TASKBOARD_SIGNED", exe).output().ok()?;
+    let subject = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    (o.status.success() && !subject.is_empty()).then_some(subject)
+}
+
+/// Moves each file and folder of the new install into `installed`, the old one aside into
+/// `.old-<pid>` first (Windows renames a running program, but won't replace it). A folder with a
+/// file in use is done file by file. All undone if anything fails.
+#[cfg(windows)]
+fn swap_in(staged: &Path, installed: &Path) -> Result<(), String> {
+    let aside = installed.join(format!("{OLD}{}", std::process::id()));
+    let mut done = Vec::new();
+    if let Err(e) = replace_all(staged, installed, &aside, &mut done) {
+        for (from, to) in done.iter().rev() {
+            let _ = std::fs::rename(to, from);
+        }
+        let _ = std::fs::remove_dir_all(&aside);
+        return Err(format!("Couldn't put the new app in place: {e}"));
+    }
+    if let Some(update) = staged.parent() {
+        let _ = std::fs::remove_dir_all(update);
+    }
+    // What nothing runs goes now; the rest at the next launch (`clean_up`).
+    let _ = std::fs::remove_dir_all(&aside);
+    Ok(())
+}
+
+/// What an update moved aside is in folders named this inside the install.
+#[cfg(windows)]
+const OLD: &str = ".old-";
+
+/// The renames made so far, `(from, to)`, to undo in reverse.
+#[cfg(windows)]
+type Moves = Vec<(PathBuf, PathBuf)>;
+
+#[cfg(windows)]
+fn replace_all(src: &Path, dst: &Path, aside: &Path, done: &mut Moves) -> std::io::Result<()> {
+    for e in std::fs::read_dir(src)? {
+        let name = e?.file_name();
+        replace(&src.join(&name), &dst.join(&name), &aside.join(&name), done)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace(src: &Path, dst: &Path, aside: &Path, done: &mut Moves) -> std::io::Result<()> {
+    let rename = |from: &Path, to: &Path, done: &mut Moves| {
+        std::fs::rename(from, to)?;
+        done.push((from.to_path_buf(), to.to_path_buf()));
+        std::io::Result::Ok(())
+    };
+    if std::fs::symlink_metadata(dst).is_ok() {
+        std::fs::create_dir_all(aside.parent().unwrap_or(aside))?;
+        if let Err(e) = rename(dst, aside, done) {
+            if !(src.is_dir() && dst.is_dir()) {
+                return Err(e);
+            }
+            // Something in the folder is in use: the folder stays, and its files are replaced.
+            std::fs::create_dir_all(aside)?;
+            for old in std::fs::read_dir(dst)? {
+                let name = old?.file_name();
+                if !src.join(&name).exists() {
+                    rename(&dst.join(&name), &aside.join(&name), done)?;
+                }
+            }
+            return replace_all(src, dst, aside, done);
+        }
+    }
+    rename(src, dst, done)
+}
+
+/// At launch: deletes what earlier updates moved aside, now that nothing runs it.
+#[cfg(windows)]
+pub fn clean_up() {
+    let Some(dir) = crate::install::installed_app() else { return };
+    for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().starts_with(OLD) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,7 +582,8 @@ mod tests {
     fn release(tag: &str, prerelease: bool, archive: bool) -> Value {
         let dmg = json!({"name": format!("Taskboard-{tag}.dmg"), "browser_download_url": format!("https://x/{tag}.dmg"), "size": 9, "digest": "sha256:CD"});
         let tgz = json!({"name": format!("Taskboard-{tag}.app.tar.gz"), "browser_download_url": format!("https://x/{tag}.app.tar.gz"), "size": 5, "digest": "sha256:AB"});
-        let assets = if archive { json!([dmg, tgz]) } else { json!([dmg]) };
+        let zip = json!({"name": format!("Taskboard-{tag}-windows-x64.zip"), "browser_download_url": format!("https://x/{tag}-windows-x64.zip"), "size": 6, "digest": "sha256:AB"});
+        let assets = if archive { json!([dmg, tgz, zip]) } else { json!([dmg]) };
         json!({"tag_name": tag, "draft": false, "prerelease": prerelease, "html_url": format!("https://x/{tag}"), "assets": assets})
     }
 
@@ -418,7 +591,8 @@ mod tests {
     fn picks_the_newest_release_for_the_channel() {
         let list = json!([release("v0.2.0-beta.2", true, true), release("v0.1.1", false, true), release("v0.2.0-beta.3", true, false), release("v0.1.0", false, true)]);
         let beta = pick(&list, "0.1.0-beta.44").unwrap();
-        assert_eq!((beta.version.as_str(), beta.archive.as_str(), beta.sha256.as_deref()), ("0.2.0-beta.2", "https://x/v0.2.0-beta.2.app.tar.gz", Some("ab")));
+        let want = format!("https://x/v0.2.0-beta.2{ARCHIVE_SUFFIX}");
+        assert_eq!((beta.version.as_str(), beta.archive.as_str(), beta.sha256.as_deref()), ("0.2.0-beta.2", want.as_str(), Some("ab")), "this platform's archive");
         assert_eq!(pick(&list, "0.1.0").unwrap().version, "0.1.1");
         assert_eq!(pick(&list, "0.1.1"), None);
         let draft = json!([{"tag_name": "v9.0.0", "draft": true, "prerelease": false, "assets": [{"name": "a.app.tar.gz", "browser_download_url": "u"}]}]);
@@ -439,6 +613,100 @@ mod tests {
         assert_eq!(std::fs::read_to_string(b.join("v")).unwrap(), "new");
         assert!(!a.exists());
         assert_eq!(std::fs::read_dir(tmp.join("Apps")).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(windows)]
+    fn install_tree(root: &Path, version: &str, marker: &str) {
+        std::fs::create_dir_all(root.join(r"plugin\task-board\bin")).unwrap();
+        for f in [crate::win::APP_EXE, crate::win::DAEMON_EXE, "tb.exe", r"plugin\task-board\bin\wait-hint"] {
+            std::fs::write(root.join(f), marker).unwrap();
+        }
+        std::fs::write(root.join(crate::win::MANIFEST), json!({"id": BUNDLE_ID, "version": version}).to_string()).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_update_replaces_the_install_s_files_even_one_running() {
+        let tmp = std::env::temp_dir().join(format!("taskboard-swap-win-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (installed, staged) = (tmp.join("Taskboard"), tmp.join(r"Taskboard\.update\Taskboard"));
+        install_tree(&installed, "1.0.0", "old");
+        std::fs::write(installed.join("unins000.exe"), "the installer's").unwrap();
+        std::fs::write(installed.join(r"plugin\task-board\bin\gone"), "old").unwrap();
+        install_tree(&staged, "1.1.0", "new");
+        // A copy of ping stands in for a daemon still running from the install.
+        let ping = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\PING.EXE");
+        let running = installed.join("running.exe");
+        std::fs::copy(&ping, &running).unwrap();
+        std::fs::copy(&ping, staged.join("running.exe")).unwrap();
+        let mut child = Command::new(&running).args(["-n", "30", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        // And a file in the plugin folder is open, so the folder can't move as a whole.
+        let open = std::fs::File::open(installed.join(r"plugin\task-board\bin\wait-hint")).unwrap();
+
+        swap_in(&staged, &installed).unwrap();
+        assert_eq!(read(&installed.join(crate::win::APP_EXE)), "new");
+        assert_eq!(read(&installed.join(r"plugin\task-board\bin\wait-hint")), "new");
+        assert!(!installed.join(r"plugin\task-board\bin\gone").exists(), "a file the new version doesn't have goes");
+        assert_eq!(read(&installed.join("unins000.exe")), "the installer's", "files only the old install has stay");
+        assert!(!installed.join(".update").exists());
+        let aside = || std::fs::read_dir(&installed).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(OLD)).count();
+        assert_eq!(aside(), 1, "what's still running or open waits aside");
+        drop(open);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_update_that_fails_partway_puts_the_old_files_back() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = std::env::temp_dir().join(format!("taskboard-swap-undo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (installed, staged) = (tmp.join("Taskboard"), tmp.join(r"Taskboard\.update\Taskboard"));
+        install_tree(&installed, "1.0.0", "old");
+        install_tree(&staged, "1.1.0", "new");
+        // The last thing to move is a file opened without sharing: it can't be moved aside.
+        std::fs::write(installed.join("zz"), "old").unwrap();
+        std::fs::write(staged.join("zz"), "new").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(installed.join("zz")).unwrap();
+        assert!(swap_in(&staged, &installed).is_err());
+        drop(held);
+        for f in [crate::win::APP_EXE, crate::win::DAEMON_EXE, "tb.exe", r"plugin\task-board\bin\wait-hint", "zz"] {
+            assert_eq!(read(&installed.join(f)), "old", "{f} is the old one again");
+            assert_eq!(read(&staged.join(f)), "new", "and the new one is still staged");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_staged_update_must_be_this_app_at_the_release_s_version() {
+        let tmp = std::env::temp_dir().join(format!("taskboard-stage-win-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let installed = tmp.join("installed");
+        install_tree(&installed, "1.0.0", "unsigned");
+        let tar = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\tar.exe");
+        let zip = |version: &str, id: &str| {
+            let src = tmp.join(format!("src-{version}-{id}"));
+            install_tree(&src.join("Taskboard"), version, "new");
+            std::fs::write(src.join(r"Taskboard\install.json"), json!({"id": id, "version": version}).to_string()).unwrap();
+            let out = tmp.join(format!("{version}-{id}.zip"));
+            assert!(Command::new(&tar).arg("-a").arg("-cf").arg(&out).arg("-C").arg(&src).arg("Taskboard").status().unwrap().success());
+            out
+        };
+        let staged = stage(&zip("1.1.0", BUNDLE_ID), &tmp.join("s1"), "1.1.0", &installed).unwrap();
+        assert_eq!(read(&staged.join(crate::win::APP_EXE)), "new");
+        let wrong_version = stage(&zip("1.0.5", BUNDLE_ID), &tmp.join("s2"), "1.1.0", &installed).unwrap_err();
+        assert!(wrong_version.contains("1.0.5"), "{wrong_version}");
+        let other_app = stage(&zip("1.1.0", "com.mrgnhnt.taskboard.dev"), &tmp.join("s3"), "1.1.0", &installed).unwrap_err();
+        assert!(other_app.contains("com.mrgnhnt.taskboard.dev"), "{other_app}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

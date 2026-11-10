@@ -1,10 +1,11 @@
 name: Release
 
 # Pushing a version tag (v1.1.0, see scripts/release.sh) builds the Apple
-# Silicon app, signs and notarizes it, packs it in a DMG and publishes a
-# GitHub release. The website's Download button links to the newest release
-# with a DMG. A beta tag (v1.2.0-beta.1) is published as a prerelease, which
-# the website still offers while it's the newest.
+# Silicon app, signs and notarizes it, packs it in a DMG, builds the Windows
+# installer and update zip, and publishes a GitHub release with all of them.
+# The website's Download button links to the newest release with a DMG. A
+# beta tag (v1.2.0-beta.1) is published as a prerelease, which the website
+# still offers while it's the newest.
 on:
   push:
     tags: ["v*"]
@@ -20,7 +21,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
+  macos:
     if: github.actor == 'mrgnhnt96'
     runs-on: macos-15
     timeout-minutes: 90
@@ -125,6 +126,78 @@ jobs:
           security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/AuthKey.p8"
 
+      - name: Keep the macOS files for the release
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            ${{ steps.dmg.outputs.file }}
+            ${{ steps.archive.outputs.file }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # The installer (per user, into %LOCALAPPDATA%\Programs\Taskboard) and the
+  # zip the app's updater downloads, both from packaging/windows/build.sh.
+  # Not code-signed yet: the updater checks the zip against GitHub's digest,
+  # and once releases are signed it also wants the same publisher.
+  windows:
+    if: github.actor == 'mrgnhnt96'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # The files as they are in the repo (LF), like the macOS build's, not
+      # converted to CRLF.
+      - name: Check out without CRLF
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - name: Check version matches tag
+        run: ./scripts/set-version.sh --check "${GITHUB_REF_NAME#v}"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/package"
+
+      # Inno Setup 6 is on GitHub's Windows images; installed if it isn't.
+      - name: Inno Setup
+        run: |
+          if ! command -v iscc >/dev/null && [ ! -f "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]; then
+            choco install innosetup --no-progress -y
+          fi
+
+      - name: Build install folder, update zip and installer
+        run: packaging/windows/build.sh --version "${GITHUB_REF_NAME#v}" --out dist/release --zip --installer
+
+      - name: Keep the Windows files for the release
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/release/Taskboard-*-windows-x64.zip
+            dist/release/Taskboard-*-windows-x64-setup.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -134,5 +207,6 @@ jobs:
           else
             flags=(--latest)
           fi
-          gh release create "$GITHUB_REF_NAME" "${{ steps.dmg.outputs.file }}" "${{ steps.archive.outputs.file }}" \
+          ls -l release
+          gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" \
             --title "Taskboard ${GITHUB_REF_NAME#v}" --generate-notes "${flags[@]}"

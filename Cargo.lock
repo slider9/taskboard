@@ -6912,6 +6912,8 @@ dependencies = [
  "serde_json",
  "taskboardd",
  "ureq",
+ "windows-sys 0.61.2",
+ "winreg",
 ]
 
 [[package]]

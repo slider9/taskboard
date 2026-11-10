@@ -14,6 +14,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Windows (Git Bash): %LOCALAPPDATA%\Programs\Taskboard.
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) exec packaging/windows/install.sh --real "$@" ;; esac
+
 ID="com.mrgnhnt.taskboard"
 LABEL="$ID.daemon"
 PORT=8792
