@@ -450,7 +450,8 @@ fn stage(archive: &Path, dir: &Path, version: &str, installed: &Path) -> Result<
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     // Windows' own tar (10 1803 and later) reads zips.
     let tar = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows")).join(r"System32\tar.exe");
-    let unpacked = Command::new(tar).arg("-xf").arg(archive).arg("-C").arg(dir).output().map_err(|e| e.to_string())?;
+    // The app has no console: `proc::command` keeps tar's and PowerShell's from flashing up.
+    let unpacked = taskboardd::proc::command(tar).arg("-xf").arg(archive).arg("-C").arg(dir).output().map_err(|e| e.to_string())?;
     if !unpacked.status.success() {
         return Err(format!("Couldn't unpack the update: {}", String::from_utf8_lossy(&unpacked.stderr).trim()));
     }
@@ -482,7 +483,7 @@ fn stage(archive: &Path, dir: &Path, version: &str, installed: &Path) -> Result<
 #[cfg(windows)]
 fn publisher(exe: &Path) -> Option<String> {
     let script = "$s = Get-AuthenticodeSignature -LiteralPath $env:TASKBOARD_SIGNED; if ($s.Status -eq 'Valid') { $s.SignerCertificate.Subject }";
-    let o = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script]).env("TASKBOARD_SIGNED", exe).output().ok()?;
+    let o = taskboardd::proc::command("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script]).env("TASKBOARD_SIGNED", exe).output().ok()?;
     let subject = String::from_utf8_lossy(&o.stdout).trim().to_string();
     (o.status.success() && !subject.is_empty()).then_some(subject)
 }

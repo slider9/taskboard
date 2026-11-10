@@ -796,8 +796,10 @@ pub fn default_data_dir() -> PathBuf {
     expand_home("~/.config/taskboard")
 }
 
+/// Every launch of the app loads the config, so this runs in it too: through `proc::command`, so it
+/// doesn't flash a console window there.
 fn git_first_name() -> Option<String> {
-    let out = std::process::Command::new("git").args(["config", "--global", "user.name"]).output().ok()?;
+    let out = crate::proc::command("git").args(["config", "--global", "user.name"]).output().ok()?;
     let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
     name.split_whitespace().next().map(|s| s.to_string())
 }

@@ -113,15 +113,40 @@ pub fn run_until(
 
 /// A command that runs `program`. Windows can't start a `#!` script itself (a file with no extension
 /// that starts `#!`, such as a wrapper config.toml names for `gh` or `claude`, or a test's fake), so
-/// there it runs in Git Bash: `bash <script> <args>`.
+/// there it runs in Git Bash: `bash <script> <args>`. It opens no console window ([`no_window`]).
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[cfg(windows)]
     if is_sh_script(Path::new(program.as_ref())) {
         let mut c = Command::new(git_bash());
         bash_args(&mut c, [program.as_ref()]);
+        no_window(&mut c);
         return c;
     }
-    Command::new(program)
+    let mut c = Command::new(program);
+    no_window(&mut c);
+    c
+}
+
+/// On Windows, a console program started by a process with no console (the app, or a `tb` started
+/// detached) gets a console window of its own, which flashes up for as long as it runs. This starts
+/// it with a hidden one instead. A process with a console, shown or hidden (`tb` in a terminal, the
+/// daemon), shares it with what it starts, as before. Elsewhere it does nothing.
+pub fn no_window(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    if !has_console() {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// This process is attached to a console, hidden or not. (`GetConsoleWindow` can't tell: a hidden one
+/// has no window either.)
+#[cfg(windows)]
+fn has_console() -> bool {
+    // SAFETY: no arguments; it fails, answering 0, when there's no console.
+    unsafe { windows_sys::Win32::System::Console::GetConsoleCP() != 0 }
 }
 
 /// `command(program)` with `args`, written the way the program reads them: through `bash_args` when it
@@ -220,6 +245,7 @@ pub fn make_runnable(path: &Path) -> std::io::Result<()> {
 pub fn shell(script: &str) -> Command {
     let mut c = Command::new(sh());
     bash_args(&mut c, ["-c", script]);
+    no_window(&mut c);
     c
 }
 
@@ -374,6 +400,40 @@ fn runnable_as(p: &std::path::Path) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The app has no console, and what it starts mustn't flash one up. The test runs a copy of itself
+    /// detached (no console), which starts another through `command`; that one says whether it got a
+    /// console window.
+    #[cfg(windows)]
+    #[test]
+    fn a_program_started_by_one_with_no_console_opens_no_window() {
+        const ROLE: &str = "TB_NO_WINDOW_ROLE";
+        const OUT: &str = "TB_NO_WINDOW_OUT";
+        let me = std::env::current_exe().unwrap();
+        let this = ["proc::tests::a_program_started_by_one_with_no_console_opens_no_window", "--exact"];
+        match std::env::var(ROLE).as_deref() {
+            Ok("inner") => {
+                // SAFETY: no arguments; null when the console has no window, or there's no console.
+                let window = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
+                std::fs::write(std::env::var(OUT).unwrap(), if window.is_null() { "no window" } else { "a window" }).unwrap();
+            }
+            Ok("outer") => {
+                assert!(!has_console());
+                command(&me).args(this).env(ROLE, "inner").stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+            }
+            _ => {
+                assert!(has_console(), "a test run has a console");
+                let out = std::env::temp_dir().join(format!("tb-no-window-{}", std::process::id()));
+                let _ = std::fs::remove_file(&out);
+                let mut outer = Command::new(&me);
+                outer.args(this).env(ROLE, "outer").env(OUT, &out).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+                detach(&mut outer).status().unwrap();
+                let got = std::fs::read_to_string(&out).unwrap_or_else(|e| panic!("the copy started with no console didn't report: {e}"));
+                let _ = std::fs::remove_file(&out);
+                assert_eq!(got, "no window");
+            }
+        }
+    }
 
     #[test]
     fn which_finds_git() {
