@@ -16,7 +16,9 @@ use crate::util::*;
 const KEY: &str = "status_bar";
 /// The script path the board last asked Midna to show, so it asks once and not on every sync.
 const OFFERED_KEY: &str = "status_bar_offered";
-const SCRIPT: &str = "plugin/task-board/bin/midna-status";
+/// The status-bar script. Midna runs an item's path itself, which on Windows can't be a `sh` script, so
+/// there it's the batch file beside it.
+const SCRIPT: &str = if cfg!(windows) { "plugin/task-board/bin/midna-status.cmd" } else { "plugin/task-board/bin/midna-status" };
 /// Most queued tasks the bar names one by one; the rest are a count.
 const LINE_MAX: usize = 3;
 
@@ -200,10 +202,15 @@ fn pr_stage(stage: &Value) -> (&'static str, &'static str, &'static str) {
     }
 }
 
-/// The script in the app this daemon runs from (`…/Taskboard.app/Contents/MacOS/taskboardd`), if
-/// it's there. None from a checkout or a test build.
+/// The script in the app this daemon runs from (`…/Taskboard.app/Contents/MacOS/taskboardd`, or on
+/// Windows the install folder, `…\Programs\Taskboard`, with `tb.exe` and the plugin beside the daemon),
+/// if it's there. None from a checkout or a test build.
 fn bundled_script() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
+    if cfg!(windows) {
+        let dir = exe.parent()?;
+        return Some(PathBuf::from(join_path(&dir.to_string_lossy(), SCRIPT))).filter(|p| p.is_file() && dir.join("tb.exe").is_file());
+    }
     let contents = exe.parent()?.parent()?;
     if contents.file_name()? != "Contents" || !contents.parent()?.extension().is_some_and(|e| e == "app") {
         return None;
@@ -218,7 +225,7 @@ pub fn with_script(items: &[String], script: &str) -> Option<Vec<String>> {
         return None;
     }
     let mut out = items.to_vec();
-    match out.iter().position(|i| i.ends_with(&format!("/{SCRIPT}"))) {
+    match out.iter().position(|i| i.replace('\\', "/").ends_with(&format!("/{SCRIPT}"))) {
         Some(at) => out[at] = script.to_string(),
         None => {
             let at = out.iter().position(|i| i == "update").unwrap_or(out.len());
@@ -378,6 +385,7 @@ mod tests {
         assert_eq!(s.as_array().unwrap().last().unwrap()["text"], "Today: 8% left", "after the task and its line");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn the_script_goes_before_update_or_replaces_an_older_copy() {
         let items = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -387,5 +395,15 @@ mod tests {
         let old = "/Users/me/taskboard/plugin/task-board/bin/midna-status";
         assert_eq!(with_script(&items(&["spacer", old, "update"]), app).unwrap(), items(&["spacer", app, "update"]));
         assert_eq!(with_script(&items(&["spacer", app]), app), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_the_script_is_the_batch_file_written_with_either_separator() {
+        let items = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let app = r"C:\Users\me\AppData\Local\Programs\Taskboard\plugin\task-board\bin\midna-status.cmd";
+        assert_eq!(with_script(&items(&["daemon", "update"]), app).unwrap(), items(&["daemon", app, "update"]));
+        let old = "D:/src/taskboard/plugin/task-board/bin/midna-status.cmd";
+        assert_eq!(with_script(&items(&["spacer", old, "update"]), app).unwrap(), items(&["spacer", app, "update"]));
     }
 }

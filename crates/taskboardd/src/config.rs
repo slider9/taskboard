@@ -806,6 +806,19 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
+/// Midna's CLI where its app puts it (on Windows a copy, so it has the `.exe`).
+pub const DEFAULT_MIDNA: &str = if cfg!(windows) { "~/.local/bin/midna.exe" } else { "~/.local/bin/midna" };
+
+/// The installed Midna's home, which holds its socket: `~/Library/Application Support/com.mrgnhnt.midna`
+/// on macOS, `%LOCALAPPDATA%\com.mrgnhnt.midna` on Windows.
+pub fn midna_home() -> PathBuf {
+    if !cfg!(windows) {
+        return expand_home("~/Library/Application Support/com.mrgnhnt.midna");
+    }
+    let local = env("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| expand_home("~/AppData/Local"));
+    local.join("com.mrgnhnt.midna")
+}
+
 /// The `[terminals]` lines earlier `init`s wrote: a live empty list from before the Jira desk moved to
 /// the Background group by default, then the Jira desk alone from before PR visits and other quiet
 /// terminals joined it. Exactly these lines (the owner's own list wouldn't carry init's example) become
@@ -911,13 +924,13 @@ impl Config {
                 .or(f.statusline_dir.as_deref().map(expand_home))
                 .unwrap_or_else(|| data.join("statusline")),
             data,
-            midna: expand_home(&env("TASKBOARD_MIDNA").or(f.midna.clone()).unwrap_or_else(|| "~/.local/bin/midna".into())),
+            midna: expand_home(&env("TASKBOARD_MIDNA").or(f.midna.clone()).unwrap_or_else(|| DEFAULT_MIDNA.into())),
             midna_socket: env("TASKBOARD_MIDNA_SOCKET")
                 .or(f.midna_socket.clone())
                 .or_else(|| env("MIDNA_SOCKET"))
-                .or_else(|| env("MIDNA_HOME").map(|h| format!("{h}/midnad.sock")))
                 .map(|p| expand_home(&p))
-                .unwrap_or_else(|| expand_home("~/Library/Application Support/com.mrgnhnt.midna/midnad.sock")),
+                .or_else(|| env("MIDNA_HOME").map(|h| expand_home(&h).join("midnad.sock")))
+                .unwrap_or_else(|| midna_home().join("midnad.sock")),
             midna_bundle: f.midna_bundle.clone().unwrap_or_else(|| "com.mrgnhnt.midna".into()),
             open_midna: f.open_midna.unwrap_or(true),
             notify: f.notify.unwrap_or(true),

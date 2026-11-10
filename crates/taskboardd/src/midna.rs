@@ -94,9 +94,46 @@ fn open_app(app: &App) {
         }
         s.midna_opened = Some(Instant::now());
     }
-    if std::process::Command::new("open").args(["-g", "-b", &app.cfg.midna_bundle]).spawn().is_ok() {
-        app.info("midna: it wasn't running; opened it");
+    if start_midna(app) {
+        app.info(if cfg!(windows) { "midna: it wasn't running; started it" } else { "midna: it wasn't running; opened it" });
     }
+}
+
+/// Opens Midna's app in the background (`open -g`), which starts its daemon.
+#[cfg(not(windows))]
+fn start_midna(app: &App) -> bool {
+    std::process::Command::new("open").args(["-g", "-b", &app.cfg.midna_bundle]).spawn().is_ok()
+}
+
+/// Starts Midna's daemon the way its login entry does, with no window: the installed `midnad.exe`, in
+/// the folder that `bin\current` names under Midna's home (the socket's folder). It backgrounds itself.
+#[cfg(windows)]
+fn start_midna(app: &App) -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let Some(midnad) = installed_midnad(&app.cfg.midna_socket) else { return false };
+    let home = app.cfg.midna_socket.parent().unwrap_or(Path::new("."));
+    std::process::Command::new(midnad)
+        .arg("--home")
+        .arg(home)
+        .arg("--socket")
+        .arg(&app.cfg.midna_socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+        .spawn()
+        .is_ok()
+}
+
+/// The `midnad.exe` Midna installed beside `socket`: `bin\<the folder bin\current names>\midnad.exe`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn installed_midnad(socket: &Path) -> Option<std::path::PathBuf> {
+    let bin = socket.parent()?.join("bin");
+    let current = std::fs::read_to_string(bin.join("current")).ok()?;
+    let midnad = bin.join(current.trim()).join("midnad.exe");
+    (!current.trim().is_empty() && midnad.is_file()).then_some(midnad)
 }
 
 /// Calls Midna's CLI directly (for notifications, which don't touch the board's state).
@@ -727,8 +764,8 @@ const DETAIL_CHARS: usize = 40;
 fn menu_tb(app: &App) -> String {
     std::env::current_exe()
         .ok()
-        .and_then(|exe| Some(exe.parent()?.join("tb")))
-        .and_then(|tb| std::fs::canonicalize(tb).ok())
+        .and_then(|exe| Some(exe.parent()?.join(format!("tb{}", std::env::consts::EXE_SUFFIX))))
+        .and_then(|tb| crate::util::canonical(tb).ok())
         .map(|tb| tb.display().to_string())
         .unwrap_or_else(|| board::tb_program(app))
 }
@@ -1621,5 +1658,22 @@ mod tests {
         let s = json!({"status": {"state": "exited", "exit_code": 1}});
         assert_eq!(describe_exit(Some(&s), None, now).as_deref(), Some("exit 1"));
         assert_eq!(describe_exit(None, Some("───\n❯"), now), None, "nothing Midna knows");
+    }
+
+    #[test]
+    fn the_installed_midnad_is_the_one_bin_current_names_beside_the_socket() {
+        let home = std::env::temp_dir().join(format!("tb-midna-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let sock = home.join("midnad.sock");
+        assert_eq!(installed_midnad(&sock), None, "nothing installed");
+        let build = home.join("bin").join("0.1.0-beta.46-da6ad2ab");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(home.join("bin").join("current"), "0.1.0-beta.46-da6ad2ab\n").unwrap();
+        assert_eq!(installed_midnad(&sock), None, "bin\\current names a folder with no midnad.exe");
+        std::fs::write(build.join("midnad.exe"), "").unwrap();
+        assert_eq!(installed_midnad(&sock), Some(build.join("midnad.exe")));
+        std::fs::write(home.join("bin").join("current"), "").unwrap();
+        assert_eq!(installed_midnad(&sock), None, "an empty bin\\current");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -1856,6 +1856,15 @@ fn answer(app: &App, id: i64, body: &Value) -> Result<Value> {
 
 /// The daemon's code-signing identifier, which Midna's `agents.trusted_clients` names to let it answer pickers.
 const TRUSTED_CLIENT_ID: &str = "com.mrgnhnt.taskboard.daemon";
+
+/// What Midna's `agents.trusted_clients` names to trust this daemon: its code-signing identifier, or on
+/// Windows (where Midna checks no signatures and matches a client by its path) this program's path.
+fn trusted_client_entry() -> String {
+    if !cfg!(windows) {
+        return TRUSTED_CLIENT_ID.into();
+    }
+    std::env::current_exe().and_then(crate::util::canonical).map(|p| p.display().to_string()).unwrap_or_else(|_| "taskboardd.exe's full path".into())
+}
 /// Midna presses the picker's keys and waits for it to close, which takes a few seconds.
 const PICK_TIMEOUT: f64 = 60.0;
 
@@ -1879,7 +1888,7 @@ fn pick(app: &App, id: i64, body: &Value) -> Result<Value> {
             return err(501, "Update Midna: this version can't answer Claude's picker. Answer it in the terminal.");
         }
         Err(midna::RpcError::Refused { code: midna::RPC_HUMAN_ONLY, .. }) => {
-            return err(403, format!("Midna only lets a trusted app answer the picker. Add {TRUSTED_CLIENT_ID} to Midna's agents.trusted_clients setting, or answer it in the terminal."));
+            return err(403, format!("Midna only lets a trusted app answer the picker. Add {} to Midna's agents.trusted_clients setting, or answer it in the terminal.", trusted_client_entry()));
         }
         Err(midna::RpcError::Refused { code: midna::RPC_NOT_FOUND, .. }) => {
             return err(409, format!("{}'s terminal is gone, so its picker is too.", rf("task", id)));

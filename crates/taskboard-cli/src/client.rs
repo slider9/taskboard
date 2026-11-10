@@ -327,7 +327,7 @@ pub fn midna_path() -> Option<PathBuf> {
             return Some(expand_home(&p));
         }
     }
-    let d = expand_home("~/.local/bin/midna");
+    let d = expand_home(taskboardd::config::DEFAULT_MIDNA);
     if d.is_file() {
         return Some(d);
     }
