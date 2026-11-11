@@ -218,10 +218,17 @@ async fn stop_signal() -> &'static str {
 async fn stop_signal() -> &'static str {
     let mut brk = tokio::signal::windows::ctrl_break().expect("ctrl-break handler");
     let mut close = tokio::signal::windows::ctrl_close().expect("console close handler");
+    // Its supervisor's ask (`proc::stop_event`). Without the event the sender is dropped, and that
+    // branch just never fires.
+    let (tx, asked) = tokio::sync::oneshot::channel();
+    taskboardd::proc::on_stop_asked(move || {
+        let _ = tx.send(());
+    });
     tokio::select! {
         _ = tokio::signal::ctrl_c() => "ctrl-c",
         _ = brk.recv() => "ctrl-break",
         _ = close.recv() => "its console closed",
+        Ok(()) = asked => "asked to stop by its supervisor (the app restarting or updating the daemon, an install or an uninstall)",
     }
 }
 

@@ -9,8 +9,10 @@
 //! - **The daemon** runs under `taskboard-app.exe --daemon` ([`supervise`]), which a per-user Run
 //!   entry starts at sign-in. It starts `taskboardd.exe serve` without a window and starts it again
 //!   after a crash, at most every 10 seconds, but not after a clean exit (another board holds the
-//!   port), like launchd's KeepAlive. [`stop`] signals the supervisor's stop event, and it ends
-//!   the daemon and exits; [`restart_daemon`] then starts a new one, on the programs now in the install.
+//!   port), like launchd's KeepAlive. [`stop`] signals the supervisor's stop event, and it asks the
+//!   daemon to stop (the daemon's own stop event, `taskboardd::proc::stop_event`, where launchd sends
+//!   SIGTERM), ends it if it hasn't within [`GRACE`], and exits; [`restart_daemon`] then starts a new
+//!   one, on the programs now in the install.
 //! - **Links**: `<scheme>://…` runs `taskboard-app.exe "<url>"`. One app runs per install
 //!   ([`claim`]): a second launch hands its links, or just "come to the front", to the first over a
 //!   named pipe and exits. (Not an AF_UNIX socket: its file outlives an app that crashes, and
@@ -38,6 +40,10 @@ pub const APP_EXE: &str = "taskboard-app.exe";
 pub const DAEMON_EXE: &str = "taskboardd.exe";
 /// The supervisor waits this long between starts of a daemon that keeps crashing (launchd's ThrottleInterval).
 const THROTTLE: Duration = Duration::from_secs(10);
+/// How long a daemon asked to stop has before it's ended: inside [`stop`]'s 10 seconds.
+const GRACE: Duration = Duration::from_secs(8);
+/// How long [`stop`] waits for the supervisor, and for the daemon in all.
+const STOP_LIMIT: Duration = Duration::from_secs(10);
 /// A message to the running app ([`claim`]) that quits it instead of opening a link.
 pub const QUIT: &str = "--quit";
 
@@ -235,9 +241,46 @@ pub fn wait_exit(pid: u32, limit: Duration) -> bool {
     if h.is_null() {
         return true;
     }
-    let gone = unsafe { WaitForSingleObject(h, limit.as_millis().min(u32::MAX as u128) as u32) } == WAIT_OBJECT_0;
+    let gone = unsafe { WaitForSingleObject(h, ms(limit)) } == WAIT_OBJECT_0;
     unsafe { CloseHandle(h) };
     gone
+}
+
+/// A wait's milliseconds.
+fn ms(d: Duration) -> u32 {
+    d.as_millis().min(u32::MAX as u128) as u32
+}
+
+/// Makes a manual-reset named event, or opens it if it's there already.
+fn event(name: &str) -> Option<Held> {
+    let h = unsafe { windows_sys::Win32::System::Threading::CreateEventW(std::ptr::null(), 1, 0, wide(name).as_ptr()) };
+    (!h.is_null()).then_some(Held(h))
+}
+
+/// Asks `taskboardd serve` (`pid`, with its `process` handle) to stop cleanly: sets its stop event,
+/// made here if it hasn't got that far in starting up, so it stops as soon as it does. True when it
+/// exited within `limit`.
+fn ask_to_stop(pid: u32, process: HANDLE, limit: Duration) -> bool {
+    let Some(ev) = event(&taskboardd::proc::stop_event(pid)) else { return false };
+    unsafe { windows_sys::Win32::System::Threading::SetEvent(ev.0) };
+    let exited = unsafe { WaitForSingleObject(process, ms(limit)) } == WAIT_OBJECT_0;
+    exited
+}
+
+/// Asks the daemon `pid` to stop and ends it if it hasn't within `limit`. True when it stopped by itself.
+fn stop_daemon(pid: u32, limit: Duration) -> bool {
+    // One handle throughout, so the id can't go to another process meanwhile.
+    let h = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+    if h.is_null() {
+        return false;
+    }
+    let asked = ask_to_stop(pid, h, limit);
+    if !asked {
+        unsafe { TerminateProcess(h, 0) };
+        unsafe { WaitForSingleObject(h, 5000) };
+    }
+    unsafe { CloseHandle(h) };
+    asked
 }
 
 /// Starts a program with no console and outside the job of whatever started us (a terminal that
@@ -254,27 +297,41 @@ pub fn spawn_detached(cmd: &mut Command) -> std::io::Result<()> {
 /// `taskboard-app.exe --daemon`: keeps `taskboardd.exe serve` running (see the module docs). One
 /// per install; another just exits.
 pub fn supervise() -> i32 {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
     let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) else { return 2 };
     let m = Manifest::read(&dir);
     let Some(_lock) = hold(&supervisor_lock(&m)) else { return 0 };
-    // [`stop`] sets it: end the daemon and go, even while waiting to start it again.
-    let stop = Held(unsafe { CreateEventW(std::ptr::null(), 1, 0, wide(&stop_event(&m)).as_ptr()) });
-    if stop.0.is_null() {
-        return 2;
-    }
-    let stopped = |wait: Duration| unsafe { WaitForSingleObject(stop.0, wait.as_millis().min(u32::MAX as u128) as u32) } == WAIT_OBJECT_0;
+    // [`stop`] sets it: stop the daemon and go, even while waiting to start it again.
+    let Some(stop) = event(&stop_event(&m)) else { return 2 };
     // Kept from the start: an update moves this program aside, and the daemon to start is the one now in the install.
     let daemon = dir.join(DAEMON_EXE);
+    keep_running(
+        || {
+            let mut c = Command::new(&daemon);
+            c.arg("serve");
+            c
+        },
+        &stop,
+        THROTTLE,
+        GRACE,
+    )
+}
+
+/// Runs the command `daemon` makes, with no window, and starts it again after it fails, at most
+/// every `throttle`, until it exits cleanly or `stop` is set. Then it asks the daemon to stop and
+/// ends it if it hasn't within `grace`.
+fn keep_running(daemon: impl Fn() -> Command, stop: &Held, throttle: Duration, grace: Duration) -> i32 {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Threading::WaitForMultipleObjects;
+    let stopped = |wait: Duration| unsafe { WaitForSingleObject(stop.0, ms(wait)) } == WAIT_OBJECT_0;
     let mut failed_starts = 0;
     loop {
         let started = Instant::now();
-        let child = Command::new(&daemon).arg("serve").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(CREATE_NO_WINDOW).spawn();
+        let mut cmd = daemon();
+        let child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(CREATE_NO_WINDOW).spawn();
         match child {
             Err(e) => {
                 failed_starts += 1;
-                crate::log::info(format!("couldn't start {}: {e}", daemon.display()));
+                crate::log::info(format!("couldn't start {}: {e}", Path::new(cmd.get_program()).display()));
                 // Gone for a minute: uninstalled, not mid-update.
                 if failed_starts >= 6 {
                     return 1;
@@ -284,9 +341,13 @@ pub fn supervise() -> i32 {
                 failed_starts = 0;
                 let handles = [c.as_raw_handle() as HANDLE, stop.0];
                 if unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, u32::MAX) } == WAIT_OBJECT_0 + 1 {
-                    unsafe { TerminateProcess(handles[0], 0) };
+                    if ask_to_stop(c.id(), handles[0], grace) {
+                        crate::log::info("stopped the daemon");
+                    } else {
+                        crate::log::info(format!("the daemon didn't stop within {}s of being asked; ending it", grace.as_secs_f32()));
+                        unsafe { TerminateProcess(handles[0], 0) };
+                    }
                     let _ = c.wait();
-                    crate::log::info("stopped the daemon");
                     return 0;
                 }
                 match c.wait() {
@@ -299,7 +360,7 @@ pub fn supervise() -> i32 {
                 }
             }
         }
-        if stopped(THROTTLE.saturating_sub(started.elapsed())) {
+        if stopped(throttle.saturating_sub(started.elapsed())) {
             return 0;
         }
     }
@@ -361,17 +422,20 @@ pub fn restart_daemon(dir: &Path, m: &Manifest) -> Result<(), String> {
     start_supervisor(dir)
 }
 
-/// Stops the daemon and its supervisor, and a daemon from the install that runs without one.
+/// Stops the daemon and its supervisor, and a daemon from the install that runs without one: each
+/// is asked first and ended if it hasn't stopped within [`STOP_LIMIT`] in all.
 pub fn stop(dir: &Path, m: &Manifest) -> bool {
     use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+    let start = Instant::now();
     let ev = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide(&stop_event(m)).as_ptr()) };
     if !ev.is_null() {
         unsafe { SetEvent(ev) };
         unsafe { CloseHandle(ev) };
     }
-    let gone = wait_released(&supervisor_lock(m), Duration::from_secs(10));
+    let gone = wait_released(&supervisor_lock(m), STOP_LIMIT);
+    // Run by hand from the install, or left by a supervisor that crashed: what's left of the time.
     for pid in running_under(dir, DAEMON_EXE) {
-        end(pid, 0);
+        stop_daemon(pid, STOP_LIMIT.saturating_sub(start.elapsed()));
     }
     gone
 }
@@ -657,5 +721,150 @@ mod tests {
         assert_eq!(child.wait().unwrap().code(), Some(7), "ended with the code it was given");
         assert!(running_under(&dir, "ping.exe").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Not a test: the daemon the supervisor tests run, which is this test program again with
+    /// `TASKBOARD_FAKE_DAEMON` naming a file it writes what it does to. By its
+    /// `TASKBOARD_FAKE_DAEMON_MODE`: `listen` waits to be asked to stop the way `taskboardd serve`
+    /// does and exits 0 when it is; `late` starts listening only after 1.5 seconds; `deaf` never
+    /// listens; `crash` exits 3 at once, and `done` 0.
+    #[test]
+    #[ignore]
+    fn fake_daemon() {
+        let Some(out) = std::env::var_os("TASKBOARD_FAKE_DAEMON") else { return };
+        let say = |s: &str| {
+            let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&out).unwrap();
+            writeln!(f, "{s}").unwrap();
+        };
+        match std::env::var("TASKBOARD_FAKE_DAEMON_MODE").unwrap_or_default().as_str() {
+            "crash" => {
+                say("started");
+                std::process::exit(3);
+            }
+            "done" => {
+                say("started");
+                std::process::exit(0);
+            }
+            "deaf" => {
+                say("deaf");
+                std::thread::sleep(Duration::from_secs(60));
+                std::process::exit(4);
+            }
+            "late" => std::thread::sleep(Duration::from_millis(1500)),
+            _ => {}
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(taskboardd::proc::on_stop_asked(move || tx.send(()).unwrap()));
+        say("listening");
+        if rx.recv_timeout(Duration::from_secs(60)).is_err() {
+            std::process::exit(5);
+        }
+        say("stopped cleanly");
+        std::process::exit(0);
+    }
+
+    /// Makes the command that starts [`fake_daemon`] in `mode`, reporting to `out`.
+    fn fake(out: &Path, mode: &str) -> impl Fn() -> Command + Send + 'static {
+        let (exe, out, mode) = (std::env::current_exe().unwrap(), out.to_path_buf(), mode.to_string());
+        move || {
+            let mut c = Command::new(&exe);
+            c.args(["win::tests::fake_daemon", "--exact", "--ignored", "--test-threads=1", "-q"]);
+            c.env("TASKBOARD_FAKE_DAEMON", &out).env("TASKBOARD_FAKE_DAEMON_MODE", &mode);
+            c
+        }
+    }
+
+    /// A file for one test's fake daemon to report to, in a folder of the test's own.
+    fn report(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("taskboard-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("daemon.txt")
+    }
+
+    fn lines(out: &Path) -> Vec<String> {
+        std::fs::read_to_string(out).unwrap_or_default().lines().map(str::to_string).collect()
+    }
+
+    /// Waits (up to 30 seconds, the whole suite may be running) until the fake has said `what` `n` times.
+    fn wait_for(out: &Path, what: &str, n: usize) {
+        let start = Instant::now();
+        while lines(out).iter().filter(|l| *l == what).count() < n {
+            assert!(start.elapsed() < Duration::from_secs(30), "the fake daemon didn't say {what:?} {n} times: {:?}", lines(out));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The supervisor's exit code, or a failure if it doesn't finish within `limit`.
+    fn finished(sup: std::thread::JoinHandle<i32>, limit: Duration) -> i32 {
+        let start = Instant::now();
+        while !sup.is_finished() {
+            assert!(start.elapsed() < limit, "the supervisor didn't finish within {limit:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        sup.join().unwrap()
+    }
+
+    /// The supervisor on a thread, with a stop event of the test's own; the other handle sets it.
+    fn supervisor(test: &str, out: &Path, mode: &str, throttle: Duration, grace: Duration) -> (std::thread::JoinHandle<i32>, Held) {
+        let name = format!(r"Local\taskboard-test-{test}-{}", std::process::id());
+        let (ours, theirs) = (event(&name).unwrap(), event(&name).unwrap());
+        let daemon = fake(out, mode);
+        (std::thread::spawn(move || keep_running(daemon, &theirs, throttle, grace)), ours)
+    }
+
+    fn set(ev: &Held) {
+        unsafe { windows_sys::Win32::System::Threading::SetEvent(ev.0) };
+    }
+
+    #[test]
+    fn a_stopped_supervisor_asks_its_daemon_to_stop_and_it_stops_cleanly() {
+        let out = report("clean-stop");
+        let (sup, stop) = supervisor("clean-stop", &out, "listen", Duration::from_secs(10), Duration::from_secs(10));
+        wait_for(&out, "listening", 1);
+        let asked = Instant::now();
+        set(&stop);
+        assert_eq!(finished(sup, Duration::from_secs(15)), 0);
+        assert!(asked.elapsed() < Duration::from_secs(10), "it stopped when asked, not when its time ran out");
+        assert_eq!(lines(&out), ["listening", "stopped cleanly"]);
+        let _ = std::fs::remove_dir_all(out.parent().unwrap());
+    }
+
+    #[test]
+    fn a_daemon_asked_to_stop_while_it_starts_stops_once_it_listens() {
+        let out = report("late-stop");
+        let mut c = fake(&out, "late")().stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        assert!(stop_daemon(c.id(), Duration::from_secs(15)), "it stopped by itself");
+        assert_eq!(c.wait().unwrap().code(), Some(0));
+        assert_eq!(lines(&out), ["listening", "stopped cleanly"]);
+        let _ = std::fs::remove_dir_all(out.parent().unwrap());
+    }
+
+    #[test]
+    fn a_daemon_that_doesn_t_stop_when_asked_is_ended() {
+        let out = report("deaf-stop");
+        let (sup, stop) = supervisor("deaf-stop", &out, "deaf", Duration::from_secs(10), Duration::from_millis(500));
+        wait_for(&out, "deaf", 1);
+        let asked = Instant::now();
+        set(&stop);
+        assert_eq!(finished(sup, Duration::from_secs(10)), 0);
+        assert!(asked.elapsed() >= Duration::from_millis(500), "it had its time to stop first");
+        assert_eq!(lines(&out), ["deaf"]);
+        let _ = std::fs::remove_dir_all(out.parent().unwrap());
+    }
+
+    #[test]
+    fn a_daemon_that_crashes_is_started_again_but_not_one_that_exits_cleanly() {
+        let out = report("crash");
+        let (sup, stop) = supervisor("crash", &out, "crash", Duration::from_millis(100), Duration::from_secs(1));
+        wait_for(&out, "started", 3);
+        set(&stop);
+        assert_eq!(finished(sup, Duration::from_secs(10)), 0);
+        let out = report("done");
+        let (sup, _stop) = supervisor("done", &out, "done", Duration::from_millis(100), Duration::from_secs(1));
+        assert_eq!(finished(sup, Duration::from_secs(30)), 0, "a clean exit ends the supervisor too");
+        assert_eq!(lines(&out), ["started"], "and isn't started again");
+        let _ = std::fs::remove_dir_all(out.parent().unwrap());
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("taskboard-crash-{}", std::process::id())));
     }
 }
