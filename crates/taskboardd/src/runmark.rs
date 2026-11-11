@@ -61,7 +61,7 @@ impl Mark {
         let mut s = match (&self.stopping, &self.stopped) {
             (Some(why), Some(at)) => format!("last run ({who}) stopped cleanly at {at}: {why}"),
             (Some(why), None) => format!("last run ({who}) began stopping ({why}) but didn't finish: it was killed while shutting down"),
-            (None, _) => format!("last run ({who}) ended without a clean shutdown: it crashed, was killed (SIGKILL) or the Mac went down; look above for a panic"),
+            (None, _) => format!("last run ({who}) ended without a clean shutdown: it crashed, was killed outright or the computer went down; look above for a panic"),
         };
         if self.version != now {
             s.push_str(&format!("; now v{now}"));

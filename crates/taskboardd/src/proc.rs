@@ -368,6 +368,39 @@ impl Drop for Group {
     }
 }
 
+/// Windows: the named event that asks `taskboardd serve` (process `pid`) to stop cleanly, as
+/// launchd's SIGTERM does on macOS. Its supervisor (`taskboard-app --daemon`) sets it. Not a
+/// console ctrl-break: that would reach every program the daemon runs in its console too.
+#[cfg(windows)]
+pub fn stop_event(pid: u32) -> String {
+    format!(r"Local\taskboardd.stop.{pid}")
+}
+
+/// Windows: calls `f`, on a thread of its own, once this process's [`stop_event`] is set. False
+/// when the event couldn't be made, so nothing can ask this run to stop that way.
+#[cfg(windows)]
+pub fn on_stop_asked(f: impl FnOnce() + Send + 'static) -> bool {
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+    use windows_sys::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    let name: Vec<u16> = stop_event(std::process::id()).encode_utf16().chain(Some(0)).collect();
+    // Manual reset. One the supervisor made first (a stop asked while this was starting) opens as
+    // it is, set or not.
+    let h = unsafe { CreateEventW(std::ptr::null(), 1, 0, name.as_ptr()) };
+    if h.is_null() {
+        return false;
+    }
+    // Held for the life of the process. It crosses to the thread as a number (a raw pointer isn't Send).
+    let h = h as usize;
+    std::thread::Builder::new()
+        .name("stop-event".into())
+        .spawn(move || {
+            if unsafe { WaitForSingleObject(h as _, INFINITE) } == WAIT_OBJECT_0 {
+                f();
+            }
+        })
+        .is_ok()
+}
+
 /// Finds a command on PATH (or returns the path as given when it has a slash). On Windows a name
 /// without an extension is looked for with each of PATHEXT's (`git` is `git.exe`, `npm` is `npm.cmd`);
 /// a path to a `#!` script with none beside it is that script (`command` runs it in Git Bash).
@@ -509,5 +542,22 @@ mod tests {
         make_runnable(&fake).unwrap();
         let o = run(&fake, &args, Some(dir.path()), 10.0).ok().expect("it ran");
         assert_eq!(o.stdout, want, "{}", o.stderr);
+    }
+
+    /// The only test that asks this process to stop: the event stays set for the rest of the run.
+    #[cfg(windows)]
+    #[test]
+    fn setting_the_stop_event_reaches_the_process_it_names() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(on_stop_asked(move || tx.send(()).unwrap()));
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "not asked yet");
+        let name: Vec<u16> = stop_event(std::process::id()).encode_utf16().chain(Some(0)).collect();
+        let ev = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+        assert!(!ev.is_null(), "the event is there to open by the process's id");
+        unsafe { SetEvent(ev) };
+        unsafe { CloseHandle(ev) };
+        rx.recv_timeout(Duration::from_secs(5)).expect("asked within 5 seconds");
     }
 }
