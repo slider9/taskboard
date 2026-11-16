@@ -1344,17 +1344,28 @@ fn deny(reason: &str) {
 /// for typing that never comes, which holds the turn (and its task) open for good. Heredocs and pipes
 /// in the command still feed what they name. Only the input changes: Claude Code still asks for the
 /// call as it would have. Not PowerShell's: the group is Bash's syntax.
+///
+/// Not in auto mode either. There Claude Code gives no verdict on a call a hook changed, so Claude
+/// has to send the changed command again, every time, and a worktree session's guard then turns the
+/// group down as too complex to check. A stray read there waits for the Bash tool's time limit.
 fn close_stdin(payload: &Value) {
-    if payload["tool_name"] != "Bash" {
-        return;
-    }
-    let Some(command) = payload["tool_input"]["command"].as_str().and_then(stdin_closed) else { return };
-    let mut input = payload["tool_input"].clone();
-    input["command"] = json!(command);
+    let Some(input) = stdin_closed_input(payload) else { return };
     let o = json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": input}});
     let mut so = std::io::stdout();
     let _ = so.write_all(o.to_string().as_bytes());
     let _ = so.flush();
+}
+
+/// A Bash call's input with its command reading from /dev/null, or None to leave the call as it is
+/// (see [`close_stdin`]).
+fn stdin_closed_input(payload: &Value) -> Option<Value> {
+    if payload["tool_name"] != "Bash" || payload["permission_mode"] == "auto" {
+        return None;
+    }
+    let command = payload["tool_input"]["command"].as_str().and_then(stdin_closed)?;
+    let mut input = payload["tool_input"].clone();
+    input["command"] = json!(command);
+    Some(input)
 }
 
 const STDIN_CLOSED_END: &str = "\n} < /dev/null";
@@ -2023,6 +2034,16 @@ mod tests {
         assert_eq!(once, "{ echo hi\n} < /dev/null");
         assert_eq!(stdin_closed(&once), None, "grouped already");
         assert_eq!(stdin_closed("  "), None);
+    }
+
+    #[test]
+    fn auto_mode_leaves_a_bash_command_as_it_is() {
+        let call = |mode: &str, tool: &str| json!({"tool_name": tool, "permission_mode": mode, "tool_input": {"command": "echo hi", "description": "d"}});
+        assert_eq!(stdin_closed_input(&call("default", "Bash")), Some(json!({"command": "{ echo hi\n} < /dev/null", "description": "d"})), "the rest of the input as it was");
+        assert!(stdin_closed_input(&call("acceptEdits", "Bash")).is_some());
+        assert_eq!(stdin_closed_input(&call("auto", "Bash")), None, "auto mode gives no verdict on a changed call");
+        assert_eq!(stdin_closed_input(&call("default", "PowerShell")), None);
+        assert!(stdin_closed_input(&json!({"tool_name": "Bash", "tool_input": {"command": "echo hi"}})).is_some(), "a hook input without a mode, as before");
     }
 
     #[test]
