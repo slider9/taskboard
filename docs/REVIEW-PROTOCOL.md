@@ -154,6 +154,12 @@ tb finding T<n>                                        # the findings to fix and
 tb finding T<n> F1 fixed "<what you changed>"          # from the task's own terminal, once it's fixed
 ```
 
+The message counts as sent once the agent's prompt hook reports it. Typed in through Midna while the
+terminal is idle, a message that doesn't arrive is typed once more, and then the owner is alerted to
+type anything in that terminal, which hands it over through the hook. Whether the message arrived or not,
+`tb status` and `tb peek` (its card's `code_review.note`) say where the review stands and list each
+finding to fix with triage's reason, so an agent coming back to the task finds them.
+
 The note is one line of 300 characters at most; a finding is marked fixed once. Then it commits, pushes
 and runs `tb submit` again as before. A changed worktree runs the next round, whose reviewer sees each
 `fixed` note in `TASKBOARD_PREVIOUS`. An unchanged one carries on to the PR, and the owner is alerted with

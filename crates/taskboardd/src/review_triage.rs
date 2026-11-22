@@ -257,7 +257,7 @@ fn start_fixing(app: &App, t: &Row, n: u64, d: &Value, fix: &[Value]) -> Result<
     let k = fix.len();
     let text = format!(
         "[task-board] {me}'s code review, round {n}, found {k} thing{} your change caused, to fix before its PR:\n{}\n\
-         Each in full (detail, url): {}\n\
+         Each in full (detail, url): {} · this list again any time: {tb} finding {me}\n\
          Fix only these: the round's other findings went to the backlog or were dismissed. Mark each once it's fixed: \
          {tb} finding {me} <id> fixed \"<what you changed>\"\n\
          Then commit, push and run tb submit again as before, with the same summary and --pr-body: the board reviews the change \
@@ -295,6 +295,50 @@ pub fn end_fixing(app: &App, t: &Row, stage: &Value) -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// Where the task's code review stands, for its agent (`tb status`, `tb peek`): what the review waits on,
+/// or, while it fixes a round, each finding to fix with triage's reason and how to mark it. A fix list
+/// that never reached the agent can be read here in full.
+pub fn agent_note(app: &App, t: &Row) -> Result<Option<String>> {
+    let Some(stage) = code_review::stage(t) else { return Ok(None) };
+    let me = rf("task", t.id());
+    let tb = board::tb_cmd(app);
+    let n = stage["round"].as_u64().unwrap_or(1);
+    if stage["state"] != code_review::FIXING {
+        let now = match stage["state"].as_str() {
+            Some(STATE) => format!("round {n}'s findings are being triaged"),
+            Some("running") => format!("round {n} is running"),
+            _ => format!("round {n} is waiting to run"),
+        };
+        return Ok(Some(format!(
+            "In code review: {now}. Leave the worktree alone and end your turn: the board sends you anything to fix, or opens the PR."
+        )));
+    }
+    let d = round_event(app, t.id(), n)?.map(|(_, d)| d).unwrap_or(Value::Null);
+    let fix = with_outcome(&d, "fix");
+    let left = unfixed(&d);
+    let mut lines = vec![format!(
+        "Fixing code review round {n}: {} of {} finding{} still to fix before its PR.",
+        left.len(),
+        fix.len(),
+        if fix.len() == 1 { "" } else { "s" }
+    )];
+    for f in &fix {
+        let tr = &d["triage"][f["id"].as_str().unwrap_or("")];
+        lines.push(match tr["fixed"].as_str() {
+            Some(note) => format!("- {} (fixed: {note})", finding_line(f)),
+            None => format!("- {}\n  Triage: {}", finding_line(f), tr["reason"].as_str().unwrap_or("")),
+        });
+    }
+    let files = code_review::task_dir(app, t.id()).join(format!("round-{n}")).join("findings.json");
+    lines.push(format!("Each in full (detail, url): {} · this list again: {tb} finding {me}", files.display()));
+    lines.push(if left.is_empty() {
+        "Every one is marked fixed: commit, push and run tb submit again.".to_string()
+    } else {
+        format!("Mark each once it's fixed: {tb} finding {me} <id> fixed \"<what you changed>\". Then commit, push and run tb submit again.")
+    });
+    Ok(Some(lines.join("\n")))
 }
 
 /// While the task's agent fixes round `n`'s findings, for the task card: how many to fix and how many are fixed.

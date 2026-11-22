@@ -11,7 +11,7 @@ use taskboardd::api::{self, Query};
 use taskboardd::app::App;
 use taskboardd::config::Config;
 use taskboardd::util::{Row, RowExt};
-use taskboardd::{board, code_review, dispatch, midna, p, reports};
+use taskboardd::{board, code_review, deliver, dispatch, jobs, midna, p, reports};
 
 struct Board {
     app: Arc<App>,
@@ -597,4 +597,138 @@ fn triage_backlog_says_what_it_blocks_and_a_minor_finding_off_the_diff_cant_hold
     assert!(b.alerts().iter().any(|a| a.contains("misses its done-when") && a.contains("Old helper leaks")), "{:?}", b.alerts());
     let r = &code_review::rounds(&b.app, id).unwrap()[0];
     assert_eq!((r["triage"]["F1"]["blocks"].as_str(), r["triage"]["F2"]["blocks"].as_str()), (Some("pr"), Some("goal")), "{r}");
+}
+
+const LONG_AGO: &str = "2020-01-01T00:00:00Z";
+
+impl Board {
+    /// Round 1 found F1 (fix) and F2 (dismiss): the task's agent has its fix list to come.
+    fn fixing(&self) -> i64 {
+        std::fs::write(self.dir.path().join("result-1.json"), TWO).unwrap();
+        let id = self.task();
+        self.push();
+        self.done().unwrap();
+        code_review::sweep(&self.app).unwrap();
+        self.app.db.x("UPDATE jobs SET target = json_set(target, '$.session', 's-triage') WHERE purpose = 'code_review_triage'", p![]).unwrap();
+        self.triage(id, "F1", "fix", "The change counts one page too many").unwrap();
+        self.triage(id, "F2", "dismiss", "Not worth it").unwrap();
+        code_review::sweep(&self.app).unwrap();
+        id
+    }
+    /// Terminal s1 has sat idle at its prompt for a while.
+    fn idle(&self) {
+        self.app.db.x("UPDATE sessions SET status = 'idle' WHERE id = 's1'", p![]).unwrap();
+        self.app.db.x("UPDATE sessions SET status_at = ? WHERE id = 's1'", p![LONG_AGO]).unwrap();
+    }
+    fn fix_job(&self, id: i64) -> Row {
+        self.app.db.q1("SELECT * FROM jobs WHERE kind = 'deliver' AND task_id = ? AND purpose = 'code_review_fix'", p![id]).unwrap().unwrap()
+    }
+    /// The board's tick types the fix list in through Midna, and Midna says it typed it. How many it typed.
+    fn type_in(&self) -> usize {
+        self.app.db.tx(|| deliver::tick(&self.app)).unwrap();
+        let typing = self.app.db.q("SELECT id FROM jobs WHERE kind = 'message' AND state = 'pending'", p![]).unwrap();
+        for j in &typing {
+            self.app.db.tx(|| jobs::result(&self.app, j.id(), true, "", "", 0)).unwrap();
+        }
+        typing.len()
+    }
+    /// The fix list's last typing, and its release, are long past.
+    fn later(&self, id: i64) {
+        self.app
+            .db
+            .x("UPDATE jobs SET created_at = ?, target = json_set(target, '$.sent_at', ?) WHERE id = ?", p![LONG_AGO, LONG_AGO, self.fix_job(id).id()])
+            .unwrap();
+    }
+    fn logged(&self, id: i64, text: &str) -> bool {
+        self.app.db.q("SELECT text FROM events WHERE task_id = ?", p![id]).unwrap().iter().any(|e| e.st("text").contains(text))
+    }
+    fn status_text(&self) -> String {
+        self.report("tb.status", json!({})).unwrap()["context"].as_str().unwrap_or("").to_string()
+    }
+}
+
+#[test]
+fn a_fix_list_midna_typed_counts_as_sent_only_once_the_agents_prompt_holds_it() {
+    let b = new_board(|d| Some(reviewer(d, PASS)));
+    let id = b.fixing();
+    let text = b.fix_list(id).unwrap();
+    b.idle();
+
+    assert_eq!(b.type_in(), 1);
+    let j = b.fix_job(id);
+    assert_eq!(j.s("state"), Some("running"), "typed, not delivered");
+    assert_eq!(board::job_target(&j)["typed"], 1);
+    assert!(!b.logged(id, "findings to fix"), "nothing says it was sent yet");
+
+    // Claude Code hands it to the agent as one prompt, its lines as they were typed.
+    let prompt = text.replace('\n', "\r\n");
+    b.report("hook.prompt", json!({"prompt": prompt})).unwrap();
+    assert_eq!(b.fix_job(id).s("state"), Some("done"));
+    assert!(b.logged(id, "its code review's findings to fix"));
+    assert!(b.alerts().is_empty(), "{:?}", b.alerts());
+}
+
+#[test]
+fn a_typed_fix_list_that_never_arrives_is_typed_once_more_then_the_owner_hears() {
+    let b = new_board(|d| Some(reviewer(d, PASS)));
+    let id = b.fixing();
+    b.idle();
+    assert_eq!(b.type_in(), 1);
+
+    // It didn't arrive and the terminal still sits idle: typed again, once.
+    b.later(id);
+    assert_eq!(b.type_in(), 1, "typed again");
+    assert!(b.logged(id, "again: the last time it didn't arrive"));
+    b.later(id);
+    assert_eq!(b.type_in(), 0, "not a third time");
+    assert_eq!(b.fix_job(id).s("state"), Some("running"));
+    let alerts = b.alerts();
+    assert!(alerts.iter().any(|a| a.contains("hasn't picked up the code review's fix list") && a.contains("typed it in 2 times")), "{alerts:?}");
+
+    // The owner types anything: the hook hands the list over and says so.
+    let out = b.report("hook.prompt", json!({"prompt": "Where are you up to?"})).unwrap();
+    let handed = out["deliver"]["text"].as_str().unwrap_or("");
+    assert!(handed.contains("Off by one"), "{out}");
+    b.report("hook.delivered", json!({"ids": out["deliver"]["ids"]})).unwrap();
+    assert_eq!(b.fix_job(id).s("state"), Some("done"));
+    assert!(b.alerts().is_empty(), "{:?}", b.alerts());
+}
+
+#[test]
+fn tb_status_and_peek_say_where_the_review_stands_and_list_each_finding_to_fix() {
+    let b = new_board(|d| Some(reviewer(d, PASS)));
+    std::fs::write(b.dir.path().join("result-1.json"), TWO).unwrap();
+    let id = b.task();
+    b.push();
+    b.done().unwrap();
+    assert!(b.status_text().contains("In code review: round 1 is waiting to run. Leave the worktree alone and end your turn"), "{}", b.status_text());
+    code_review::sweep(&b.app).unwrap();
+    assert!(b.status_text().contains("round 1's findings are being triaged"), "{}", b.status_text());
+
+    b.app.db.x("UPDATE jobs SET target = json_set(target, '$.session', 's-triage') WHERE purpose = 'code_review_triage'", p![]).unwrap();
+    b.triage(id, "F1", "fix", "The change counts one page too many").unwrap();
+    b.triage(id, "F2", "dismiss", "Not worth it").unwrap();
+    code_review::sweep(&b.app).unwrap();
+    let text = b.status_text();
+    for want in [
+        "Fixing code review round 1: 1 of 1 finding still to fix",
+        "- F1: [major] Off by one (a.txt:1)",
+        "Triage: The change counts one page too many",
+        &format!("finding T{id} <id> fixed"),
+        &format!("this list again: tb finding T{id}"),
+        "findings.json",
+    ] {
+        assert!(text.contains(want), "{want} in {text}");
+    }
+    assert!(!text.contains("Old helper"), "only the ones to fix: {text}");
+
+    let mut q = Query::new();
+    q.insert("session".into(), "s1".into());
+    let peek = api::dispatch(&b.app, "GET", "whoami", &q, &json!({})).unwrap();
+    let note = peek["task"]["code_review"]["note"].as_str().unwrap_or("");
+    assert!(note.contains("- F1: [major] Off by one (a.txt:1)"), "{peek}");
+
+    b.fixed(id, "F1", "Counts from zero").unwrap();
+    let text = b.status_text();
+    assert!(text.contains("(fixed: Counts from zero)") && text.contains("Every one is marked fixed"), "{text}");
 }

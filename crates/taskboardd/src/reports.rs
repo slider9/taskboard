@@ -3239,6 +3239,9 @@ fn on_status(r: &mut Report) -> Result<Value> {
             line = format!("{line}\n{s}");
         }
     }
+    if let Some(note) = crate::review_triage::agent_note(r.app, &t)? {
+        line = format!("{line}\n{note}");
+    }
     Ok(with(
         ok(Some(&t), Some(line)),
         json!({"title": t.v("title"), "status": t.v("status"), "jira_key": t.v("jira_key"), "pr_url": t.v("pr_url"),
@@ -3549,6 +3552,11 @@ pub fn handle(app: &App, body: Value, spooled: bool) -> Result<Value> {
                     };
                 }
             }
+        }
+        if r.event == "hook.prompt" {
+            // A message Midna typed in counts as sent once the agent's prompt holds it, before `take`
+            // could hand it over a second time.
+            deliver::arrived(app, r.sid(), r.body["prompt"].as_str().unwrap_or(""))?;
         }
         if !spooled {
             let mut handed = deliver::take(app, r.sid(), &r.event)?;

@@ -215,6 +215,10 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
             let card = |t: &Row| -> Result<Value> {
                 let mut c = board::task_card(app, t)?;
                 c["detail"] = t.v("detail");
+                // An agent back on a task in code review reads where it stands and every finding to fix.
+                if let Some(note) = crate::review_triage::agent_note(app, t)? {
+                    c["code_review"]["note"] = json!(note);
+                }
                 Ok(c)
             };
             Ok(json!({"session": sid,

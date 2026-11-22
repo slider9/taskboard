@@ -1,4 +1,8 @@
 //! Messages for a terminal's task: handed over by its hooks, or typed in through Midna once it's idle.
+//!
+//! A message Midna typed isn't delivered yet: it is once the agent's prompt hook reports its text
+//! (`arrived`). Typed text can be lost (a multi-line one was, on Windows), so one that doesn't arrive
+//! is typed once more while the terminal stays idle, and then the owner is told.
 
 use serde_json::{json, Value};
 
@@ -14,6 +18,10 @@ const RESEND_AFTER_SECS: f64 = 30.0;
 const DELIVERY_WAIT_SECS: f64 = 90.0;
 const SEND_SETTLE_SECS: f64 = 5.0;
 const SEND_RETRY_SECS: f64 = 30.0;
+/// Times Midna types a message that hasn't arrived before the board stops typing it and tells the owner.
+const TYPED_MAX: u64 = 2;
+/// How much of a typed message's start (whitespace squashed) the agent's prompt has to hold.
+const MATCH_CHARS: usize = 80;
 
 fn what(purpose: &str) -> &'static str {
     match purpose {
@@ -133,6 +141,7 @@ fn send(app: &App, j: &Row, t: &Row, s: &Row, target: &mut Row) -> Result<Option
         || age_secs(s.s("status_at")).unwrap_or(0.0) < SEND_SETTLE_SECS
         || sending(app, target)?
         || failed_ago < SEND_RETRY_SECS
+        || typed_times(target) >= TYPED_MAX
     {
         return Ok(None);
     }
@@ -152,12 +161,57 @@ fn send(app: &App, j: &Row, t: &Row, s: &Row, target: &mut Row) -> Result<Option
         board::BOARD,
         "midna",
         &format!(
-            "{} is idle at its prompt, so the board sent it {} through Midna",
+            "{} is idle at its prompt, so the board is typing {} into it through Midna{}",
             board::session_name(app, s.s("id"), None),
-            what(&purpose)
+            what(&purpose),
+            if typed_times(target) > 0 { ", again: the last time it didn't arrive" } else { "" }
         ),
     )?;
     Ok(Some(jid))
+}
+
+fn typed_times(target: &Row) -> u64 {
+    target.get("typed").and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// Midna typed a message into its terminal (`jobs::after_result`). It isn't the agent's until its prompt
+/// hook reports it (`arrived`), so the job stays open; `tick` types it again or tells the owner.
+pub fn typed(app: &App, deliver_id: i64) -> Result<()> {
+    let Some(j) = app.db.q1("SELECT * FROM jobs WHERE id = ? AND kind = ?", p![deliver_id, KIND])? else { return Ok(()) };
+    if !matches!(j.s("state"), Some("pending") | Some("running")) {
+        return Ok(());
+    }
+    let mut target = board::job_target(&j);
+    target.remove("send_job");
+    target.insert("typed_at".into(), json!(now_iso()));
+    target.insert("typed".into(), json!(typed_times(&target) + 1));
+    save_target(app, &j, &target)
+}
+
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The agent's prompt hook in terminal `sid` reported `prompt`: each message Midna typed there that it
+/// holds is delivered.
+pub fn arrived(app: &App, sid: Option<&str>, prompt: &str) -> Result<()> {
+    let Some(sid) = sid.filter(|s| !s.is_empty()) else { return Ok(()) };
+    let got = squash(prompt);
+    if got.is_empty() {
+        return Ok(());
+    }
+    let mut ids = vec![];
+    for j in open_jobs(app, None)? {
+        let target = board::job_target(&j);
+        if j.s("state") != Some("running") || target.s("sent_on") != Some("midna") || target.s("sent_to") != Some(sid) {
+            continue;
+        }
+        let start: String = squash(&board::job_args(&j).st("text")).chars().take(MATCH_CHARS).collect();
+        if !start.is_empty() && got.contains(&start) {
+            ids.push(json!(j.id()));
+        }
+    }
+    delivered(app, Some(sid), &ids)
 }
 
 pub fn send_failed(app: &App, deliver_id: i64, why: &str) -> Result<()> {
@@ -378,16 +432,22 @@ pub fn tick(app: &App) -> Result<()> {
             save_target(app, &j, &target)?;
             let w = what(&purpose);
             let name = s.as_ref().map(|s| board::session_name(app, s.s("id"), None)).unwrap_or_else(|| "Its terminal".into());
+            // Typed but never reported by the agent's prompt hook: the text was lost on the way in.
+            let lost = match typed_times(&target) {
+                0 => String::new(),
+                1 => " (Midna typed it in, but it never reached the agent)".to_string(),
+                n => format!(" (Midna typed it in {n} times, but it never reached the agent)"),
+            };
             board::log_event(
                 app,
                 t.id(),
                 board::BOARD,
                 "midna",
-                &format!("{name} is idle at its prompt and hasn't picked up {w}. Type anything in it to hand it over"),
+                &format!("{name} is idle at its prompt and hasn't picked up {w}{lost}. Type anything in it to hand it over"),
             )?;
             dispatch::add_alert(
                 app,
-                &format!("{} is idle and hasn't picked up {w}. Type anything in its terminal to hand it over.", rf("task", t.id())),
+                &format!("{} is idle and hasn't picked up {w}{lost}. Type anything in its terminal to hand it over.", rf("task", t.id())),
                 Some(t.id()),
                 t.i("goal_id"),
                 None,

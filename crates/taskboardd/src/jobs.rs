@@ -141,7 +141,8 @@ pub fn after_result(app: &App, j: &Row, ok: bool, res: &Value) -> Result<()> {
         "message" => {
             if let Some(did) = a.i("deliver") {
                 if ok {
-                    deliver::delivered(app, a.s("to"), &[json!(did)])?;
+                    // Typed, not yet delivered: the agent's prompt hook says when it has it.
+                    deliver::typed(app, did)?;
                 } else {
                     deliver::send_failed(app, did, &why)?;
                     if let Some(t) = &t {
