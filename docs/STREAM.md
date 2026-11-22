@@ -1,11 +1,18 @@
 # Work event stream, protocol v1
 
 The board defines this format; a work relay (anything that hears Bitbucket, GitHub, git, CI or Jira) adapts
-to it. An event carries every field the board needs, so the board never has to call the host to finish one.
+to it. A complete event carries every field the board needs, so in stream mode the board applies it without
+calling the host. An incomplete pr event without its state, title, branch and base, a review or comment,
+or a pr event in board mode makes the board read the PR from its host instead (see Kinds and Modes).
 
 ```
-POST /stream/events          (tb stream send '<json>'   or   … | tb stream send)
+POST http://127.0.0.1:8792/tasks/api/stream/events     (tb stream send '<json>'   or   … | tb stream send)
+X-Task-Board: 1
+Content-Type: application/json
 ```
+
+The address is the board's API (config `host` and `port`, or `TASKBOARD_PORT`). A POST without the
+`X-Task-Board: 1` header gets 403, and a body over 2 MiB gets 413. `tb stream send` sets both for you.
 
 ## Envelope
 
@@ -17,7 +24,7 @@ POST /stream/events          (tb stream send '<json>'   or   … | tb stream sen
 - `events` holds 1 to 500 events. A body without `events` but with a `kind` is read as a single event:
   `{"v": 1, "id": …, "kind": …}`.
 - Every event has these fields:
-  - `id`: a string of 1 to 200 characters, unique to that event. Sending the same id again is a duplicate.
+  - `id`: a string of 1 to 200 bytes (UTF-8, leading and trailing spaces not counted), unique to that event. Sending the same id again is a duplicate.
   - `kind`: what kind of event it is (see Kinds).
   - `at`: when it happened, as ISO 8601.
   - `source`: the relay or feed it came from.
@@ -116,7 +123,8 @@ any case. A display name, a username or an account id all match once they're in 
 
 ### `jira.comment`
 
-`key`, `comment_id` (Jira's numeric id), `author` and `body` are required. `visibility?` is optional.
+`key`, `comment_id` (Jira's numeric id, digits only), `author` and `body` are required. Any other field, such as
+`visibility`, is kept with the event but not read.
 
 ### `heartbeat`: the relay is alive
 
@@ -214,7 +222,9 @@ for a source, the source's health is its relays':
   reconcile: once every `[feed] reconcile_secs` (default 3600, 0 never), and once more after the relay connects or
   comes back from being stuck. Other PRs are polled as before, and so are a relay's PRs again from the round after
   it goes stuck or silent. A relay that never sent a heartbeat covers nothing, so the poll keeps reading its PRs.
-  `POST /prs/refresh` still reads every PR;
+  `POST /prs/refresh` still reads every PR. The read of the owner's open PRs while PR builds are stopped
+  (`pr_builds.owner_prs_secs`) goes by the same rule for each repo: a repo a healthy, active prs relay covers is read
+  once after the relay connects or comes back, then every `reconcile_secs`, since its PR events note the owner's PRs;
 - likewise the master-break watch's `[master] every_mins` timer rests for a `[master.projects]` branch while builds
   is in stream mode and a healthy, active builds relay covers its repo: the relay's pushes and builds read the
   branch then. It still reads the branch to reconcile, every `reconcile_secs` and once after the relay connects or

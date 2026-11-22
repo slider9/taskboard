@@ -1,9 +1,8 @@
-//! The dialog over the main window: the alerts list (read-only; esc or Close closes it, and it
-//! closes by itself once nothing needs you), the New idea form (`ui::ideas`), and the confirm for a
-//! link menu's Mark done / Cancel task… and the PR's Merge now. Tasks, goals and issues are made and changed through
-//! Claude (`tb`), never typed in here.
-use crate::app::{CloseOverlay, MainWindow, alert_row};
-use crate::fmt::arr;
+//! The dialog over the main window: the ⌘K search, a task's whole note for testers, the New idea
+//! form (`ui::ideas`), and the confirm for a link menu's Mark done / Cancel task… and the PR's
+//! Merge now (which names the holds it skips and keeps a refusal on screen). Tasks, goals and
+//! issues are made and changed through Claude (`tb`), never typed in here.
+use crate::app::{CloseOverlay, MainWindow};
 use crate::theme::Theme;
 use crate::ui::kit;
 use gpui_kit::prelude::*;
@@ -11,7 +10,6 @@ use gpui_kit::*;
 use std::cmp::Ordering;
 
 pub enum Modal {
-    Alerts,
     /// The ⌘K palette (`ui::search`).
     Search,
     /// A task's whole note for testers (the panel's Show all).
@@ -22,6 +20,19 @@ pub enum Modal {
     /// The menu skips Midna's approval, so nothing happens until the owner confirms here. Also the
     /// PR's Merge now, the owner's override.
     Finish(Finish),
+    /// Settling a goal's last miss would finish the goal: ask first.
+    LastMiss(LastMiss),
+}
+
+pub struct LastMiss {
+    /// The issue, "B15".
+    pub r: String,
+    /// What was pressed: `ticket`, `drop` or `without`.
+    pub act: &'static str,
+    /// The goal that would finish, "G3".
+    pub goal: String,
+    /// Its When done closes terminals.
+    pub auto_close: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +41,10 @@ pub enum Ask {
     Cancel,
     /// Merge the task's PR past whatever holds it (`tb pr merge --override`).
     Merge,
+    /// Close the task's terminal (a failed task's, or one still running a command).
+    Close,
+    /// Close it although a command is still running (`force`).
+    CloseForce,
 }
 
 pub struct Finish {
@@ -38,11 +53,22 @@ pub struct Finish {
     /// Why it can't go ahead: it's already done, or the board refused.
     pub note: Option<String>,
     pub busy: bool,
+    /// A merge that was tried and refused: the dialog keeps the answer until it's closed.
+    pub refused: Option<Refused>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Refused {
+    pub why: String,
+    /// When it was refused, "3:16 PM".
+    pub at: String,
+    /// Ask the agent to rebase is on its way to the board.
+    pub asking: bool,
 }
 
 impl Modal {
     pub fn finish(r: String, ask: Ask) -> Modal {
-        Modal::Finish(Finish { r, ask, note: None, busy: false })
+        Modal::Finish(Finish { r, ask, note: None, busy: false, refused: None })
     }
 }
 
@@ -105,14 +131,7 @@ fn close(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWindow>) 
 /// The dialog over a dimmed backdrop. As on the web, clicks on the backdrop do nothing.
 pub fn render(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWindow>) -> AnyElement {
     let t = cx.global::<Theme>().clone();
-    // The alerts dialog closes itself once nothing needs you (renderBanner).
-    if matches!(m.modal, Some(Modal::Alerts)) && arr(m.state(), "alerts").is_empty() && m.data.state.is_some() {
-        m.modal = None;
-        window.focus(&m.focus, cx);
-        return div().into_any_element();
-    }
     let body = match &m.modal {
-        Some(Modal::Alerts) => alerts(m, &t, cx),
         Some(Modal::Search) => return crate::ui::search::render(m, window, cx),
         Some(Modal::Note(text)) => {
             let text = text.clone();
@@ -120,25 +139,27 @@ pub fn render(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWind
         }
         Some(Modal::NewIdea) => crate::ui::ideas::form(m, &t, window, cx),
         Some(Modal::Finish(f)) => finish(m, &t, f, cx),
+        Some(Modal::LastMiss(x)) => last_miss(&t, x, cx),
         None => return div().into_any_element(),
     };
     deferred(
         kit::scrim(&t, "modal-scrim")
+            .track_focus(&m.modal_focus)
             .flex()
             .items_center()
             .justify_center()
             .on_action(cx.listener(|m, _: &CloseOverlay, window, cx| on_escape(m, window, cx)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().id("modal-body").flex().flex_col().max_h(relative(0.92)).child(body)),
+            .child(div().id("modal-body").debug_selector(|| "modal-body".into()).flex().flex_col().max_h(relative(0.9)).child(body)),
     )
     .with_priority(1)
     .into_any_element()
 }
 
-/// Esc in the dialog closes it.
+/// Esc in the dialog closes its top layer: a menu open in it, else the dialog.
 pub fn on_escape(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWindow>) {
     if m.modal.is_some() {
-        close(m, window, cx);
+        m.escape(window, cx);
     }
 }
 
@@ -154,28 +175,6 @@ pub fn head(t: &Theme, title: impl Into<SharedString>, cx: &mut Context<MainWind
         .pb(px(12.))
         .child(div().flex_1().text_size(px(17.)).font_weight(FontWeight::BOLD).child(title.into()))
         .child(kit::btn_small(t, "modal-close", "Close").on_click(cx.listener(|m, _, window, cx| close(m, window, cx))))
-}
-
-fn alerts(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> AnyElement {
-    let list = arr(m.state(), "alerts").to_vec();
-    let (title, _) = crate::app::alerts_dialog_view(&list);
-    let mut col = div().id("alerts-list").flex().flex_col().overflow_y_scroll();
-    for a in &list {
-        col = col.child(alert_row(t, a, cx));
-    }
-    kit::modal_box(t, 560.)
-        .child(head(t, title, cx))
-        .child(col)
-        .when(list.iter().any(|a| !crate::app::alert_stays(a)), |d| {
-            d.child(
-                div().flex().justify_end().p(px(16.)).child(
-                    kit::btn_small(t, "alerts-dismiss-all", "Dismiss all")
-                        // The dialog closes by itself once the alerts are gone.
-                        .on_click(cx.listener(|m, _, _, cx| crate::app::dismiss_all_alerts(m, cx))),
-                ),
-            )
-        })
-        .into_any_element()
 }
 
 /// The whole note for testers, scrolling when it's taller than the window.
@@ -217,6 +216,9 @@ fn already(t: &serde_json::Value, ask: Ask) -> Option<String> {
             None
         };
     }
+    if matches!(ask, Ask::Close | Ask::CloseForce) {
+        return None;
+    }
     if t["failed"] == true {
         Some(format!("{r} already failed."))
     } else if t["status"] == "done" {
@@ -226,16 +228,182 @@ fn already(t: &serde_json::Value, ask: Ask) -> Option<String> {
     }
 }
 
+/// What an open PR's merge would skip: the checks still running or failing, and the review it
+/// still waits for.
+pub(crate) fn holds(pr: &serde_json::Value) -> Vec<String> {
+    let mut v = vec![];
+    match pr["checks"].as_str() {
+        Some("pending") => v.push("CI, still running".to_string()),
+        Some("fail") => v.push("CI, failing".to_string()),
+        _ => {}
+    }
+    let (have, need) = (pr["approvals"]["have"].as_i64().unwrap_or(0), pr["approvals"]["need"].as_i64().unwrap_or(0));
+    match pr["review"].as_str() {
+        Some("changes") => v.push("Review, changes asked for".to_string()),
+        Some("pending") if need > have => v.push(format!("Review, {have} of {need} approvals")),
+        Some("pending") => v.push("Review, not approved yet".to_string()),
+        _ => {}
+    }
+    v
+}
+
+/// Who refused a merge: the PR's host, else the board.
+fn refuser(pr: &serde_json::Value) -> &'static str {
+    match pr["host"].as_str().map(str::to_lowercase).as_deref() {
+        Some("github") => "GitHub",
+        Some("bitbucket") => "Bitbucket",
+        Some("gitlab") => "GitLab",
+        _ => "The board",
+    }
+}
+
+/// What the host's refusal comes to: the branch is behind its base, or conflicts with it. Either way the
+/// task's agent can rebase it; any other refusal is shown as it was said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    Behind,
+    Conflicts,
+}
+
+fn refusal(why: &str) -> Option<Refusal> {
+    let w = why.to_lowercase();
+    if w.contains("conflict") {
+        Some(Refusal::Conflicts)
+    } else if w.contains("behind") || w.contains("out of date") || w.contains("not up to date") {
+        Some(Refusal::Behind)
+    } else {
+        None
+    }
+}
+
+/// The base branch a refusal names ("… behind main.", "… with its base branch main."), else "its base".
+fn base_named(why: &str) -> String {
+    let lower = why.to_lowercase();
+    ["base branch ", "behind "]
+        .iter()
+        .filter_map(|k| lower.find(k).map(|i| &why[i + k.len()..]))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(|w| w.trim_end_matches(['.', ',', ':', ';', ')']))
+        .find(|w| !w.is_empty() && !matches!(w.to_lowercase().as_str(), "its" | "the" | "a" | "by") && !w.starts_with(|c: char| c.is_ascii_digit()))
+        .map_or_else(|| "its base".to_string(), str::to_string)
+}
+
+/// The refusal's red line and the muted line under it.
+fn refused_lines(by: &str, why: &str) -> (String, String) {
+    let base = base_named(why);
+    match refusal(why) {
+        Some(Refusal::Behind) => (format!("{by} says the branch is behind {base}."), format!("The agent can rebase it on {base} and merge again.")),
+        Some(Refusal::Conflicts) => (format!("{by} says the branch conflicts with {base}."), format!("The agent can rebase it on {base} and merge again.")),
+        None => (format!("{by} refused the merge."), why.to_string()),
+    }
+}
+
+/// A merge the host refused: what it said, then Focus in Midna, Close, and Ask the agent to rebase
+/// when a rebase is what it needs.
+fn refused_view(t: &Theme, task: &str, pr_word: &str, pr: Option<&serde_json::Value>, r: &Refused, cx: &mut Context<MainWindow>) -> AnyElement {
+    let by = pr.map_or("The board", refuser);
+    let (said, next) = refused_lines(by, &r.why);
+    let task_ref = task.to_string();
+    let focus = kit::btn(t, "finish-focus", "Focus in Midna")
+        .on_click(cx.listener(move |m, _, _, cx| m.focus_in_midna(format!("tasks/{task_ref}/focus"), Some(task_ref.clone()), cx)));
+    let close_btn = kit::btn(t, "finish-close", "Close").on_click(cx.listener(|m, _, window, cx| close(m, window, cx)));
+    let rebase = refusal(&r.why).map(|_| match r.asking {
+        true => kit::btn_primary(t, "finish-rebase", "Asking the agent…").opacity(0.6),
+        false => kit::btn_primary(t, "finish-rebase", "Ask the agent to rebase").on_click(cx.listener(|m, _, _, cx| ask_rebase(m, cx))),
+    });
+    let bang = div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(14.))
+        .rounded_full()
+        .border_1()
+        .border_color(t.down)
+        .text_size(px(9.5))
+        .font_weight(FontWeight::BOLD)
+        .text_color(t.down)
+        .child("!");
+    kit::modal_box(t, 440.)
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .flex_col()
+                .gap(px(8.))
+                .px(px(24.))
+                .pt(px(22.))
+                .pb(px(22.))
+                .child(div().text_size(px(17.)).font_weight(FontWeight::BOLD).child(format!("Couldn't merge {pr_word}")))
+                .child(
+                    div()
+                        .id("finish-refused")
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .line_height(relative(1.4))
+                        .text_color(t.down)
+                        .child(bang)
+                        .child(said),
+                )
+                .child(div().id("finish-next").line_height(relative(1.4)).text_size(px(13.)).text_color(t.text_2).child(next))
+                .child(div().flex().flex_none().items_center().gap(px(8.)).pt(px(14.)).child(focus).child(div().flex_1()).child(close_btn).children(rebase)),
+        )
+        .into_any_element()
+}
+
+/// Ask the agent to rebase: sends the task's agent the rebase (`POST tasks/<id>/pr/rebase`), then
+/// closes the dialog with a toast; a refusal stays on screen as a toast.
+fn ask_rebase(m: &mut MainWindow, cx: &mut Context<MainWindow>) {
+    let Some(Modal::Finish(f)) = &mut m.modal else { return };
+    let Some(refused) = f.refused.as_mut().filter(|r| !r.asking) else { return };
+    refused.asking = true;
+    let (r, why) = (f.r.clone(), refused.why.clone());
+    let (ok_r, fail_r) = (r.clone(), r.clone());
+    m.post_or(
+        format!("tasks/{r}/pr/rebase"),
+        serde_json::json!({"why": why}),
+        cx,
+        move |m, _, cx| {
+            if matches!(&m.modal, Some(Modal::Finish(f)) if f.r == ok_r) {
+                m.modal = None;
+            }
+            m.toast(format!("Asked {ok_r}'s agent to rebase"), false, cx);
+        },
+        move |m, e, cx| {
+            if let Some(Modal::Finish(f)) = m.modal.as_mut().filter(|x| matches!(x, Modal::Finish(f) if f.r == fail_r)) {
+                if let Some(r) = f.refused.as_mut() {
+                    r.asking = false;
+                }
+            }
+            m.toast(crate::ui::status::plain_error(&e.message), true, cx);
+        },
+    );
+    cx.notify();
+}
+
 fn finish(m: &MainWindow, t: &Theme, f: &Finish, cx: &mut Context<MainWindow>) -> AnyElement {
     let shown = shown_task(m, &f.r).or(m.data.task_card.as_ref().filter(|c| c["ref"].as_str() == Some(f.r.as_str())));
-    let name = shown.and_then(|v| v["title"].as_str()).unwrap_or("").to_string();
     let note = f.note.clone().or_else(|| shown_task(m, &f.r).and_then(|t| already(t, f.ask)));
-    let pr = shown.and_then(|v| v["pr"]["num"].as_i64()).map(|n| format!("PR #{n}")).unwrap_or_else(|| "its PR".into());
+    let pr_facts = shown.map(|v| &v["pr"]).filter(|p| p.is_object());
+    let num = pr_facts.and_then(|p| p["num"].as_i64());
+    if let Some(r) = &f.refused {
+        let word = num.map(|n| format!("PR #{n}")).unwrap_or_else(|| "the PR".into());
+        return refused_view(t, &f.r, &word, pr_facts, r, cx);
+    }
     let title = match f.ask {
         Ask::Cancel => format!("Cancel {}?", f.r),
         Ask::Done => format!("Mark {} done?", f.r),
-        Ask::Merge => format!("Merge {pr} now?"),
+        Ask::Merge => format!("Merge {} without waiting?", num.map(|n| format!("#{n}")).unwrap_or_else(|| "its PR".into())),
+        Ask::Close | Ask::CloseForce => format!("Close the terminal for {}?", f.r),
     };
+    // What the yes skips or changes, not the task's name again.
+    let mut does = what_it_does(f.ask).to_string();
+    if matches!(f.ask, Ask::Close | Ask::CloseForce) && shown.is_some_and(|t| t["failed"] == true) {
+        does.push_str(" The task stays failed.");
+    }
     let go = match (f.ask, f.busy) {
         (Ask::Cancel, false) => kit::btn_danger(t, "finish-go", "Cancel task"),
         (Ask::Cancel, true) => kit::btn_danger(t, "finish-go", "Cancelling…").opacity(0.6),
@@ -243,9 +411,27 @@ fn finish(m: &MainWindow, t: &Theme, f: &Finish, cx: &mut Context<MainWindow>) -
         (Ask::Done, true) => kit::btn_primary(t, "finish-go", "Marking done…").opacity(0.6),
         (Ask::Merge, false) => kit::btn_danger(t, "finish-go", "Merge now"),
         (Ask::Merge, true) => kit::btn_danger(t, "finish-go", "Merging…").opacity(0.6),
+        (Ask::Close | Ask::CloseForce, false) => kit::btn_danger(t, "finish-go", "Close terminal"),
+        (Ask::Close | Ask::CloseForce, true) => kit::btn_danger(t, "finish-go", "Closing…").opacity(0.6),
     };
 
-    let go = (!f.busy && note.is_none()).then(|| go.on_click(cx.listener(|m, _, _, cx| confirm_finish(m, cx))));
+    let merge = f.ask == Ask::Merge;
+    // The button stays while the answer is on its way, saying so; it goes only when it can't go ahead.
+    let go = match (f.busy, note.is_none()) {
+        (true, _) => Some(go),
+        (false, true) => Some(go.on_click(cx.listener(|m, _, _, cx| confirm_finish(m, cx)))),
+        (false, false) => None,
+    };
+    let skips = if merge && note.is_none() { pr_facts.map(holds).unwrap_or_default() } else { vec![] };
+    let warn = (merge && note.is_none()).then(|| {
+        let mut d = div().id("finish-merge").flex().flex_col().gap(px(6.)).line_height(relative(1.4));
+        if !skips.is_empty() {
+            d = d.child(div().child("It merges now and skips:")).children(skips.into_iter().map(|h| div().flex().gap(px(8.)).pl(px(4.)).child(div().text_color(t.muted).child("•")).child(h)));
+        }
+        d.child(div().text_color(t.muted).child("You can't undo a merge from the app."))
+    });
+    let keep = matches!(f.ask, Ask::Close | Ask::CloseForce);
+    let cancel = ((merge || keep) && go.is_some() && !f.busy).then(|| kit::btn(t, "finish-cancel", if keep { "Keep it open" } else { "Cancel" }).on_click(cx.listener(|m, _, window, cx| close(m, window, cx))));
     kit::modal_box(t, 440.)
         .child(head(t, title, cx))
         .child(
@@ -256,11 +442,81 @@ fn finish(m: &MainWindow, t: &Theme, f: &Finish, cx: &mut Context<MainWindow>) -
                 .gap(px(10.))
                 .px(px(20.))
                 .pb(px(20.))
-                .when(!name.is_empty(), |d| d.child(div().id("finish-name").line_height(relative(1.4)).child(name)))
+                .when(warn.is_none(), |d| d.child(div().id("finish-does").line_height(relative(1.4)).text_color(t.text_2).child(does)))
+                .children(warn)
                 .children(note.map(|n| div().id("finish-note").text_size(px(12.5)).text_color(t.down).child(n)))
-                .children(go.map(|go| div().flex().flex_none().justify_end().pt(px(4.)).child(go))),
+                .children(go.map(|go| div().flex().flex_none().justify_end().gap(px(8.)).pt(px(4.)).children(cancel).child(go))),
         )
         .into_any_element()
+}
+
+/// Pressing Ticket, Won't do or Finish without it on a goal's last miss opens the confirm instead
+/// of acting. True when it asked; false when the press goes ahead as it was.
+pub fn ask_last_miss(m: &mut MainWindow, r: &str, act: &'static str, cx: &mut Context<MainWindow>) -> bool {
+    let Some(b) = m.data.issue.as_ref().filter(|b| crate::fmt::ref_of(b, "B") == r && crate::fmt::b(b, "misses_goal")) else { return false };
+    let Some(g) = b.get("goal_id").and_then(|id| id.as_i64()).and_then(|id| m.data.goals.iter().find(|g| g.get("id").and_then(|x| x.as_i64()) == Some(id))) else { return false };
+    if !crate::ui::issue_panel::finishes_goal(g) {
+        return false;
+    }
+    let auto_close = !matches!(g.get("auto_close"), Some(serde_json::Value::Bool(false))) && g.get("auto_close").and_then(|v| v.as_f64()) != Some(0.);
+    let goal = crate::fmt::ref_of(g, "G");
+    m.modal = Some(Modal::LastMiss(LastMiss { r: r.to_string(), act, goal, auto_close }));
+    cx.notify();
+    true
+}
+
+/// What the yes does to the issue, for the dialog's line.
+fn last_miss_does(x: &LastMiss) -> String {
+    let what = match x.act {
+        "ticket" => format!("{} goes to Jira", x.r),
+        "drop" => format!("{} closes as won’t do", x.r),
+        _ => format!("{} stays in the backlog", x.r),
+    };
+    let when = if x.auto_close { " and its When done runs: terminals close" } else { "" };
+    format!("This is the last thing holding it. {what}. Its outcome stays unmet,{when}.").replace(",.", ".")
+}
+
+fn last_miss(t: &Theme, x: &LastMiss, cx: &mut Context<MainWindow>) -> AnyElement {
+    let (r, act) = (x.r.clone(), x.act);
+    kit::modal_box(t, 440.)
+        .child(div().px(px(20.)).pt(px(18.)).pb(px(12.)).text_size(px(17.)).font_weight(FontWeight::BOLD).child(format!("Finish {} now?", x.goal)))
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .flex_col()
+                .gap(px(14.))
+                .px(px(20.))
+                .pb(px(20.))
+                .child(div().id("last-miss-does").line_height(relative(1.4)).text_color(t.text_2).child(last_miss_does(x)))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.))
+                        .child(kit::btn(t, "last-miss-keep", "Keep it open").on_click(cx.listener(|m, _, window, cx| close(m, window, cx))))
+                        .child(kit::btn_primary(t, "last-miss-go", format!("Finish {}", x.goal)).on_click(cx.listener(move |m, _, window, cx| {
+                            close(m, window, cx);
+                            match act {
+                                "ticket" => crate::ui::issue_panel::ticket(m, &r, cx),
+                                "without" => crate::ui::issue_panel::finish_without(m, &r, cx),
+                                _ => crate::ui::issue_panel::drop_issue(m, &r, cx),
+                            }
+                        }))),
+                ),
+        )
+        .into_any_element()
+}
+
+/// The one line a Finish dialog says: what the yes skips or changes.
+pub fn what_it_does(ask: Ask) -> &'static str {
+    match ask {
+        Ask::Cancel => "Marks it failed as cancelled by you, without waiting for its agent.",
+        Ask::Done => "Marks it done now, without waiting for its agent to hand it in.",
+        Ask::Merge => "Merges past its checks and reviews; a conflict with its base still stops it.",
+        Ask::Close => "Closes the terminal it ran in.",
+        Ask::CloseForce => "Stops the command that is still running.",
+    }
 }
 
 /// The owner's yes: looks the task up again and only marks it done (or failed) while it's still
@@ -278,34 +534,46 @@ pub fn confirm_finish(m: &mut MainWindow, cx: &mut Context<MainWindow>) {
         let answer = cx
             .background_executor()
             .spawn(async move {
-                let t = backend.get(&format!("tasks/{task}"), &[]).map_err(|e| e.message)?;
+                let t = backend.get(&format!("tasks/{task}"), &[]).map_err(|e| (false, e.message))?;
                 if let Some(note) = already(&t, ask) {
-                    return Err(note);
+                    return Err((false, note));
                 }
                 let (path, body) = match ask {
                     Ask::Cancel => (format!("tasks/{task}/fail"), serde_json::json!({"reason": "Cancelled by you"})),
                     Ask::Done => (format!("tasks/{task}/done"), serde_json::json!({})),
                     Ask::Merge => (format!("tasks/{task}/pr/merge"), serde_json::json!({"override": true})),
+                    Ask::Close | Ask::CloseForce => (format!("tasks/{task}/close-terminal"), serde_json::json!({"force": ask == Ask::CloseForce})),
                 };
-                backend.post(&path, body).map_err(|e| e.message)
+                backend.post(&path, body).map_err(|e| (true, e.message))
             })
             .await;
         let _ = this.update(cx, |m, cx| {
-            let Some(Modal::Finish(f)) = &mut m.modal else { return };
-            if f.r != r {
+            let said = match ask {
+                Ask::Cancel => format!("Cancelled {r}"),
+                Ask::Done => format!("Marked {r} done"),
+                Ask::Merge => format!("Merged {r}'s PR"),
+                Ask::Close | Ask::CloseForce => format!("Closing {r}’s terminal"),
+            };
+            // Closed while it was busy: the answer still shows, as a toast.
+            let Some(Modal::Finish(f)) = m.modal.as_mut().filter(|x| matches!(x, Modal::Finish(f) if f.r == r)) else {
+                match answer {
+                    Ok(_) => m.toast(said, false, cx),
+                    Err((_, note)) => m.toast(note, true, cx),
+                }
+                m.refresh(cx);
                 return;
-            }
+            };
             match answer {
                 Ok(_) => {
                     m.modal = None;
-                    let said = match ask {
-                        Ask::Cancel => format!("Cancelled {r}"),
-                        Ask::Done => format!("Marked {r} done"),
-                        Ask::Merge => format!("Merged {r}'s PR"),
-                    };
                     m.toast(said, false, cx);
                 }
-                Err(note) => {
+                // A merge the host refused keeps its answer in the dialog.
+                Err((true, why)) if ask == Ask::Merge => {
+                    f.busy = false;
+                    f.refused = Some(Refused { why: crate::ui::status::plain_error(&why), at: chrono::Local::now().format("%-I:%M %p").to_string(), asking: false });
+                }
+                Err((_, note)) => {
                     f.busy = false;
                     f.note = Some(note);
                 }

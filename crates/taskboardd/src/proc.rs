@@ -117,10 +117,7 @@ pub fn run_until(
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[cfg(windows)]
     if is_sh_script(Path::new(program.as_ref())) {
-        let mut c = Command::new(git_bash());
-        bash_args(&mut c, [program.as_ref()]);
-        no_window(&mut c);
-        return c;
+        return git_bash_with([program.as_ref()]);
     }
     let mut c = Command::new(program);
     no_window(&mut c);
@@ -149,59 +146,76 @@ fn has_console() -> bool {
     unsafe { windows_sys::Win32::System::Console::GetConsoleCP() != 0 }
 }
 
-/// `command(program)` with `args`, written the way the program reads them: through `bash_args` when it
-/// runs in Git Bash.
+/// `command(program)` with `args`, written the way the program reads them: through [`git_bash_with`]
+/// when it runs in Git Bash.
 pub fn command_with<I, S>(program: impl AsRef<std::ffi::OsStr>, args: I) -> Command
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    let mut cmd = command(program.as_ref());
-    if runs_in_git_bash(Path::new(program.as_ref())) {
-        bash_args(&mut cmd, args);
-    } else {
-        cmd.args(args);
-    }
-    cmd
-}
-
-/// `program` is Git Bash, or a script `command` runs in it: on Windows its arguments go through
-/// `bash_args`.
-fn runs_in_git_bash(program: &Path) -> bool {
-    #[cfg(windows)]
-    return program == git_bash() || is_sh_script(program);
-    #[cfg(unix)]
-    return {
-        let _ = program;
-        false
-    };
-}
-
-/// Adds `args` to a command that runs Git Bash (`sh()`, `shell`, a script `command` runs). On Windows
-/// Git Bash reads its command line the way Cygwin does, not the way Rust writes it: in quotes `\\` is
-/// one backslash, and outside them `'` quotes, `*`, `{a,b}` and `~` expand and `@file` reads a file. So
-/// each argument goes in double quotes with `\` and `"` escaped, every other character taken as it is.
-/// One that starts with a drive (`C:`) keeps its backslashes as written once inside quotes, so its
-/// letter goes before them. Elsewhere it's `args`.
-pub fn bash_args<I, S>(cmd: &mut Command, args: I) -> &mut Command
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        for a in args {
-            cmd.raw_arg(cygwin_quoted(&a.as_ref().to_string_lossy()));
+        let p = Path::new(program.as_ref());
+        let script = is_sh_script(p);
+        if script || p == git_bash() {
+            let first = script.then(|| program.as_ref().to_os_string());
+            return git_bash_with(first.into_iter().chain(args.into_iter().map(|a| a.as_ref().to_os_string())));
         }
-        cmd
     }
-    #[cfg(unix)]
-    cmd.args(args)
+    let mut cmd = command(program.as_ref());
+    cmd.args(args);
+    cmd
 }
 
-/// `arg` written for a Cygwin program's command line (`bash_args`).
-#[cfg_attr(unix, allow(dead_code))]
+/// The longest argument [`git_bash_with`] puts on Git Bash's command line, in UTF-8 bytes. Cygwin keeps
+/// only the first 8186 characters of a quoted one and drops the rest without a word.
+#[cfg(windows)]
+const QUOTED_ARG_MAX: usize = 8000;
+
+/// What [`git_bash_with`] names the environment variables an argument too long for the command line
+/// goes in: `TASKBOARD_ARGC`, then `TASKBOARD_ARG_1` and on.
+#[cfg(windows)]
+const ARG_VAR: &str = "TASKBOARD_ARG";
+
+/// Puts `"$@"` back together from the `TASKBOARD_ARG_<n>` variables, unsets them, and runs bash with it.
+#[cfg(windows)]
+const ARGS_FROM_ENV: &str = r#"i=1; set --; while [ "$i" -le "$TASKBOARD_ARGC" ]; do eval "set -- \"\$@\" \"\$TASKBOARD_ARG_$i\""; unset "TASKBOARD_ARG_$i"; i=$((i+1)); done; unset TASKBOARD_ARGC i; exec "$BASH" "$@""#;
+
+/// Git Bash run with `args` (`sh()`, `shell`, a script `command` runs), opening no console window
+/// ([`no_window`]). Git Bash reads its command line the way Cygwin does, not the way Rust writes it: in
+/// quotes `\\` is one backslash, and outside them `'` quotes, `*`, `{a,b}` and `~` expand and `@file`
+/// reads a file. So each argument goes in double quotes with `\` and `"` escaped, every other character
+/// taken as it is. One that starts with a drive (`C:`) keeps its backslashes as written once inside
+/// quotes, so its letter goes before them. Cygwin cuts a quoted argument short, though
+/// ([`QUOTED_ARG_MAX`]), so when one is longer (a review's prompt to a `#!` wrapper of `claude`) every
+/// argument goes in an environment variable instead and a short `bash -c` ([`ARGS_FROM_ENV`]) runs bash
+/// with them.
+#[cfg(windows)]
+fn git_bash_with<I, S>(args: I) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    use std::os::windows::process::CommandExt;
+    let args: Vec<String> = args.into_iter().map(|a| a.as_ref().to_string_lossy().into_owned()).collect();
+    let mut c = Command::new(git_bash());
+    no_window(&mut c);
+    if args.iter().all(|a| a.len() <= QUOTED_ARG_MAX) {
+        for a in &args {
+            c.raw_arg(cygwin_quoted(a));
+        }
+        return c;
+    }
+    c.raw_arg(cygwin_quoted("-c")).raw_arg(cygwin_quoted(ARGS_FROM_ENV));
+    c.env(format!("{ARG_VAR}C"), args.len().to_string());
+    for (i, a) in args.iter().enumerate() {
+        c.env(format!("{ARG_VAR}_{}", i + 1), a);
+    }
+    c
+}
+
+/// `arg` written for a Cygwin program's command line ([`git_bash_with`]).
+#[cfg(windows)]
 fn cygwin_quoted(arg: &str) -> String {
     let b = arg.as_bytes();
     let drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
@@ -243,10 +257,15 @@ pub fn make_runnable(path: &Path) -> std::io::Result<()> {
 /// A command that runs `script` in a shell: `/bin/sh -c` on Unix, Git Bash's `bash -c` on Windows, so
 /// the same POSIX commands in config.toml run on both.
 pub fn shell(script: &str) -> Command {
-    let mut c = Command::new(sh());
-    bash_args(&mut c, ["-c", script]);
-    no_window(&mut c);
-    c
+    #[cfg(windows)]
+    return git_bash_with(["-c", script]);
+    #[cfg(unix)]
+    {
+        let mut c = Command::new(sh());
+        c.args(["-c", script]);
+        no_window(&mut c);
+        c
+    }
 }
 
 /// The shell config.toml's commands run in (`sh -c "…"`): `/bin/sh` on Unix, Git Bash on Windows.
@@ -401,6 +420,16 @@ pub fn on_stop_asked(f: impl FnOnce() + Send + 'static) -> bool {
         .is_ok()
 }
 
+/// Starts a command the board doesn't wait for, and reaps it once it exits so it isn't left a
+/// zombie under the board (a `Child` dropped without a wait is never reaped).
+pub fn start_reaped(cmd: &mut Command) -> std::io::Result<()> {
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// Finds a command on PATH (or returns the path as given when it has a slash). On Windows a name
 /// without an extension is looked for with each of PATHEXT's (`git` is `git.exe`, `npm` is `npm.cmd`);
 /// a path to a `#!` script with none beside it is that script (`command` runs it in Git Bash).
@@ -544,6 +573,29 @@ mod tests {
         assert_eq!(o.stdout, want, "{}", o.stderr);
     }
 
+    #[test]
+    fn git_bash_gets_a_long_argument_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        // Past where Cygwin cuts a quoted argument off, with every awkward word in it.
+        let long: String = AWKWARD.iter().cycle().take(1500).map(|a| format!("{a} ")).collect();
+        assert!(long.len() > 10_000);
+        let args = vec!["first".to_string(), long.clone(), "".to_string(), "last".to_string()];
+        let script = r#"printf '%s|' "$#" "$1"; printf %s "$2" > long.txt; printf '|%s|%s' "$3" "$4""#;
+        let fake = dir.path().join("fake");
+        std::fs::write(&fake, format!("#!/bin/sh\n{script}\n")).unwrap();
+        make_runnable(&fake).unwrap();
+        let o = run(&fake, &args, Some(dir.path()), 10.0).ok().expect("it ran");
+        assert_eq!(o.stdout, "4|first|||last", "{}", o.stderr);
+        assert!(std::fs::read_to_string(dir.path().join("long.txt")).unwrap() == long, "the long one, every character");
+        let mut all = vec!["-c".to_string(), script.to_string(), "sh".to_string()];
+        all.extend(args.iter().cloned());
+        let o = run_with(&sh(), &all, Some(dir.path()), 10.0, &[], None).ok().expect("it ran");
+        assert_eq!(o.stdout, "4|first|||last", "Git Bash run directly: {}", o.stderr);
+        assert!(std::fs::read_to_string(dir.path().join("long.txt")).unwrap() == long);
+        let o = shell(&format!("{script}; printf '|%s' \"${{TASKBOARD_ARG_2-none}}\"\n: <<'END'\n{long}\nEND\n")).current_dir(dir.path()).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&o.stdout), "0|||||none", "a long script runs, and the variables are gone");
+    }
+
     /// The only test that asks this process to stop: the event stays set for the rest of the run.
     #[cfg(windows)]
     #[test]
@@ -559,5 +611,30 @@ mod tests {
         unsafe { SetEvent(ev) };
         unsafe { CloseHandle(ev) };
         rx.recv_timeout(Duration::from_secs(5)).expect("asked within 5 seconds");
+    }
+
+    // Zombies are Unix's: Windows keeps no exited child waiting to be reaped.
+    #[cfg(unix)]
+    #[test]
+    fn a_started_command_is_reaped_once_it_exits() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "echo $$ > \"$0\"", "pidfile"]);
+        let dir = tempfile::tempdir().unwrap();
+        cmd.current_dir(dir.path());
+        start_reaped(&mut cmd).ok().unwrap();
+        let file = dir.path().join("pidfile");
+        let until = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Some(p) = std::fs::read_to_string(&file).ok().and_then(|s| s.trim().parse::<i32>().ok()) {
+                break p;
+            }
+            assert!(Instant::now() < until, "the command never ran");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // Reaped: the process is gone, not a zombie still waiting for the board to wait on it.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(Instant::now() < until, "process {pid} is still there (a zombie)");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }

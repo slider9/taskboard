@@ -3,7 +3,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -331,6 +331,9 @@ const ADDED: &[(&str, &str, &str)] = &[
     ("goals", "lane", "TEXT"),
     // A line on what an attachment is (`tb attach --summary`); null when none was given.
     ("attachments", "summary", "TEXT"),
+    // The text of a link the board can't open, as the agent who attached it read it (`tb attach --copy`):
+    // a claude.ai artifact's page with its tags taken out. Plan review reads it; null when none was given.
+    ("attachments", "copy", "TEXT"),
     // Jira off for the goal's tasks (`tb goal set G<n> --jira off`): none asks for a ticket unless it
     // opts in with `--jira new` or a key (`jira::goal_off`).
     ("goals", "jira_off", "INT DEFAULT 0"),
@@ -350,6 +353,15 @@ const ADDED: &[(&str, &str, &str)] = &[
     // a lost one (`board::set_working`, `board::claim`). `started_at` stays the first pickup. Null on
     // a task from before it, which reads `started_at`.
     ("tasks", "picked_up_at", "TEXT"),
+    // How a closed (`drop`) backlog issue was closed: `fixed` for one finished work fixed (`tb backlog
+    // fixed`, a task's `--fixes`, the tidy); null for won't do. `fixed_by` is the task that fixed it and
+    // `fixed_pr` its PR link, either one null when it isn't known (`fixes::close_fixed`).
+    ("issues", "closed_as", "TEXT"),
+    ("issues", "fixed_by", "INT"),
+    ("issues", "fixed_pr", "TEXT"),
+    // A failed wave the owner let the goal go on past: who, when and the tasks that had failed
+    // (JSON `{"by", "at", "tasks"}`, `waves::release`).
+    ("goal_waves", "passed_failed", "TEXT"),
 ];
 
 fn add_columns(conn: &Connection, added: &[(&str, &str, &str)]) -> rusqlite::Result<()> {
@@ -434,6 +446,8 @@ pub struct Db {
     /// The recent writes by number (the first part of `mark`) with the rows each changed; None for
     /// one that changed too many to list.
     log: Mutex<VecDeque<(i64, Option<Vec<(String, i64)>>)>>,
+    /// Every read run, for `reads`.
+    reads: AtomicU64,
 }
 
 // The connection is only touched while the re-entrant lock is held.
@@ -511,9 +525,11 @@ impl Db {
         add_columns(&conn, crate::lines::ADDED)?;
         add_columns(&conn, crate::lost_done::ADDED)?;
         add_columns(&conn, crate::qa::ADDED)?;
+        add_columns(&conn, crate::tidy::ADDED)?;
         conn.execute_batch(crate::lines::SCHEMA)?;
         conn.execute_batch(crate::spans::SCHEMA)?;
         conn.execute_batch(crate::review::SCHEMA)?;
+        conn.execute_batch(crate::recap::SCHEMA)?;
         add_columns(&conn, crate::review::ADDED)?;
         add_columns(&conn, crate::code_review::ADDED)?;
         conn.execute_batch(BACKFILL_STATES)?;
@@ -521,6 +537,7 @@ impl Db {
         conn.execute_batch(BACKFILL_MERGED)?;
         conn.execute_batch(crate::merges::SCHEMA)?;
         conn.execute_batch(crate::merges::BACKFILL)?;
+        add_columns(&conn, crate::merges::ADDED)?;
         conn.execute_batch(crate::samepr::SCHEMA)?;
         conn.execute_batch(crate::start_grants::SCHEMA)?;
         add_columns(&conn, crate::start_grants::ADDED)?;
@@ -532,6 +549,7 @@ impl Db {
             readers: path.map(|path| Readers { path, idle: Mutex::new(vec![]), marker: Mutex::new(None) }),
             writes: AtomicI64::new(0),
             log: Mutex::new(VecDeque::new()),
+            reads: AtomicU64::new(0),
         })
     }
 
@@ -554,6 +572,7 @@ impl Db {
     /// Runs `f` with a connection for reading. Outside a transaction that is a pooled reader, so it
     /// doesn't wait for another thread's; inside one, the writer's, to see its own changes.
     fn read<T>(&self, what: &str, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
         match &self.readers {
             Some(readers) if !self.held_here() => {
                 let c = readers.take()?;
@@ -734,6 +753,12 @@ impl Db {
         Ok(self.changed(&sql, params)? > 0)
     }
 
+    /// Waits until no other thread is inside `tx`, so what this thread reads next includes what that
+    /// transaction committed. Work queued from inside a request's transaction calls it before reading.
+    pub fn settle(&self) {
+        drop(self.lock("waiting for a transaction"));
+    }
+
     /// Whether this thread is inside `tx`: what it reads there may yet roll back.
     /// Another thread's transaction isn't this one's, so it never waits for the lock to find out.
     pub fn in_tx(&self) -> bool {
@@ -749,6 +774,16 @@ impl Db {
             None => 0,
         };
         Ok((self.writes.load(Ordering::Acquire), others))
+    }
+
+    /// How many writes this board has committed: the first part of `mark`, without asking SQLite.
+    pub fn writes(&self) -> i64 {
+        self.writes.load(Ordering::Acquire)
+    }
+
+    /// How many reads (`q`, `val` and the like) this board has run: what a request costs, counted.
+    pub fn reads(&self) -> u64 {
+        self.reads.load(Ordering::Relaxed)
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
@@ -855,6 +890,30 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(db.get_setting("k").unwrap().as_deref(), Some("after"));
         assert_ne!(db.mark().unwrap(), mark);
+    }
+
+    #[test]
+    fn settle_waits_for_another_threads_transaction_to_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(Db::open(&dir.path().join("board.db")).unwrap());
+        db.set_setting("k", Some("before")).unwrap();
+        let (inside, go_on) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+        let d = db.clone();
+        let writer = std::thread::spawn(move || {
+            d.tx(|| {
+                d.set_setting("k", Some("after"))?;
+                inside.0.send(()).unwrap();
+                go_on.1.recv().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                Ok(())
+            })
+            .unwrap();
+        });
+        inside.1.recv().unwrap();
+        go_on.0.send(()).unwrap();
+        db.settle();
+        assert_eq!(db.get_setting("k").unwrap().as_deref(), Some("after"), "settle returns once the commit is in");
+        writer.join().unwrap();
     }
 
     #[test]

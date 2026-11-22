@@ -56,24 +56,14 @@ pub fn clean(app: &App, value: &Value, t: Option<&Row>) -> Result<Option<String>
         }
         let other = board::get_task(app, n)?;
         if let Some(t) = t {
-            if !crate::projects::may_wait_on(app, &t.st("project"), &other.st("project")) {
-                return err(
-                    409,
-                    format!(
-                        "{} is in {}, not {}, so its work can't be brought into this task. \
-                         To let {}'s tasks wait for {}'s: tb project set {} --waits-on {}",
-                        rf("task", n),
-                        other.st("project"),
-                        t.st("project"),
-                        t.st("project"),
-                        other.st("project"),
-                        t.st("project"),
-                        other.st("project")
-                    ),
-                );
+            if let Some(why) = cross_project_refusal(app, t, &other) {
+                return err(409, why);
             }
             if reaches(app, n, t.id(), &mut vec![])? {
                 return err(409, format!("{} already waits for {}, so this would wait forever.", rf("task", n), rf("task", t.id())));
+            }
+            if let Some(why) = crate::order_cycle::refusal(app, t, n)? {
+                return err(409, why);
             }
         }
         if !out.contains(&n) {
@@ -81,6 +71,80 @@ pub fn clean(app: &App, value: &Value, t: Option<&Row>) -> Result<Option<String>
         }
     }
     Ok(if out.is_empty() { None } else { Some(jdumps(&json!(out))) })
+}
+
+/// Why `t` may not wait for `other`: it's in a project `t`'s project isn't allowed to wait on. None when it may.
+/// Names the project that isn't allowed and the owner's `tb project set` line that allows it, keeping the
+/// projects already allowed (`--waits-on` replaces the list), and tells the agent to ask the owner with
+/// that line rather than run it or give up on the wait.
+pub fn cross_project_refusal(app: &App, t: &Row, other: &Row) -> Option<String> {
+    let (mine, theirs) = (t.st("project"), other.st("project"));
+    if crate::projects::may_wait_on(app, &mine, &theirs) {
+        return None;
+    }
+    let allowed = crate::projects::waits_on(app, &mine);
+    let may = match allowed.as_slice() {
+        [] => format!("{mine}'s own"),
+        _ => format!("{mine}'s and {}'s", crate::dispatch::say_refs(&allowed)),
+    };
+    let set = [allowed.clone(), vec![theirs.clone()]].concat().join(",");
+    let (tb, owner, me, it) = (board::tb_cmd(app), &app.cfg.owner, rf("task", t.id()), rf("task", other.id()));
+    Some(format!(
+        "{it} is in {theirs}, and {mine}'s tasks may only wait for {may}, so {me} can't wait for it. \
+         Allowing {mine}'s tasks to wait for {theirs}'s is {owner}'s call:\n  {tb} project set {mine} --waits-on {set}\n\
+         Don't run that yourself. If {me} needs {it} first, ask {owner} with {tb} question and put that line in the \
+         question; once it's set, record the wait for {it} with {tb} wait-for."
+    ))
+}
+
+/// What `tb task new` and `tb start` say when this terminal's task makes or starts tasks whose title or detail
+/// names it ("Blocks T12", "report the SHA on T12"): the exact `tb wait-for` line that parks it on them. An
+/// agent that only says it will wait records nothing, so nothing brings its conversation back. Only a mention
+/// of the task's own ref counts, and it's never recorded for the agent: the mention may be a note, not a need.
+/// None when no such task names it, or it waits for them already.
+pub fn caller_needs_line(app: &App, via: Option<&str>, targets: &[i64]) -> Result<Option<String>> {
+    let Some(me) = board::task_for_session(app, via)? else { return Ok(None) };
+    let mine = crate::human::task_ref(&me);
+    let have = ids(&me);
+    let (mut may, mut refused) = (vec![], vec![]);
+    for &n in targets {
+        if n == me.id() || have.contains(&n) {
+            continue;
+        }
+        let Some(o) = board::find_task(app, Some(n))? else { continue };
+        if ready(Some(&o)) || !names(&format!("{}\n{}", o.st("title"), o.st("detail")), &mine) || reaches(app, n, me.id(), &mut vec![])? {
+            continue;
+        }
+        match cross_project_refusal(app, &me, &o) {
+            Some(why) => refused.push(format!("{} names {mine}. {why}", crate::human::task_ref(&o))),
+            None => may.push(crate::human::task_ref(&o)),
+        }
+    }
+    let mut out = vec![];
+    if !may.is_empty() {
+        let (them, it, done) = match may.as_slice() {
+            [one] => (format!("{one} names"), "it", "it's done"),
+            _ => (format!("{} name", crate::dispatch::say_refs(&may)), "them", "they're done"),
+        };
+        out.push(format!(
+            "{them} {mine}, so {mine} may need {it} first. If {mine} can't go on until then, record the wait now and end your \
+             turn; the board carries this conversation on once {done}:\n  {} wait-for {} --why \"<what {mine} needs>\"\n\
+             Only saying you'll wait records nothing, and nothing brings this conversation back.",
+            board::tb_cmd(app),
+            may.join(" ")
+        ));
+    }
+    out.extend(refused);
+    Ok(if out.is_empty() { None } else { Some(out.join("\n")) })
+}
+
+/// Whether `text` names the ref `r` (T12, not T120 or AT12).
+fn names(text: &str, r: &str) -> bool {
+    text.match_indices(r).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + r.len()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric()) && !after.is_some_and(|c| c.is_ascii_digit())
+    })
 }
 
 pub fn reaches(app: &App, start: i64, target: i64, seen: &mut Vec<i64>) -> Result<bool> {
@@ -406,7 +470,7 @@ pub fn waiting_line(app: &App, t: &Row) -> Result<Value> {
         let pending = board::live_start_job(app, t)?.filter(|j| j.s("state") == Some("pending"));
         let hold = match pending {
             Some(j) => crate::dispatch::start_hold(app, &j)?,
-            None => None,
+            None => crate::startwatch::waiting_line(app, t)?,
         };
         return Ok(hold.map(Value::String).unwrap_or(Value::Null));
     }
@@ -735,22 +799,44 @@ pub fn follow_ups(app: &App) -> Result<i64> {
         let seen = flow.get(FOLLOW).and_then(|v| v.as_object()).cloned().unwrap_or_default();
         let mut changes = Row::new();
         let mut notes = vec![];
+        let mut diverged = vec![];
+        let mut caught_up = vec![];
+        let mut held = None;
         for n in deps(&t) {
             let other = board::find_task(app, Some(n))?;
             if !ready(other.as_ref()) {
                 continue;
             }
             let other = other.unwrap();
-            let now = json!({"head": head_of(&other), "merged": landed(&other).is_some() || (other.st("pr_state").eq_ignore_ascii_case("MERGED") && stack_landed(app, &other)?)});
+            let mut now = json!({"head": head_of(&other), "merged": landed(&other).is_some() || (other.st("pr_state").eq_ignore_ascii_case("MERGED") && stack_landed(app, &other)?)});
             let key = n.to_string();
             let Some(before) = seen.get(&key) else {
                 changes.insert(key, now);
                 continue;
             };
-            if *before == now || (now["head"].is_null() && now["merged"] == false) {
+            if (before["head"] == now["head"] && before["merged"] == now["merged"]) || (now["head"].is_null() && now["merged"] == false) {
                 continue;
             }
-            notes.push(follow_line(app, &t, &other, before, &now)?);
+            if *held.get_or_insert(stack_base_held(app, &t)?) {
+                continue;
+            }
+            let tips = earlier_tips(before);
+            match follow_line(app, &t, &other, before, &now, &tips)? {
+                Follow::Tell(line) => {
+                    notes.push(line);
+                    if before["diverged"] == true {
+                        caught_up.push(other.clone());
+                    }
+                }
+                Follow::Diverged => {
+                    if before["diverged"] != true {
+                        diverged.push(other.clone());
+                    }
+                    now["diverged"] = json!(true);
+                }
+                Follow::Quiet => {}
+            }
+            now["tips"] = json!(tips);
             changes.insert(key, now);
         }
         if changes.is_empty() {
@@ -784,6 +870,12 @@ pub fn follow_ups(app: &App) -> Result<i64> {
             )?;
             sent += 1;
         }
+        for other in &caught_up {
+            crate::dispatch::clear_alert_key(app, &diverged_key(&t, other))?;
+        }
+        for other in &diverged {
+            flag_diverged(app, &t, other)?;
+        }
         let mut merged = seen.clone();
         for (k, v) in changes {
             merged.insert(k, v);
@@ -793,20 +885,347 @@ pub fn follow_ups(app: &App) -> Result<i64> {
     Ok(sent)
 }
 
-fn follow_line(app: &App, t: &Row, other: &Row, before: &Value, now: &Value) -> Result<String> {
-    let branch = moved_onto(t, other).unwrap_or_else(|| "<its branch>".into());
-    let old: String = before["head"].as_str().unwrap_or("").chars().take(12).collect();
-    let old = if old.is_empty() { "<its old last commit>".to_string() } else { old };
-    let lbl = label(app, other)?;
-    if now["merged"] == true && before["merged"] != true {
-        return Ok(format!(
-            "- {lbl} was merged. Drop its commits from your branch and keep only yours: git fetch origin && \
-             git rebase --onto origin/<your base, usually main> {old} <your branch>."
-        ));
+/// A head-merge child still stacks on the task: rebasing its branch now would break that child's PR,
+/// so a move it builds on is left unrecorded until the stack has merged into it.
+fn stack_base_held(app: &App, t: &Row) -> Result<bool> {
+    Ok(crate::stack::children(app, t.id())?.iter().any(crate::stack::head))
+}
+
+/// How many of a dependency's earlier heads the board keeps, to find the one a task is built on
+/// after it missed a move.
+const KEPT_TIPS: usize = 20;
+
+/// The dependency's heads the board saw before `before`'s, newest first: `before`'s head and the
+/// tips recorded with it.
+fn earlier_tips(before: &Value) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    let older = before["tips"].as_array().into_iter().flatten().filter_map(|v| v.as_str());
+    for sha in before["head"].as_str().into_iter().chain(older) {
+        if !sha.is_empty() && !out.iter().any(|s| s == sha) && out.len() < KEPT_TIPS {
+            out.push(sha.to_string());
+        }
     }
-    let new: String = now["head"].as_str().unwrap_or("").chars().take(12).collect();
-    Ok(format!(
-        "- {lbl}'s branch {branch} moved from {old} to {new}. Replay your commits on the new tip: \
+    out
+}
+
+/// The first of `shas` that git, in the task's checkout, finds on the task's branch (locally or at
+/// origin). None when there's no checkout or branch to ask; Some(None) when none of them is on it.
+fn first_on_branch(t: &Row, shas: &[String]) -> Option<Option<String>> {
+    let ctx = board::task_context(t);
+    let worktree = ctx.get("where").and_then(|w| w.get("worktree")).and_then(|v| v.as_str());
+    let dir = [worktree, t.s("repo_path")].into_iter().flatten().find(|d| std::path::Path::new(d).is_dir())?;
+    let branch = crate::stack::branch(t).filter(|b| real_branch(b))?;
+    let git = crate::proc::which("git")?;
+    let run = |args: &[&str]| {
+        let mut all: Vec<String> = vec!["-C".into(), dir.into()];
+        all.extend(args.iter().map(|a| a.to_string()));
+        crate::proc::run(&git, &all, None, 5.0).ok().and_then(|o| o.code)
+    };
+    let refs: Vec<String> = [format!("refs/heads/{branch}"), format!("refs/remotes/origin/{branch}")]
+        .into_iter()
+        .filter(|r| run(&["rev-parse", "--verify", "-q", &format!("{r}^{{commit}}")]) == Some(0))
+        .collect();
+    if refs.is_empty() {
+        return None;
+    }
+    Some(shas.iter().find(|sha| refs.iter().any(|r| run(&["merge-base", "--is-ancestor", sha, r]) == Some(0))).cloned())
+}
+
+/// What a dependency's change asks of the task.
+enum Follow {
+    /// Nothing to tell it.
+    Quiet,
+    /// A line for its rebase prompt.
+    Tell(String),
+    /// Its branch holds none of the dependency's heads the board saw, so there's no commit to replay from.
+    Diverged,
+}
+
+/// What to tell the task about a dependency's change: nothing when its head didn't move and it didn't
+/// newly merge. The rebase replays from the newest of the dependency's heads the task's branch holds
+/// (`tips`, newest first), so a task that missed a move is still told how to catch up; when its branch
+/// holds none of them, it has diverged from the dependency.
+fn follow_line(app: &App, t: &Row, other: &Row, before: &Value, now: &Value, tips: &[String]) -> Result<Follow> {
+    let newly_merged = now["merged"] == true && before["merged"] != true;
+    let (was, is) = (before["head"].as_str().unwrap_or(""), now["head"].as_str().unwrap_or(""));
+    if !newly_merged && (is.is_empty() || was == is) {
+        return Ok(Follow::Quiet);
+    }
+    let base = match (!was.is_empty()).then(|| first_on_branch(t, tips)).flatten() {
+        Some(None) => return Ok(Follow::Diverged),
+        Some(Some(found)) => found,
+        None => was.to_string(),
+    };
+    let branch = moved_onto(t, other).unwrap_or_else(|| "<its branch>".into());
+    let old = short_sha(&base);
+    let old = if old.is_empty() { "<its old last commit>".to_string() } else { old };
+    let missed = if base != was { format!(" Your branch is built on its older tip {old}, not {}.", short_sha(was)) } else { String::new() };
+    let lbl = label(app, other)?;
+    if newly_merged {
+        return Ok(Follow::Tell(format!(
+            "- {lbl} was merged.{missed} Drop its commits from your branch and keep only yours: git fetch origin && \
+             git rebase --onto origin/<your base, usually main> {old} <your branch>."
+        )));
+    }
+    let new = short_sha(is);
+    Ok(Follow::Tell(format!(
+        "- {lbl}'s branch {branch} moved from {old} to {new}.{missed} Replay your commits on the new tip: \
          git fetch origin && git rebase --onto origin/{branch} {old} <your branch>."
-    ))
+    )))
+}
+
+fn diverged_key(t: &Row, other: &Row) -> String {
+    format!("diverged:{}:{}", rf("task", t.id()), rf("task", other.id()))
+}
+
+/// Tells the owner, once, that the task's branch holds none of the heads the board saw of a task it
+/// builds on, so the board can't say what to rebase from.
+fn flag_diverged(app: &App, t: &Row, other: &Row) -> Result<()> {
+    let (r, o) = (rf("task", t.id()), rf("task", other.id()));
+    let onto = moved_onto(t, other).map(|b| format!("origin/{b}")).unwrap_or_else(|| format!("{o}'s branch"));
+    let detail = format!(
+        "Its branch has none of the versions of {o}'s branch the board has seen, so it can't be told what to rebase from. \
+         Rebuild it on {onto}, keeping only its own commits."
+    );
+    board::log_event(app, t.id(), board::BOARD, "note", &format!("Diverged from {o}: none of its earlier last commits are on this task's branch"))?;
+    let fields = json!({"title": t.st("title"), "detail": detail});
+    crate::dispatch::add_alert_keyed_with(app, &format!("{r}: {}. {detail}", t.st("title")), Some(t.id()), t.i("goal_id"), &diverged_key(t, other), fields)
+}
+
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(12).collect()
+}
+
+/// Queued tasks that hold up others: each one in the queue with nothing on it for a day, that a queued
+/// task waits for or a head-merge parent's PR holds on, raises a `stuck:T<n>` alert naming the chain
+/// ("T1 waits on T2, T2 waits on T3, T3 is queued"). A wait written only in a task's detail can
+/// leave a stack like that standing for days, since the board sees no wait to hold it. Each stuck
+/// spell is raised once, and its alert comes down once nothing waits on the task.
+const STUCK_PREFIX: &str = "stuck:";
+const STUCK_RAISED: &str = "stuck_raised";
+const STUCK_AFTER_SECS: f64 = 24.0 * 3600.0;
+const IDLE_QUEUED: &str = "SELECT t.* FROM tasks t LEFT JOIN goals g ON g.id = t.goal_id WHERE t.status = 'queued' \
+     AND COALESCE(g.paused, 0) = 0 AND COALESCE(g.deprioritized, 0) = 0 AND COALESCE(g.archived, 0) = 0";
+
+fn stuck_key(id: i64) -> String {
+    format!("{STUCK_PREFIX}{}", rf("task", id))
+}
+
+/// When someone last did anything with the task: its newest event not the board's own, else when it was made.
+fn idle_since(app: &App, t: &Row) -> Result<Option<f64>> {
+    let at = app.db.val("SELECT MAX(at) FROM events WHERE task_id = ? AND kind <> 'release' AND who <> ?", p![t.id(), board::BOARD])?;
+    Ok(at.as_str().or(t.s("created_at")).or(t.s("updated_at")).and_then(parse_iso))
+}
+
+/// The tasks `y` holds up: queued tasks that wait for it or stack on it and can't go on without it, and
+/// the done task a head-merge `y` goes into, whose open PR holds until `y`'s merges.
+fn held_by(app: &App, y: &Row) -> Result<Vec<Row>> {
+    let mut out = vec![];
+    for w in waiting_on(app, y)? {
+        if w.s("status") == Some("queued") && !ready_for(app, &w, y.id(), Some(y))? {
+            out.push(w);
+        }
+    }
+    if crate::stack::head(y) && !pr_merged(y) {
+        if let Some(p) = crate::stack::parent(app, y)?.filter(|p| p.s("status") == Some("done") && board::pr_still_open(p)) {
+            out.push(p);
+        }
+    }
+    Ok(out)
+}
+
+/// Each (waiter, what it waits on) pair above `q`, nearest first.
+fn held_chain(app: &App, q: &Row) -> Result<Vec<(i64, i64)>> {
+    let (mut edges, mut seen, mut todo) = (vec![], vec![q.id()], vec![q.clone()]);
+    let mut i = 0;
+    while i < todo.len() && seen.len() < 64 {
+        let y = todo[i].clone();
+        i += 1;
+        for w in held_by(app, &y)? {
+            edges.push((w.id(), y.id()));
+            if !seen.contains(&w.id()) {
+                seen.push(w.id());
+                todo.push(w);
+            }
+        }
+    }
+    Ok(edges)
+}
+
+/// "T1 waits on T2, T2 waits on T3, T3 is queued", from the top of the chain down.
+fn chain_line(q: i64, edges: &[(i64, i64)]) -> String {
+    let mut bits: Vec<String> = edges.iter().rev().map(|(w, y)| format!("{} waits on {}", rf("task", *w), rf("task", *y))).collect();
+    bits.push(format!("{} is queued", rf("task", q)));
+    bits.join(", ")
+}
+
+/// A queued task that can start, isn't set to start later and isn't the owner's to do: the bottom of a chain.
+fn stuck_candidate(app: &App, q: &Row) -> Result<bool> {
+    Ok(!crate::human::is(q) && !crate::scheduled::waiting(q) && blocker(app, q)?.is_none())
+}
+
+/// Raises an alert for each queued task that has held up others for a day, and takes down the ones
+/// whose task no longer does. The number raised.
+pub fn stuck_stacks(app: &App) -> Result<i64> {
+    let now = now_ts();
+    let before = jloads_obj(crate::reqcache::setting(app, STUCK_RAISED).ok().flatten().as_deref());
+    let up = crate::dispatch::alerts(app);
+    let (mut raised, mut stuck, mut sent) = (Row::new(), vec![], 0);
+    for q in app.db.q(IDLE_QUEUED, p![])? {
+        let Some(since) = idle_since(app, &q)?.filter(|s| now - s >= STUCK_AFTER_SECS) else { continue };
+        if !stuck_candidate(app, &q)? {
+            continue;
+        }
+        let edges = held_chain(app, &q)?;
+        if edges.is_empty() {
+            continue;
+        }
+        let key = stuck_key(q.id());
+        stuck.push(key.clone());
+        let r = rf("task", q.id());
+        let spell = json!(iso(since));
+        let shown = up.iter().any(|a| a["key"] == key);
+        if !shown && before.get(&r) != Some(&spell) {
+            raise_stuck(app, &q, since, &chain_line(q.id(), &edges), &key)?;
+            sent += 1;
+        }
+        raised.insert(r, spell);
+    }
+    for a in &up {
+        if let Some(k) = a["key"].as_str().filter(|k| k.starts_with(STUCK_PREFIX) && !stuck.iter().any(|s| s == k)) {
+            crate::dispatch::clear_alert_key(app, k)?;
+        }
+    }
+    if raised != before {
+        crate::reqcache::forget_setting(STUCK_RAISED);
+        app.db.set_setting(STUCK_RAISED, Some(&jdumps(&Value::Object(raised))))?;
+    }
+    Ok(sent)
+}
+
+fn raise_stuck(app: &App, q: &Row, since: f64, chain: &str, key: &str) -> Result<()> {
+    let r = rf("task", q.id());
+    let day = local_dt(since).format("%b %-d");
+    let detail = format!("Queued with no update since {day}, and other work can't move until it does: {chain}.");
+    let text = format!(
+        "{r}: {}. {detail} Start {r}, or if its detail says to wait for one of these, settle that wait so the chain can move.",
+        q.st("title")
+    );
+    let fields = json!({"title": q.st("title"), "detail": detail});
+    board::log_event(app, q.id(), board::BOARD, "note", &format!("Holds up a chain: {chain}"))?;
+    crate::dispatch::add_alert_keyed_with(app, &text, Some(q.id()), q.i("goal_id"), key, fields)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::fields;
+
+    const OLD: &str = "2026-01-01T12:00:00Z";
+
+    fn app(dir: &std::path::Path) -> std::sync::Arc<App> {
+        App::for_tests(Config::for_tests(dir))
+    }
+
+    fn task(app: &App, f: Vec<(&str, Value)>) -> i64 {
+        let mut all = fields!["title" => "Fix the form", "created_at" => OLD, "updated_at" => OLD];
+        all.extend(f);
+        let id = app.db.insert("tasks", all).unwrap();
+        app.db.insert("events", fields!["task_id" => id, "at" => OLD, "who" => "Terminal", "kind" => "status", "text" => "x"]).unwrap();
+        id
+    }
+
+    fn stuck_alerts(app: &App) -> Vec<Value> {
+        crate::dispatch::alerts(app).into_iter().filter(|a| a["key"].as_str().is_some_and(|k| k.starts_with(STUCK_PREFIX))).collect()
+    }
+
+    /// The reported stack: A's PR holds for B to merge into it, B's for C, and C sits in the queue.
+    fn head_stack(app: &App) -> (i64, i64, i64) {
+        let a = task(app, fields!["status" => "done", "pr_num" => 1, "pr_state" => "OPEN", "pr_phase" => "stack"]);
+        let b = task(app, fields!["status" => "done", "pr_num" => 2, "pr_state" => "OPEN", "pr_phase" => "stack", "pr_after" => a, "stack_merge" => "head"]);
+        let c = task(app, fields!["status" => "queued", "pr_after" => b, "stack_merge" => "head", "detail" => "Don't start until A has merged"]);
+        (a, b, c)
+    }
+
+    #[test]
+    fn a_ref_is_named_only_as_a_whole_word() {
+        assert!(names("Blocks zonai T12", "T12"));
+        assert!(names("report the SHA on T12's PR", "T12"));
+        assert!(names("(T12)", "T12"));
+        assert!(!names("Blocks T120", "T12"));
+        assert!(!names("see AT12", "T12"));
+        assert!(names("see T120 and T12.", "T12"));
+    }
+
+    #[test]
+    fn a_queued_task_holding_a_head_merge_stack_names_the_chain() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let (a, b, c) = head_stack(&app);
+        assert_eq!(stuck_stacks(&app).unwrap(), 1);
+        let up = stuck_alerts(&app);
+        assert_eq!(up.len(), 1);
+        assert_eq!(up[0]["task_id"].as_i64(), Some(c));
+        let (a, b, c) = (rf("task", a), rf("task", b), rf("task", c));
+        let chain = format!("{a} waits on {b}, {b} waits on {c}, {c} is queued");
+        assert!(up[0]["detail"].as_str().unwrap().contains(&chain), "{up:?}");
+        crate::dispatch::prune_alerts(&app).unwrap();
+        assert_eq!(stuck_alerts(&app).len(), 1);
+    }
+
+    #[test]
+    fn a_wait_for_target_left_in_the_queue_is_flagged() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let target = task(&app, fields!["status" => "queued"]);
+        let waiter = task(&app, fields!["status" => "queued", "waits_for" => format!("[{target}]")]);
+        stuck_stacks(&app).unwrap();
+        let up = stuck_alerts(&app);
+        assert_eq!(up.len(), 1, "only the task at the bottom is flagged: {up:?}");
+        assert_eq!(up[0]["task_id"].as_i64(), Some(target));
+        let chain = format!("{} waits on {}, {} is queued", rf("task", waiter), rf("task", target), rf("task", target));
+        assert!(up[0]["detail"].as_str().unwrap().contains(&chain), "{up:?}");
+    }
+
+    #[test]
+    fn recently_queued_or_unneeded_tasks_stay_quiet() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let fresh = task(&app, fields!["status" => "queued"]);
+        app.db.insert("events", fields!["task_id" => fresh, "at" => now_iso(), "who" => "Terminal", "kind" => "status", "text" => "Queued"]).unwrap();
+        task(&app, fields!["status" => "queued", "waits_for" => format!("[{fresh}]")]);
+        task(&app, fields!["status" => "queued"]);
+        assert_eq!(stuck_stacks(&app).unwrap(), 0);
+        assert!(stuck_alerts(&app).is_empty());
+    }
+
+    #[test]
+    fn a_paused_goal_holds_its_chain_on_purpose() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let g = app.db.insert("goals", fields!["name" => "Paused", "paused" => 1]).unwrap();
+        let target = task(&app, fields!["status" => "queued", "goal_id" => g]);
+        task(&app, fields!["status" => "queued", "waits_for" => format!("[{target}]")]);
+        assert_eq!(stuck_stacks(&app).unwrap(), 0);
+    }
+
+    #[test]
+    fn it_is_raised_once_and_comes_down_when_nothing_waits() {
+        let d = tempfile::tempdir().unwrap();
+        let app = app(d.path());
+        let target = task(&app, fields!["status" => "queued"]);
+        let waiter = task(&app, fields!["status" => "queued", "waits_for" => format!("[{target}]")]);
+        assert_eq!(stuck_stacks(&app).unwrap(), 1);
+        crate::dispatch::clear_alert_key(&app, &stuck_key(target)).unwrap();
+        assert_eq!(stuck_stacks(&app).unwrap(), 0, "a dismissed alert isn't raised again for the same spell");
+        assert!(stuck_alerts(&app).is_empty());
+
+        app.db.set_setting(STUCK_RAISED, None).unwrap();
+        crate::reqcache::forget_setting(STUCK_RAISED);
+        assert_eq!(stuck_stacks(&app).unwrap(), 1);
+        board::update_task(&app, waiter, fields!["waits_for" => null]).unwrap();
+        stuck_stacks(&app).unwrap();
+        assert!(stuck_alerts(&app).is_empty(), "the alert comes down once nothing waits on it");
+    }
 }

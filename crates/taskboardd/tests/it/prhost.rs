@@ -161,6 +161,12 @@ fn reads(h: &FakeHost) -> usize {
     *h.reads.lock()
 }
 
+/// Starts the read count over after `pr_task`: linking a PR with `tb submit --pr` reads it once, to check
+/// it predates the task.
+fn forget_link_reads(h: &FakeHost) {
+    *h.reads.lock() = 0;
+}
+
 /// Ages the board's copy of the PR past `pr thread`'s TTL.
 fn age_copy(b: &Board, id: i64) {
     prflow::merge_flow(&b.app, id, vec![("checked_at", json!(iso(now_ts() - prcmds::HELD_SECS - 5.0)))]).unwrap();
@@ -512,6 +518,48 @@ fn asking_a_new_reviewer_records_no_re_review() {
 }
 
 #[test]
+fn asking_a_reviewer_who_only_commented_shows_a_re_review_until_they_comment_again() {
+    let b = board_with(|_| {});
+    let id = b.pr_task(BB);
+    let mut rec = green();
+    rec.reviewers = vec![Reviewer { commented_at: Some("2026-10-26T15:00:00Z".into()), ..reviewer("rev", "commented") }];
+    let h = fake(&b, rec.clone());
+    poll(&b);
+    let v = b.post(&format!("/tasks/T{id}/pr/reviewers"), json!({"ask": ["rev"], "who": "The agent"}));
+    assert_eq!(v["asked"][0]["queued"], false, "{v}");
+    assert!(h.calls().contains(&"re-request rev".to_string()), "{:?}", h.calls());
+    assert_eq!(b.flow(id)["rereview_asks"]["rev"]["commented_at"], "2026-10-26T15:00:00Z", "{}", b.flow(id));
+    let r = status_reviewer(&b, id, "rev");
+    assert_eq!((r["state"].as_str(), r["rereview"]["queued"].as_bool()), (Some("commented"), Some(false)), "{r}");
+    let row = reviewer_row(&b, id, "rev");
+    assert_eq!((row["state"].as_str(), row["changes"].as_bool()), (Some("rereview"), Some(false)), "{row}");
+    // A read that still shows the comment it answered keeps the ask.
+    fake(&b, rec.clone());
+    poll(&b);
+    assert_eq!(reviewer_row(&b, id, "rev")["state"], "rereview");
+    // They comment again: that answers it.
+    rec.reviewers = vec![Reviewer { commented_at: Some("2099-01-01T00:00:00Z".into()), ..reviewer("rev", "commented") }];
+    fake(&b, rec);
+    poll(&b);
+    assert_eq!(reviewer_row(&b, id, "rev")["state"], "commented");
+    assert!(status_reviewer(&b, id, "rev")["rereview"].is_null());
+    assert!(b.flow(id)["rereview_asks"].get("rev").is_none(), "{}", b.flow(id));
+}
+
+#[test]
+fn a_comment_with_no_time_on_record_answers_the_re_review() {
+    let b = board_with(|_| {});
+    let (id, h) = changes_asked(&b);
+    b.post(&format!("/tasks/T{id}/pr/addressed"), json!({"who": "The agent"}));
+    assert_eq!(reviewer_row(&b, id, "rev")["state"], "rereview");
+    let mut rec = h.rec.lock().clone();
+    rec.reviewers = vec![reviewer("rev", "commented")];
+    fake(&b, rec);
+    poll(&b);
+    assert_eq!(reviewer_row(&b, id, "rev")["state"], "commented", "can't tell it from a new comment");
+}
+
+#[test]
 fn the_re_review_ask_clears_when_that_reviewer_asks_for_changes_again_or_approves() {
     let b = board_with(|_| {});
     let (id, h) = changes_asked(&b);
@@ -695,7 +743,7 @@ fn merge_checks_everything_first_then_merges_and_closes_the_branch() {
     poll(&b);
     assert_eq!(b.phase(id), "merge", "two approvals is enough for this project");
     b.post(&format!("/tasks/T{id}/pr/merge"), json!({"agent": true, "who": "The agent"}));
-    assert!(h.calls().contains(&"merge close=true strategy=squash".to_string()));
+    assert!(h.calls().contains(&"merge close=true strategy=squash head=h1".to_string()));
     assert_eq!(b.phase(id), "merged");
 }
 
@@ -851,7 +899,7 @@ fn the_owners_override_merges_past_changes_asked_for_and_checks_and_records_what
     assert!(e.contains("B asked for changes") && e.contains("lint") && e.contains("e2e"), "{e}");
     b.post(&url, json!({"override": true}));
     assert!(h.calls().iter().any(|c| c.starts_with("merge ")), "{:?}", h.calls());
-    assert_eq!(b.phase(id), "merged");
+    assert_eq!(b.phase(id), "landing", "merged with lint running and e2e not posted: it waits for them");
     assert!(logged(&b, id, "overrode the merge gates and merged PR #9 while"), "logged");
     assert!(logged(&b, id, "B asked for changes"), "the gates open then");
     let gates = b.flow(id)["owner_override"]["gates"].as_array().cloned().unwrap_or_default();
@@ -915,6 +963,18 @@ fn the_owner_closes_a_pr_and_an_agent_only_on_their_word() {
 }
 
 #[test]
+fn an_agent_closes_a_pr_the_owner_names_by_its_task() {
+    let b = board_with(|_| {});
+    let id = b.pr_task(BB);
+    let h = fake(&b, green());
+    poll(&b);
+    b.report("hook.prompt", "s1", json!({"prompt": format!("close T{id}'s PR")}));
+    b.try_post(&format!("/tasks/T{id}/pr/close"), json!({"agent": true, "via_session": "s1"})).unwrap();
+    assert!(h.calls().iter().any(|c| c.starts_with("close")), "{:?}", h.calls());
+    assert_eq!(b.phase(id), "declined");
+}
+
+#[test]
 fn an_agent_on_a_done_tasks_pr_closes_it_when_the_owner_answers_its_question() {
     let b = board_with(|_| {});
     let id = b.pr_task(BB);
@@ -933,6 +993,50 @@ fn an_agent_on_a_done_tasks_pr_closes_it_when_the_owner_answers_its_question() {
     close().unwrap();
     assert!(h.calls().contains(&"close: Went another way".to_string()), "{:?}", h.calls());
     assert_eq!(b.phase(id), "declined");
+}
+
+#[test]
+fn an_agent_on_a_done_tasks_pr_merges_it_when_the_owner_answers_its_question() {
+    let b = board_with(|_| {});
+    let id = b.pr_task(BB);
+    let mut rec = green();
+    rec.reviewers = vec![reviewer("ok", "approved")];
+    rec.approvals = 1;
+    let h = fake(&b, rec);
+    poll(&b);
+    let merge = || b.try_post(&format!("/tasks/T{id}/pr/merge"), json!({"agent": true, "via_session": "s2"}));
+    let repo = b.dir.path().join("webapp").to_string_lossy().to_string();
+    midna::sync(&b.app, &[json!({"id": "s2", "name": "Term s2", "agent": "claude", "cwd": repo, "status": {"state": "working"}})], &[]).unwrap();
+    prflow::picked_up(&b.app, &b.task(id), "s2", "Term s2").unwrap();
+    board::session_event(&b.app, "s2", "reply", "PR #9 is still open; #12 merged already.", None).unwrap();
+    b.report("hook.prompt", "s2", json!({"prompt": "merge the PR"}));
+    assert!(merge().unwrap_err().contains("hasn't told you to merge this one"), "the reply names two PRs");
+    b.report("tb.question", "s2", json!({"text": "Should I merge PR #9 now?"}));
+    board::session_event(&b.app, "s2", "reply", "Asked whether to merge it; #12 is merged.", None).unwrap();
+    b.report("hook.prompt", "s2", json!({"prompt": "yeah, merge the PR."}));
+    merge().unwrap();
+    assert!(h.calls().iter().any(|c| c.starts_with("merge ")), "{:?}", h.calls());
+    assert_eq!(b.phase(id), "merged");
+}
+
+#[test]
+fn an_agent_on_a_done_tasks_pr_marks_it_reviewed_when_the_owner_answers_its_question() {
+    let b = board_with(|_| {});
+    let id = b.pr_task(BB);
+    fake(&b, green());
+    poll(&b);
+    let mark = || b.try_post(&format!("/tasks/T{id}/pr/reviewed"), json!({"agent": true, "via_session": "s2"}));
+    let repo = b.dir.path().join("webapp").to_string_lossy().to_string();
+    midna::sync(&b.app, &[json!({"id": "s2", "name": "Term s2", "agent": "claude", "cwd": repo, "status": {"state": "working"}})], &[]).unwrap();
+    prflow::picked_up(&b.app, &b.task(id), "s2", "Term s2").unwrap();
+    board::session_event(&b.app, "s2", "reply", "PR #9 is still open; #12 merged already.", None).unwrap();
+    b.report("hook.prompt", "s2", json!({"prompt": "I've reviewed the PR"}));
+    assert!(mark().unwrap_err().contains("haven't told you"), "the reply names two PRs");
+    b.report("tb.question", "s2", json!({"text": "Have you reviewed PR #9?"}));
+    board::session_event(&b.app, "s2", "reply", "Asked whether you've reviewed it; #12 is merged.", None).unwrap();
+    b.report("hook.prompt", "s2", json!({"prompt": "yeah, I've reviewed the PR."}));
+    let v = mark().unwrap();
+    assert_eq!(v["pr"]["bar"]["you"], "reviewed", "{v}");
 }
 
 #[test]
@@ -1932,6 +2036,84 @@ fn a_merge_that_hits_a_rate_limit_ends_the_visit_until_it_lifts() {
     assert_eq!(wakes(&b, id).len(), 2, "back to merge once it's over");
 }
 
+/// A board whose PR #9 is ready to merge, with merge tries that don't wait.
+fn ready_to_merge(retries: usize) -> (Board, i64, Arc<FakeHost>) {
+    let b = board_with(|c| {
+        c.pr.wake = true;
+        c.pr.agents_merge = Some(true);
+        c.pr.merge_retry_secs = vec![0.0; retries];
+    });
+    let id = b.pr_task(BB);
+    let mut rec = green();
+    rec.reviewers = vec![reviewer("a", "approved")];
+    let h = fake(&b, rec);
+    poll(&b);
+    assert_eq!(b.phase(id), "merge");
+    visits_done(&b, id);
+    (b, id, h)
+}
+
+fn merge_calls(h: &FakeHost) -> usize {
+    h.calls().iter().filter(|c| c.starts_with("merge ")).count()
+}
+
+#[test]
+fn a_merge_whose_base_moved_under_it_is_tried_again_by_the_board() {
+    let (b, id, h) = ready_to_merge(3);
+    *h.merge_errors.lock() = vec!["GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)".into(); 2];
+    let v = b.post(&format!("/tasks/T{id}/pr/merge"), json!({"agent": true}));
+    assert_eq!(v["merged"], true);
+    assert_eq!(merge_calls(&h), 3, "two refusals, then the merge");
+    assert_eq!(b.phase(id), "merged");
+}
+
+#[test]
+fn a_merge_the_host_dropped_but_did_counts_as_merged() {
+    let (b, id, h) = ready_to_merge(3);
+    *h.merge_lands.lock() = true;
+    *h.merge_errors.lock() = vec!["non-200 OK status code: 502 Bad Gateway body: \"<html>\"".into()];
+    let v = b.post(&format!("/tasks/T{id}/pr/merge"), json!({"agent": true}));
+    assert_eq!(v["merged"], true);
+    assert_eq!(merge_calls(&h), 1, "read merged, so not merged again");
+    assert_eq!(b.phase(id), "merged");
+}
+
+#[test]
+fn a_merge_still_refused_after_its_tries_fails_with_the_hosts_reason() {
+    let (b, id, h) = ready_to_merge(2);
+    *h.merge_error.lock() = Some("GraphQL: Merge already in progress (mergePullRequest)".into());
+    let e = b.try_post(&format!("/tasks/T{id}/pr/merge"), json!({"agent": true})).unwrap_err();
+    assert!(e.contains("Couldn't merge PR #9") && e.contains("Merge already in progress"), "{e}");
+    assert_eq!(merge_calls(&h), 3, "the first try and two more");
+    assert_eq!(b.phase(id), "merge");
+}
+
+#[test]
+fn a_merge_is_pinned_to_the_head_it_judged_and_a_push_after_the_read_holds_it() {
+    let (b, id, h) = ready_to_merge(3);
+    *h.push_before_merge.lock() = Some("h2".into());
+    let e = b.try_post(&format!("/tasks/T{id}/pr/merge"), json!({"agent": true})).unwrap_err();
+    assert!(e.contains("PR #9 can't merge yet: its branch was pushed after the board judged it at h1"), "{e}");
+    assert!(e.contains("don't run tb pr merge again"), "{e}");
+    assert_eq!(h.calls().iter().filter(|c| c.starts_with("merge ")).collect::<Vec<_>>(), ["merge close=true strategy=default head=h1"], "not tried again");
+    assert_eq!(h.rec.lock().state, "OPEN");
+    assert_eq!(b.flow(id)["merge_refused"]["head"], "h1");
+    // Once the new head is read, the merge goes through pinned to it.
+    poll(&b);
+    let v = b.post(&format!("/tasks/T{id}/pr/merge"), json!({"agent": true}));
+    assert_eq!(v["merged"], true);
+    assert!(h.calls().contains(&"merge close=true strategy=default head=h2".to_string()));
+}
+
+#[test]
+fn a_merge_refused_for_good_is_not_tried_again() {
+    let (b, id, h) = ready_to_merge(3);
+    *h.merge_error.lock() = Some("X Pull request acme/webapp#9 is not mergeable: the base branch policy prohibits the merge.".into());
+    let e = b.try_post(&format!("/tasks/T{id}/pr/merge"), json!({"agent": true})).unwrap_err();
+    assert!(e.contains("base branch policy"), "{e}");
+    assert_eq!(merge_calls(&h), 1);
+}
+
 #[test]
 fn a_check_only_an_earlier_push_posted_holds_the_pr_only_for_the_short_wait() {
     let b = board_with(|c| c.pr.agents_merge = Some(true));
@@ -2004,6 +2186,7 @@ fn full_reads_only_due_by_age_are_spread_over_polls_oldest_first() {
     let h = fake(&b, green());
     *h.stamp.lock() = Some("s1".into());
     let ids: Vec<i64> = (1..=5).map(|n| b.pr_task(&format!("https://bitbucket.org/acme/webapp/pull-requests/{n}"))).collect();
+    forget_link_reads(&h);
     poll(&b);
     assert_eq!(reads(&h), 5, "a PR never read is read at once");
     for (i, id) in ids.iter().enumerate() {
@@ -2037,6 +2220,7 @@ fn a_pr_whose_full_read_keeps_failing_doesnt_hold_its_turn() {
     let h = fake(&b, green());
     *h.stamp.lock() = Some("s1".into());
     let ids: Vec<i64> = (1..=5).map(|n| b.pr_task(&format!("https://bitbucket.org/acme/webapp/pull-requests/{n}"))).collect();
+    forget_link_reads(&h);
     poll(&b);
     for (i, id) in ids.iter().enumerate() {
         prflow::merge_flow(&b.app, *id, vec![("full_at", json!(iso(now_ts() - 7200.0 - i as f64 * 60.0)))]).unwrap();
@@ -2058,6 +2242,7 @@ fn when_the_host_cant_say_what_changed_the_timed_poll_leaves_prs_read_lately() {
     let h = fake(&b, green());
     *h.stamp.lock() = Some("s1".into());
     let ids: Vec<i64> = (1..=3).map(|n| b.pr_task(&format!("https://bitbucket.org/acme/webapp/pull-requests/{n}"))).collect();
+    forget_link_reads(&h);
     poll(&b);
     assert_eq!(reads(&h), 3);
     prflow::merge_flow(&b.app, ids[2], vec![("full_at", json!(iso(now_ts() - 1200.0)))]).unwrap();
@@ -2077,6 +2262,7 @@ fn when_the_host_cant_say_what_changed_a_limited_account_waits_and_the_rest_are_
     let h = fake(&b, green());
     *h.stamp.lock() = Some("s1".into());
     let ids: Vec<i64> = (1..=5).map(|n| b.pr_task(&format!("https://bitbucket.org/acme/webapp/pull-requests/{n}"))).collect();
+    forget_link_reads(&h);
     poll(&b);
     assert_eq!(reads(&h), 5);
     for (i, id) in ids.iter().enumerate() {

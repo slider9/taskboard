@@ -146,7 +146,7 @@ fn a_long_handoff_keeps_the_device_lines_whole() {
     let a = b.post("/tasks", json!({"title": "Long one", "detail": long, "project": "webapp", "devices": "ios"}))["id"].as_i64().unwrap();
     runner::start_queued(&b.app).unwrap();
     let h = handoff::build(&b.app, a).unwrap();
-    assert!(h.chars().count() <= 6000, "the handoff still fits: {}", h.chars().count());
+    assert!(h.chars().count() <= handoff::CONTEXT_LIMIT, "the handoff still fits: {}", h.chars().count());
     assert!(h.contains("The board lent this task the device dev-c (iOS simulator, ABCD-UDID): use only that one"), "{h}");
     assert!(h.contains("Start it: xcrun simctl boot ABCD-UDID && open -a Simulator"), "{h}");
     assert!(h.contains("Stop it when you're done: xcrun simctl shutdown ABCD-UDID"), "{h}");
@@ -167,7 +167,7 @@ fn a_long_handoff_points_to_its_reference_and_keeps_the_work_whole() {
         b.post(
             &format!("/goals/G{g}/attachments"),
             json!({"url": format!("https://example.com/design/{n}"), "title": format!("Screen {n}"), "kind": "design",
-                   "summary": "Every state of the screen, light and dark, with the spacing called out. ".repeat(3)}),
+                   "summary": "Every state of the screen, light and dark, with the spacing called out. ".repeat(6)}),
         );
     }
     let detail = format!("Fix the track list. {}", "The tester saw the rows jump when the list scrolls. ".repeat(20));
@@ -176,7 +176,7 @@ fn a_long_handoff_points_to_its_reference_and_keeps_the_work_whole() {
         .unwrap();
     runner::start_queued(&b.app).unwrap();
     let h = handoff::build(&b.app, a).unwrap();
-    assert!(h.chars().count() <= 6000, "it fits: {}", h.chars().count());
+    assert!(h.chars().count() <= handoff::CONTEXT_LIMIT, "it fits: {}", h.chars().count());
     assert!(h.contains(&format!("What to do:\n{}", detail.trim())), "the work is whole: {h}");
     assert!(h.contains(setup.replace("{device}", "dev-c").trim()), "the goal's setup is whole: {h}");
     assert!(h.contains("Attached (read these before you start): [Shortened to fit. tb handoff prints it in full.]"), "{h}");
@@ -215,16 +215,16 @@ fn one_device_goes_back_and_the_others_in_use_are_named() {
     let mine = taskboardd::devices::lent(&b.app, a).unwrap();
     let theirs = taskboardd::devices::lent(&b.app, c).unwrap();
     let h = handoff::build(&b.app, a).unwrap();
-    assert!(h.contains("use only that one, since other tasks have the rest of the pool. It goes back when the task is done."), "{h}");
-    assert!(h.contains(&format!("Other devices in use, don't touch them: {} (with T{c}).", theirs[0])), "{h}");
-    assert!(!h.contains(&format!("{} (with", mine[0])),"its own device isn't listed as another's: {h}");
+    assert!(h.contains("use only that one. It goes back when the task is done."), "{h}");
+    assert!(h.contains(&format!("Leave these devices alone, other tasks or goals have them: {}.", theirs[0])), "{h}");
+    assert!(!h.contains(&format!("have them: {}", mine[0])), "its own device isn't listed as another's: {h}");
 
     // Nobody else has one: no such line.
     let solo = new_board();
     solo.post("devices", json!({"name": "dev-a", "tags": "android"}));
     let s = solo.task("Solo", "android");
     runner::start_queued(&solo.app).unwrap();
-    assert!(!handoff::build(&solo.app, s).unwrap().contains("Other devices in use"));
+    assert!(!handoff::build(&solo.app, s).unwrap().contains("Leave these devices alone"));
 }
 
 // --- #105 ---
@@ -247,45 +247,64 @@ fn goal_setup_fills_jira_with_the_ticket_or_the_task_ref() {
 // --- #106 ---
 
 #[test]
-fn other_devices_name_their_target_and_why_and_stay_short() {
+fn other_devices_are_named_only_and_a_long_list_points_to_tb_devices() {
     let b = new_board();
     b.post("devices", json!({"name": "dev-a", "tags": "android", "target": "emulator-5554"}));
     b.post("devices", json!({"name": "dev-b", "tags": "android", "target": "emulator-5556"}));
     b.post("devices", json!({"name": "res-1", "tags": "android", "target": "R1"}));
     b.post("devices", json!({"name": "off-1", "tags": "android"}));
-    b.post("devices", json!({"name": "off-2", "tags": "android"}));
     b.post("devices", json!({"name": "spare", "tags": "ios"}));
     b.post("devices/off-1", json!({"off": true, "note": "Kept for the demo"}));
-    b.post("devices/off-2", json!({"off": true}));
     let other = b.post("/goals", json!({"name": "Other", "project": "webapp"}))["id"].as_i64().unwrap();
     b.post(&format!("goals/G{other}/devices"), json!({"device": "res-1", "reserved": true}));
     let a = b.task("A", "android");
     let c = b.task("C", "android");
     runner::start_queued(&b.app).unwrap();
     assert_eq!(b.started(), vec![a, c]);
-    let mine = taskboardd::devices::lent(&b.app, a).unwrap();
     let theirs = taskboardd::devices::lent(&b.app, c).unwrap();
-    let target = |n: &str| if n == "dev-a" { "emulator-5554" } else { "emulator-5556" };
     let h = handoff::build(&b.app, a).unwrap();
-    let mut want = [
-        format!("{} {} (with T{c})", theirs[0], target(&theirs[0])),
-        "off-1 (kept for the demo)".to_string(),
-        "off-2 (kept back)".to_string(),
-        format!("res-1 R1 (reserved for G{other})"),
-    ];
+    let mut want = vec![theirs[0].clone(), "off-1".to_string(), "res-1".to_string()];
     want.sort();
-    assert!(h.contains(&format!("Other devices in use, don't touch them: {}.", want.join("; "))), "{h}");
-    assert!(!h.contains(&format!("{} {} (with", mine[0], target(&mine[0]))) && !h.contains("spare"), "{h}");
+    assert!(h.contains(&format!("Leave these devices alone, other tasks or goals have them: {}.", want.join(", "))), "{h}");
+    assert!(!h.contains("emulator-5556") && !h.contains("R1") && !h.contains("Kept for") && !h.contains("spare"), "names only: {h}");
 
-    // A long list is clipped to 500.
+    // A long list names a few and points to tb devices for the rest.
     for i in 0..30 {
         b.post("devices", json!({"name": format!("kept-{i:02}"), "tags": "tv"}));
-        b.post(&format!("devices/kept-{i:02}"), json!({"off": true, "note": format!("Kept for {}", "a long demo booth story ".repeat(4))}));
+        b.post(&format!("devices/kept-{i:02}"), json!({"off": true, "note": "Kept for a long demo booth story"}));
     }
     let h = handoff::build(&b.app, a).unwrap();
-    let line = h.lines().find(|l| l.starts_with("Other devices in use")).unwrap();
-    let list = line.trim_start_matches("Other devices in use, don't touch them: ").trim_end_matches('.');
-    assert!(list.chars().count() <= 500 && list.ends_with('…'), "{}: {line}", list.chars().count());
+    let tb = board::tb_cmd(&b.app);
+    let line = h.lines().find(|l| l.starts_with("Leave these devices alone")).unwrap();
+    assert_eq!(
+        line,
+        format!("Leave these devices alone, other tasks or goals have them: {}, kept-00, kept-01, kept-02, kept-03 and 28 more ({tb} devices lists them).", theirs[0])
+    );
+    assert!(line.chars().count() < 200, "{line}");
+}
+
+#[test]
+fn a_goal_setup_that_covers_the_lent_device_isnt_repeated() {
+    let b = new_board();
+    b.post(
+        "devices",
+        json!({"name": "ipad-sim", "tags": "ios", "kind": "ios", "target": "B3CF-UDID",
+               "start_cmd": "xcrun simctl boot {target}", "stop_cmd": "xcrun simctl shutdown {target}"}),
+    );
+    b.app.db.x("UPDATE devices SET note = 'Open Simulator.app to watch it' WHERE name = 'ipad-sim'", p![]).unwrap();
+    let g = b.post("/goals", json!({"name": "Tablet", "project": "webapp"}))["id"].as_i64().unwrap();
+    b.post(
+        &format!("/goals/G{g}"),
+        json!({"setup": "Boot it: xcrun simctl boot {target}. Install with flutter install -d {target}, record with xcrun simctl io {target} recordVideo out.mov."}),
+    );
+    let a = b.post("/tasks", json!({"title": "Tab", "detail": "Do it.", "project": "webapp", "goal_id": g, "devices": "ios"}))["id"].as_i64().unwrap();
+    runner::start_queued(&b.app).unwrap();
+    let h = handoff::build(&b.app, a).unwrap();
+    assert!(h.contains("The board lent this task the device ipad-sim (iOS simulator, B3CF-UDID): use only that one. It goes back when the task is done."), "{h}");
+    assert!(!h.contains("Open Simulator.app"), "the goal's setup covers the device, so its note isn't repeated: {h}");
+    assert!(!h.contains("Start it:"), "the setup already boots it: {h}");
+    assert!(h.contains("Stop it when you're done: xcrun simctl shutdown B3CF-UDID"), "the setup doesn't stop it: {h}");
+    assert_eq!(h.matches("xcrun simctl boot B3CF-UDID").count(), 1, "{h}");
 }
 
 #[test]
@@ -325,7 +344,7 @@ fn a_lent_device_keeps_its_details_once_another_goal_reserves_it() {
     );
     assert!(h.contains("Start it: xcrun simctl boot ABCD-UDID"), "{h}");
     assert!(h.contains("Stop it when you're done: xcrun simctl shutdown ABCD-UDID"), "{h}");
-    assert!(!h.contains("Other devices in use"), "its own device isn't another's, reserved or not: {h}");
+    assert!(!h.contains("Leave these devices alone"), "its own device isn't another's, reserved or not: {h}");
 }
 
 #[test]
@@ -335,36 +354,38 @@ fn a_task_with_no_device_lent_still_hears_which_to_leave_alone() {
     let a = b.task("A", "android");
     runner::start_queued(&b.app).unwrap();
     assert_eq!(b.started(), vec![a]);
-    let others = format!("Other devices in use, don't touch them: dev-a emulator-5554 (with T{a}).");
+    let others = "Leave these devices alone, other tasks or goals have them: dev-a.";
     // Queued behind A: it hasn't started, so the board lends it one later.
     let c = b.task("C", "android");
     assert!(taskboardd::devices::lent(&b.app, c).unwrap().is_empty());
     let h = handoff::build(&b.app, c).unwrap();
     assert!(h.contains("This task asks for devices (android). The board lends it to this task when it starts, and this handoff then says which."), "{h}");
-    assert!(!h.contains("none were free") && h.contains(&others), "{h}");
+    assert!(!h.contains("none were free") && h.contains(others), "{h}");
 
     // The handoff it starts with, and once it has started: none were free.
     let starting = handoff::build_starting(&b.app, c).unwrap();
     board::update_task(&b.app, c, fields!["started_at" => taskboardd::util::now_iso()]).unwrap();
     for h in [starting, handoff::build(&b.app, c).unwrap()] {
         assert!(h.contains("but none were free when it started."), "{h}");
-        assert!(!h.contains("lends it to this task when it starts") && h.contains(&others), "{h}");
+        assert!(!h.contains("lends it to this task when it starts") && h.contains(others), "{h}");
     }
 }
 
 #[test]
-fn a_task_with_no_device_needs_hears_how_to_ask_for_one_once_the_pool_has_any() {
+fn a_task_with_no_device_needs_is_told_never_to_hunt_for_one_once_the_pool_has_any() {
     let b = new_board();
     let t = b.task("Copy", "");
     let tb = board::tb_cmd(&b.app);
     let line = format!(
-        "If this task needs an emulator, simulator or phone, don't pick one yourself: run {tb} task set T{t} --device tag:<tag> \
-         ({tb} devices lists them) and the board lends you a free one that no other terminal is using."
+        "Never look for, start or boot an emulator, simulator or phone yourself (no adb devices, xcrun simctl or emulator \
+         commands): the board's devices stay shut down until it lends one. If this task needs one, run {tb} task set T{t} \
+         --device tag:<tag> ({tb} devices lists the tags) and the board lends you a free one and says how to start it. \
+         Otherwise don't use any."
     );
-    assert!(!handoff::build(&b.app, t).unwrap().contains("don't pick one yourself"), "an empty pool says nothing");
+    assert!(!handoff::build(&b.app, t).unwrap().contains("Never look for, start or boot"), "an empty pool says nothing");
     b.post("devices", json!({"name": "pixel-a", "tags": "android"}));
     let h = handoff::build(&b.app, t).unwrap();
     assert!(h.contains(&line), "{h}");
     let a = b.task("A", "android");
-    assert!(!handoff::build(&b.app, a).unwrap().contains("don't pick one yourself"), "a task that asks for devices hears about those");
+    assert!(!handoff::build(&b.app, a).unwrap().contains("Never look for, start or boot"), "a task that asks for devices hears about those");
 }

@@ -1,17 +1,16 @@
-//! A backlog issue, as the web board showed it: the side panel on the Board (`issuePanel`), and
-//! the issue column beside the Backlog page's list (`issueAside`). Both share the detail
+//! A backlog issue, as the web board showed it: the side panel (`issuePanel`) with its detail
 //! (`issueDetail`: move to a goal, how it was reported, what was happening, history, notes).
 //!
 //! Also here, shared with the Backlog page: the issue labels (`issueState`, `issueFrom`, …), the
 //! issue actions (`promote`, `ticket`, `drop`, `issue-move`, `issue-note`) with the web board's
 //! inline notes and "Sending…" busy buttons, and the searchable project / goal picker.
 //!
-//! What is drawn comes from the pure view models (`PanelView`, `AsideView`, `DetailView`); their
+//! What is drawn comes from the pure view models (`PanelView`, `DetailView`); their
 //! visible text and offered actions are checked against the web board in `parity/golden/backlog.json`.
 use crate::app::{MainWindow, Page, Panel, TaskTab};
 use crate::fmt::{self, arr, s};
 use crate::theme::Theme;
-use crate::ui::kit;
+use crate::ui::{focus, kit};
 use crate::ui::modals::locale_cmp;
 use crate::ui::select::{sel, sel_styled};
 use gpui_kit::prelude::*;
@@ -161,7 +160,7 @@ fn hist_list_item(m: &mut MainWindow, ix: usize, _: &mut Window, cx: &mut Contex
     }
     let row = div().px(px(24.)).line_height(relative(1.5));
     match rows.get(ix - 1) {
-        Some(h) => row.pt(px(8.)).child(hist_row(&t, &fmt::ref_of(&b, "B"), ix - 1, &hist_row_of(h), false)).into_any_element(),
+        Some(h) => row.pt(px(8.)).child(hist_row(&t, &fmt::ref_of(&b, "B"), ix - 1, &hist_row_of(h))).into_any_element(),
         None => row.pb(px(32.)).when(more, |d| d.pt(px(8.)).child(kit::help(&t, "Loading…"))).into_any_element(),
     }
 }
@@ -207,6 +206,16 @@ pub fn found_task(b: &Value) -> Option<String> {
     }
 }
 
+/// The task that fixed an issue closed as fixed, as a ref.
+fn fixed_task(b: &Value) -> Option<String> {
+    (s(b, "closed_as") == "fixed").then(|| b.get("fixed_by").and_then(Value::as_i64)).flatten().map(|n| format!("T{n}"))
+}
+
+/// The task an issue leads to: the one it was made into, or the one that fixed it.
+fn issue_task(b: &Value) -> Option<String> {
+    (s(b, "state") == "task").then(|| b.get("task_id").and_then(Value::as_i64)).flatten().map(|n| format!("T{n}")).or_else(|| fixed_task(b))
+}
+
 /// `issueState`: (short, text) for an issue that isn't open; None while open.
 pub fn issue_state(b: &Value) -> Option<(String, String)> {
     let tr = b.get("task_id").and_then(Value::as_i64).map(|n| format!("T{n}"));
@@ -215,6 +224,11 @@ pub fn issue_state(b: &Value) -> Option<(String, String)> {
         "ticket" => {
             let key = fmt::opt_s(b, "jira_key");
             Some((key.unwrap_or("Ticket asked for").to_string(), key.map(|k| format!("Jira {k}")).unwrap_or_else(|| "Jira ticket being created".into())))
+        }
+        "drop" if s(b, "closed_as") == "fixed" => {
+            let pr = fmt::opt_s(b, "fixed_pr").and_then(|u| u.trim_end_matches('/').rsplit('/').next()).filter(|n| n.parse::<u64>().is_ok());
+            let by = fixed_task(b).or_else(|| pr.map(|n| format!("PR #{n}")));
+            Some(("Fixed".into(), by.map(|r| format!("Closed as fixed by {r}")).unwrap_or_else(|| "Closed as fixed".into())))
         }
         "drop" => Some(("Won’t do".into(), "Closed as won’t do".into())),
         "defer" => Some(("Deferred".into(), "Deferred: not for now".into())),
@@ -359,21 +373,12 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// `issueActions`: Make it a task (into `place`), Create ticket (with Jira), Won't do.
-pub fn issue_actions(cx: &Ctx, r: &str, place: &'static str) -> Vec<Act> {
-    let mut v = vec![cx.act("promote", "Make it a task", place, r)];
-    if cx.jira {
-        v.push(cx.act("ticket", "Create ticket", "", r));
-    }
-    v.push(cx.act("drop", "Won’t do", "", r));
-    v
-}
-
 pub struct HistRow {
     pub time: String,
     pub full: String,
     pub kind: String,
-    /// "who · text" (as the web joins them).
+    /// "who · text" (as the web joins them), for the parity tests.
+    #[cfg(test)]
     pub text: String,
     /// Who did it (bold in the panel), and the rest after " · ".
     pub who: Option<String>,
@@ -389,9 +394,13 @@ pub struct DetailView {
     pub snap: Vec<(String, String)>,
     /// (task ref, "Open T4’s log at 3:05 PM").
     pub found_log: Option<(String, String)>,
+    /// Only the parity tests read it whole; the panel's list draws a row at a time.
+    #[cfg(test)]
     pub history: Vec<HistRow>,
 }
 
+/// The detail with its history, as the parity tests read it.
+#[cfg(test)]
 pub fn detail_view(b: &Value) -> DetailView {
     let mut hist: Vec<&Value> = arr(b, "history").iter().collect();
     let at = |h: &Value| h.get("at").map(|a| a.as_str().map(str::to_string).unwrap_or_else(|| a.to_string())).unwrap_or_else(|| "undefined".into());
@@ -411,6 +420,7 @@ fn detail_head(b: &Value) -> DetailView {
             let at = fmt::opt_s(b, "created_at").map(|c| format!(" at {}", fmt::hhmm(c))).unwrap_or_default();
             (fr.clone(), format!("Open {fr}’s log{at}"))
         }),
+        #[cfg(test)]
         history: Vec::new(),
         r,
     }
@@ -423,6 +433,7 @@ fn hist_row_of(h: &Value) -> HistRow {
         kind: s(h, "kind").to_string(),
         who: fmt::opt_s(h, "who").map(str::to_string),
         what: s(h, "text").to_string(),
+        #[cfg(test)]
         text: match fmt::opt_s(h, "who") {
             Some(w) => format!("{w} · {}", s(h, "text")),
             None => s(h, "text").to_string(),
@@ -466,10 +477,82 @@ pub struct PanelView {
     pub state_line: String,
     /// "Open it" (made into a task): the task ref.
     pub open_task: Option<String>,
-    /// While open: the box's sentence and the actions.
-    pub open_box: Option<(String, Vec<Act>)>,
+    /// While open and not a goal's miss: what can be done with it, the first one first.
+    pub acts: Vec<Act>,
+    /// While open and holding its goal open: the goal, and what each choice does to it.
+    pub miss: Option<MissView>,
     pub note: Option<(String, bool)>,
     pub detail: DetailView,
+}
+
+/// An open issue on its goal's done-when: the goal it holds open and each choice with what it does
+/// to that goal.
+pub struct MissView {
+    /// "Holds G3 open, with 2 other misses."
+    pub head: String,
+    /// "Done when: …", the goal's outcome.
+    pub done_when: Option<String>,
+    pub acts: Vec<(Act, String)>,
+}
+
+/// "at 2:05 PM" today, else "Oct 6 at 2:05 PM" or "Yesterday at 2:05 PM".
+pub fn at_time(iso: &str) -> String {
+    let d = fmt::day_time(iso);
+    let words: Vec<&str> = d.split(' ').collect();
+    match words.len() {
+        0 | 1 if d.is_empty() => String::new(),
+        n if n > 2 => format!("{} at {}", words[..n - 2].join(" "), words[n - 2..].join(" ")),
+        _ => format!("at {d}"),
+    }
+}
+
+/// Whether settling the goal's only miss would finish it: nothing else holds it open.
+pub fn finishes_goal(goal: &Value) -> bool {
+    let mut g = goal.clone();
+    g["misses"] = json!(0);
+    fmt::i(goal, "misses") == 1 && crate::ui::goals::finished(&g)
+}
+
+/// The goal a miss holds open, and its choices.
+fn miss_view(cx: &Ctx, b: &Value, r: &str) -> MissView {
+    let gid = b.get("goal_id").and_then(Value::as_i64);
+    let goal = gid.and_then(|id| cx.goals.iter().find(|g| g.get("id").and_then(Value::as_i64) == Some(id)));
+    let g = b.get("goal").filter(|g| g.is_object()).map(|g| fmt::ref_of(g, "G")).filter(|x| !x.is_empty()).or_else(|| gid.map(|n| format!("G{n}"))).unwrap_or_else(|| "The goal".into());
+    let others = goal.map(|g| fmt::i(g, "misses") - 1).unwrap_or(0);
+    // Settling this one in any of the three ways would finish the goal.
+    let last = goal.is_some_and(finishes_goal);
+    let head = if last { format!("Last thing holding {g} open.") } else if others > 0 { format!("Holds {g} open, with {} other {}.", others, if others == 1 { "miss" } else { "misses" }) } else { format!("Holds {g} open.") };
+    let mut acts = vec![(cx.act("promote", "Make it a task", "board", r), format!("{g} stays open until the task is done."))];
+    if cx.jira {
+        acts.push((cx.act("ticket", "Create ticket", "", r), if last { format!("Sends it to Jira and finishes {g}, outcome not met.") } else { format!("Sends it to Jira. {g} stops waiting for it.") }));
+    }
+    acts.push((cx.act("drop", "Won’t do", "", r), if last { format!("Closes the issue and finishes {g}, outcome not met.") } else { format!("Closes the issue. {g} stops waiting for it.") }));
+    acts.push((cx.act("without", "Finish without it", "", r), if last { format!("Stays in the backlog and finishes {g}, outcome not met.") } else { format!("Stays in the backlog. {g} stops waiting for it.") }));
+    MissView { head, done_when: goal.and_then(|g| fmt::opt_s(g, "outcome")).map(|o| format!("Done when: {o}")), acts }
+}
+
+/// What an open issue offers. Not in a goal yet: Select for goal first, and Defer. In a goal: make
+/// it a task, send it to Jira, or close it.
+fn open_acts(cx: &Ctx, b: &Value, r: &str) -> Vec<Act> {
+    let untriaged = b.get("goal_id").is_none_or(Value::is_null);
+    let mut v = vec![];
+    if untriaged {
+        v.push(cx.act("pick", "Select for goal", "", r));
+    }
+    v.push(cx.act("promote", "Make it a task", "board", r));
+    if cx.jira {
+        v.push(cx.act("ticket", "Create ticket", "", r));
+    }
+    if untriaged {
+        v.push(cx.act("defer", "Defer", "", r));
+    }
+    v.push(cx.act("drop", "Won’t do", "", r));
+    v
+}
+
+/// Deferred or closed as won't do (not as fixed): it can be opened again.
+pub fn reopens(b: &Value) -> bool {
+    s(b, "state") == "defer" || (s(b, "state") == "drop" && s(b, "closed_as") != "fixed")
 }
 
 /// The whole panel, history and all, as the parity tests read it.
@@ -481,18 +564,23 @@ pub fn panel_view(cx: &Ctx, b: &Value) -> PanelView {
 /// The panel without the history in its detail.
 fn panel_head(cx: &Ctx, b: &Value) -> PanelView {
     let r = fmt::ref_of(b, "B");
-    let state_line = issue_state(b).map(|x| x.1).unwrap_or_else(|| format!("Open · reported at {}", fmt::hhmm(s(b, "created_at"))));
+    let state_line = issue_state(b).map(|x| x.1).unwrap_or_else(|| format!("Open · reported {}", at_time(s(b, "created_at"))));
     let open = matches!(s(b, "state"), "" | "open");
+    let miss = open && fmt::b(b, "misses_goal");
     PanelView {
         kind: kind_label(s(b, "kind")),
         title: s(b, "title").to_string(),
         project: s(b, "project").to_string(),
         state_line,
-        open_task: (s(b, "state") == "task").then(|| b.get("task_id").and_then(Value::as_i64)).flatten().map(|n| format!("T{n}")),
-        open_box: open.then(|| {
-            let what = format!("Not part of any task yet. Make it a task to queue it{}.", if cx.jira { ", or send it to Jira" } else { "" });
-            (what, issue_actions(cx, &r, "board"))
-        }),
+        open_task: issue_task(b),
+        acts: if open && !miss {
+            open_acts(cx, b, &r)
+        } else if reopens(b) {
+            vec![cx.act("reopen", "Reopen", "", &r)]
+        } else {
+            vec![]
+        },
+        miss: miss.then(|| miss_view(cx, b, &r)),
         note: cx.note(&format!("issue:{r}")),
         detail: detail_head(b),
         r,
@@ -510,50 +598,22 @@ impl PanelView {
         if self.open_task.is_some() {
             out.push("· Open it".into());
         }
-        if let Some((what, a)) = &self.open_box {
-            out.push(what.clone());
-            for x in a {
+        if let Some(mv) = &self.miss {
+            out.push(mv.head.clone());
+            out.extend(mv.done_when.clone());
+            for (x, what) in &mv.acts {
                 out.push(x.label.clone());
+                out.push(what.clone());
                 acts.push(x.act);
             }
+        }
+        for x in &self.acts {
+            out.push(x.label.clone());
+            acts.push(x.act);
         }
         out.extend(self.note.as_ref().map(|n| n.0.clone()));
         self.detail.parts(&mut out);
         (flat(&out), acts)
-    }
-}
-
-/// `issueAside` (beside the Backlog page's list): no actions box, the move picker, compact.
-pub struct AsideView {
-    pub r: String,
-    pub kind: String,
-    /// The state, or "Open · reported at …".
-    pub help: String,
-    pub title: String,
-    /// "Open task T7".
-    pub open_task: Option<String>,
-    pub detail: DetailView,
-}
-
-pub fn aside_view(b: &Value) -> AsideView {
-    AsideView {
-        r: fmt::ref_of(b, "B"),
-        kind: kind_label(s(b, "kind")),
-        help: issue_state(b).map(|x| x.1).unwrap_or_else(|| format!("Open · reported at {}", fmt::hhmm(s(b, "created_at")))),
-        title: s(b, "title").to_string(),
-        open_task: (s(b, "state") == "task").then(|| b.get("task_id").and_then(Value::as_i64)).flatten().map(|n| format!("T{n}")),
-        detail: detail_view(b),
-    }
-}
-
-impl AsideView {
-    #[cfg(test)]
-    pub fn text_and_acts(&self, err: Option<&str>) -> (String, Vec<&'static str>) {
-        let mut out = vec![self.kind.clone(), self.help.clone(), self.r.clone(), self.title.clone()];
-        out.extend(self.open_task.as_ref().map(|t| format!("Open task {t}")));
-        out.extend(err.map(str::to_string));
-        self.detail.parts(&mut out);
-        (flat(&out), vec![])
     }
 }
 
@@ -634,15 +694,62 @@ pub fn keep_issue(m: &mut MainWindow, r: &str) {
 /// `promote`: `POST /backlog/:id/promote {where}`. On the Board the new task opens.
 pub fn promote(m: &mut MainWindow, r: &str, place: &'static str, cx: &mut Context<MainWindow>) {
     keep_issue(m, r);
-    run(m, format!("promote:{place}:{r}"), format!("issue:{r}"), format!("backlog/{r}/promote"), json!({"where": place}), cx, |m, res, cx| {
+    // A miss on its goal's done-when: the toast says the goal waits for the new task, with Open it.
+    let miss = m.data.issue.as_ref().filter(|b| fmt::ref_of(b, "B") == r && fmt::b(b, "misses_goal")).map(|b| {
+        b.get("goal").filter(|g| g.is_object()).map(|g| fmt::ref_of(g, "G")).filter(|x| !x.is_empty()).unwrap_or_else(|| "The goal".into())
+    });
+    let issue = r.to_string();
+    run(m, format!("promote:{place}:{r}"), format!("issue:{r}"), format!("backlog/{r}/promote"), json!({"where": place}), cx, move |m, res, cx| {
         let t = res.get("task").filter(|t| t.is_object()).or_else(|| (s(res, "ref").starts_with('T')).then_some(res));
         let tr = t.map(|t| fmt::ref_of(t, "T")).or_else(|| res.get("task_id").and_then(Value::as_i64).map(|n| format!("T{n}"))).unwrap_or_default();
+        if let (Some(g), false) = (miss, tr.is_empty()) {
+            let text = made_text(&issue, &tr, &g, t.map(|t| s(t, "status")).unwrap_or_default());
+            m.close_panel(cx);
+            crate::ui::backlog::toast_open(m, text, tr, cx);
+            return None;
+        }
         if m.page == Page::Board && !tr.is_empty() {
             m.open_task(tr, cx);
             return None;
         }
         (m.page == Page::Board).then(|| "Made into a task".to_string())
     });
+}
+
+/// The toast after a miss became a task: planned work waits for its goal to start; queued work runs.
+pub fn made_text(issue: &str, task: &str, g: &str, status: &str) -> String {
+    match status {
+        "planned" => format!("Made {issue} into {task} as planned work in {g}. It starts when you start {g}"),
+        "queued" => format!("Made {issue} into {task} and queued it. {g} stays open until it’s done"),
+        _ => format!("Made {issue} into {task}. {g} stays open until it’s done"),
+    }
+}
+
+/// What Make it a task made, from the board's answer: the toast's text and the task Open it opens.
+pub fn made_toast(issue: &str, res: &Value) -> Option<(String, String)> {
+    let t = res.get("task").filter(|t| t.is_object())?;
+    let tr = fmt::ref_of(t, "T");
+    let g = res.get("issue").and_then(|b| b.get("goal")).filter(|g| g.is_object()).map(|g| fmt::ref_of(g, "G")).filter(|x| !x.is_empty());
+    let g = g.or_else(|| t.get("goal_id").and_then(Value::as_i64).map(|n| format!("G{n}")))?;
+    (!tr.is_empty()).then(|| (made_text(issue, &tr, &g, s(t, "status")), tr))
+}
+
+/// Select for goal: the issue joins the Backlog page's new goal, which opens.
+pub fn select_for_goal(m: &mut MainWindow, r: &str, cx: &mut Context<MainWindow>) {
+    crate::ui::backlog::pick(m, r);
+    m.close_panel(cx);
+    m.go(Page::Backlog, cx);
+}
+
+pub fn defer(m: &mut MainWindow, r: &str, cx: &mut Context<MainWindow>) {
+    keep_issue(m, r);
+    run(m, format!("defer::{r}"), format!("issue:{r}"), "backlog/bulk".into(), json!({"ids": [r], "action": "defer"}), cx, |m, v, cx| undoable(m, v, "Deferred: not for now", cx));
+}
+
+/// Finish the goal without this miss: it stays in the backlog as ordinary work.
+pub fn finish_without(m: &mut MainWindow, r: &str, cx: &mut Context<MainWindow>) {
+    keep_issue(m, r);
+    run(m, format!("without::{r}"), format!("issue:{r}"), format!("backlog/{r}/without-goal"), json!({}), cx, |m, v, cx| undoable(m, v, "The goal no longer waits for it. It stays in the backlog", cx));
 }
 
 pub fn ticket(m: &mut MainWindow, r: &str, cx: &mut Context<MainWindow>) {
@@ -652,7 +759,25 @@ pub fn ticket(m: &mut MainWindow, r: &str, cx: &mut Context<MainWindow>) {
 
 pub fn drop_issue(m: &mut MainWindow, r: &str, cx: &mut Context<MainWindow>) {
     keep_issue(m, r);
-    run(m, format!("drop::{r}"), format!("issue:{r}"), format!("backlog/{r}/drop"), json!({}), cx, |_, _, _| Some("Closed as won’t do".into()));
+    run(m, format!("drop::{r}"), format!("issue:{r}"), format!("backlog/{r}/drop"), json!({}), cx, |m, v, cx| undoable(m, v, "Closed as won’t do", cx));
+}
+
+/// A deferred or won't-do issue, open again.
+pub fn reopen(m: &mut MainWindow, r: &str, cx: &mut Context<MainWindow>) {
+    keep_issue(m, r);
+    run(m, format!("reopen::{r}"), format!("issue:{r}"), format!("backlog/{r}/reopen"), json!({}), cx, |_, _, _| Some("Opened again".into()));
+}
+
+/// What an act the board can take back says: in a toast with Undo when the board answered with the way
+/// back, else in the panel.
+fn undoable(m: &mut MainWindow, v: &Value, said: &str, cx: &mut Context<MainWindow>) -> Option<String> {
+    match v["undo"].as_str() {
+        Some(undo) => {
+            m.toast_undo(said, undo, cx);
+            None
+        }
+        None => Some(said.into()),
+    }
 }
 
 /// "Open T4’s log": the Board, with that task's Log tab.
@@ -785,29 +910,6 @@ pub fn picker_label(goal: bool, value: &str, specials: &[(String, String)], goal
     if value.is_empty() { "Choose a project".into() } else { value.to_string() }
 }
 
-/// Open a picker under the click. `on_pick` runs only when the choice changes (`pickItem`).
-#[allow(clippy::too_many_arguments)]
-pub fn open_picker(
-    m: &mut MainWindow,
-    key: &str,
-    goal: bool,
-    value: String,
-    specials: Vec<(String, String)>,
-    proj: String,
-    at: Point<Pixels>,
-    window: &mut Window,
-    cx: &mut Context<MainWindow>,
-    on_pick: impl Fn(&mut MainWindow, String, &mut Context<MainWindow>) + 'static,
-) {
-    let q = kit::Input::new(cx, if goal { "Search goals by name, project or epic" } else { "Search projects" }, false);
-    window.focus(&q.focus, cx);
-    let items = picker_items(goal, &value, &specials, &proj, "", m.state(), &m.data.goals);
-    let active = items.iter().position(|it| it.v == value).unwrap_or(0);
-    m.issue_panel.picker = Some(Picker { key: key.to_string(), goal, value, specials, proj, q, active, fixed: None, restore: None, on_pick: std::rc::Rc::new(on_pick) });
-    m.menu = Some((key.to_string(), at));
-    cx.notify();
-}
-
 /// A page's project filter: the picked project ("All projects" for `all`) and a ▾. A click opens
 /// a searchable picker of `projects` (each with its count); `on_pick` gets `all` or a name.
 pub fn project_filter(
@@ -821,10 +923,35 @@ pub fn project_filter(
     let label = if value == "all" { "All projects".to_string() } else { value.to_string() };
     let projects = projects.to_vec();
     let value = value.to_string();
-    kit::btn_small(t, SharedString::from(format!("{key}-btn")), format!("{label}  ▾")).max_w(px(260.)).overflow_hidden().on_click(cx.listener(move |m, e: &ClickEvent, window, cx| {
+    kit::btn_small(t, SharedString::from(format!("{key}-btn")), format!("{label}  ▾")).max_w(px(260.)).overflow_hidden().child(kit::anchor(key)).on_click(cx.listener(move |m, e: &ClickEvent, window, cx| {
         let p = e.position();
         open_project_filter(m, key, &value, &projects, point(p.x - px(10.), p.y + px(14.)), window, cx, on_pick.clone());
     }))
+}
+
+/// The picked project's areas beside its [`project_filter`]: "All" (with `all`, the project's
+/// count), then each area with its count. `on_pick` gets the area, or None for All.
+pub fn area_chips(
+    t: &Theme,
+    id: &str,
+    all: i64,
+    areas: &[(String, i64)],
+    picked: Option<&str>,
+    cx: &mut Context<MainWindow>,
+    on_pick: impl Fn(&mut MainWindow, Option<String>, &mut Context<MainWindow>) + Clone + 'static,
+) -> Div {
+    let labels: Vec<String> = std::iter::once(format!("All {all}")).chain(areas.iter().map(|(a, n)| format!("{a} {n}"))).collect();
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let on = picked.and_then(|p| areas.iter().position(|(a, _)| a == p)).map_or(0, |i| i + 1);
+    let names: Vec<String> = areas.iter().map(|(a, _)| a.clone()).collect();
+    kit::seg(t, id, &refs, on, |i, item| {
+        let (f, pick) = (on_pick.clone(), i.checked_sub(1).map(|k| names[k].clone()));
+        item.on_click(cx.listener(move |m, _, _, cx| {
+            if i != on {
+                f(m, pick.clone(), cx);
+            }
+        }))
+    })
 }
 
 /// Opens a page's project filter at `at` (see [`project_filter`]), focusing its search field.
@@ -928,6 +1055,7 @@ fn pick(m: &mut MainWindow, v: String, window: &mut Window, cx: &mut Context<Mai
 pub fn render_picker(m: &mut MainWindow, t: &Theme, window: &mut Window, cx: &mut Context<MainWindow>) -> Option<AnyElement> {
     let p = m.issue_panel.picker.as_ref()?;
     let at = m.menu_open(&p.key)?;
+    let key = p.key.clone();
     let q = p.q.text(cx);
     let items = p.items(&q, m.state(), &m.data.goals);
     let active = p.active.min(items.len().saturating_sub(1));
@@ -1008,7 +1136,7 @@ pub fn render_picker(m: &mut MainWindow, t: &Theme, window: &mut Window, cx: &mu
         .child(div().p(px(8.)).child(field))
         .child(list)
         .child(foot);
-    Some(kit::popover(at, card))
+    Some(kit::menu_under(&key, kit::Align::Left, at, card))
 }
 
 /// The button that opens a picker: a search glyph and the label (`pickerButton`).
@@ -1025,74 +1153,51 @@ pub fn note_el(t: &Theme, n: &Option<(String, bool)>) -> Option<Div> {
 
 /// A button for an [`Act`]: `primary` / plain / `ghost` styles as the web board's classes.
 pub fn act_button(t: &Theme, id: impl Into<ElementId>, a: &Act, style: &str, small: bool) -> Stateful<Div> {
-    let b = match style {
-        "primary" => kit::btn_primary(t, id, a.label.clone()),
-        "soft" => kit::btn(t, id, a.label.clone()).bg(t.accent_soft).border_color(t.accent_line).text_color(t.accent_fg),
-        "ghost" => {
-            let h = t.panel_2;
-            div()
-                .id(id)
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .h(px(30.))
-                .px(px(12.))
-                .rounded(px(8.))
-                .text_color(t.muted)
-                .text_size(px(13.))
-                .font_weight(FontWeight::MEDIUM)
-                .whitespace_nowrap()
-                .cursor_pointer()
-                .hover(move |s| s.bg(h))
-                .child(a.label.clone())
-        }
-        _ => kit::btn(t, id, a.label.clone()),
+    let size = if small { kit::Size::Small } else { kit::Size::Regular };
+    let kind = match style {
+        "primary" => kit::Kind::Primary,
+        "ghost" => kit::Kind::Quiet,
+        _ => kit::Kind::Secondary,
     };
-    // `.btn` is 36px tall, padding 0 14px (`.ghost` 0 10px), radius 8px, 13px; primary is bold.
-    let b = if small {
-        b.h(px(26.)).px(px(10.)).rounded(px(7.)).text_size(px(12.5))
-    } else {
-        let b = b.h(px(36.)).px(px(if style == "ghost" { 10. } else { 14. })).rounded(px(8.)).text_size(px(13.));
-        match style {
-            "primary" => b.font_weight(FontWeight::SEMIBOLD),
-            "ghost" => b,
-            _ => b.font_weight(FontWeight::NORMAL).border_color(t.border),
-        }
-    };
+    let b = kit::button(t, id, a.label.clone(), kind, size);
+    let b = if style == "soft" { b.bg(t.accent_soft).border_color(t.accent_line).text_color(t.accent_fg) } else { b };
     if a.busy { kit::disabled(b) } else { b }
 }
 
-/// Buttons for [`issue_actions`], wired.
+/// An issue's buttons, wired: the first one is the main one.
 pub fn action_row(t: &Theme, r: &str, acts: &[Act], small: bool, id: &str, cx: &mut Context<MainWindow>) -> Div {
     let mut row = div().flex().flex_wrap().items_center().gap(px(if small { 6. } else { 8. }));
-    for a in acts {
-        let style = match (a.act, small) {
-            ("promote", true) => "soft",
-            ("promote", false) => "primary",
-            ("drop", _) => "ghost",
+    for (n, a) in acts.iter().enumerate() {
+        let style = match (n, small) {
+            (0, true) => "soft",
+            (0, false) => "primary",
             _ => "",
         };
-        let b = act_button(t, SharedString::from(format!("{id}-{}-{r}", a.act)), a, style, small);
-        let (rr, act, arg) = (r.to_string(), a.act, a.arg);
-        row = row.child(if a.busy {
-            b
-        } else {
-            b.on_click(cx.listener(move |m, _, _, cx| {
-                cx.stop_propagation();
-                match act {
-                    "promote" => promote(m, &rr, arg, cx),
-                    "ticket" => ticket(m, &rr, cx),
-                    _ => drop_issue(m, &rr, cx),
-                }
-            }))
-        });
+        row = row.child(act_el(t, r, a, style, small, id, cx));
     }
     row
 }
 
-fn section(t: &Theme, title: &str) -> Div {
-    div().flex().flex_col().gap(px(8.)).child(kit::h3(t, title.to_string()))
+/// One action's button, wired.
+fn act_el(t: &Theme, r: &str, a: &Act, style: &str, small: bool, id: &str, cx: &mut Context<MainWindow>) -> Stateful<Div> {
+    let b = act_button(t, SharedString::from(format!("{id}-{}-{r}", a.act)), a, style, small);
+    let (rr, act, arg) = (r.to_string(), a.act, a.arg);
+    if a.busy {
+        return b;
+    }
+    b.on_click(cx.listener(move |m, _, _, cx| {
+        cx.stop_propagation();
+        match act {
+            "pick" => select_for_goal(m, &rr, cx),
+            "promote" => promote(m, &rr, arg, cx),
+            "ticket" | "without" | "drop" if crate::ui::modals::ask_last_miss(m, &rr, act, cx) => {}
+            "ticket" => ticket(m, &rr, cx),
+            "defer" => defer(m, &rr, cx),
+            "without" => finish_without(m, &rr, cx),
+            "reopen" => reopen(m, &rr, cx),
+            _ => drop_issue(m, &rr, cx),
+        }
+    }))
 }
 
 /// The panel's `.stack` (gap 6px) under a 13px `.h3`.
@@ -1116,21 +1221,11 @@ fn hist_color(t: &Theme, kind: &str) -> Hsla {
     }
 }
 
-/// `issueDetail`, drawn. `compact` is the aside's smaller text.
-pub fn render_detail(t: &Theme, v: &DetailView, compact: bool, cx: &mut Context<MainWindow>) -> Div {
-    let mut history = history_head(t, compact, v.history.is_empty());
-    for (n, h) in v.history.iter().enumerate() {
-        history = history.child(hist_row(t, &v.r, n, h, compact));
-    }
-    detail_sections(t, v, compact, cx).child(history)
-}
-
 /// The detail above the history.
-fn detail_sections(t: &Theme, v: &DetailView, compact: bool, cx: &mut Context<MainWindow>) -> Div {
+fn detail_sections(t: &Theme, v: &DetailView, cx: &mut Context<MainWindow>) -> Div {
     let r = v.r.clone();
     let mut col = div().flex().flex_col().gap(px(18.));
-    let sec = |title: &str, gap: f32| if compact { section(t, title) } else { panel_section(t, title, gap) };
-    let mut how = sec("How it was reported", 6.).child(div().text_size(px(if compact { 13. } else { 14. })).child(sel(t, "issue-how", v.how.clone())));
+    let mut how = panel_section(t, "How it was reported", 6.).child(div().text_size(px(14.)).child(sel(t, "issue-how", v.how.clone())));
     if let Some(said) = &v.said {
         how = how.child(div().text_size(px(14.)).text_color(t.text_2).bg(t.bg).border_l(px(3.)).border_color(t.border_2).rounded_r(px(8.)).px(px(12.)).py(px(8.)).child(sel(t, "issue-said", said.clone())));
     }
@@ -1144,70 +1239,59 @@ fn detail_sections(t: &Theme, v: &DetailView, compact: bool, cx: &mut Context<Ma
     }
     col = col.child(how);
 
-    let mut happening = sec("What was happening", 6.);
+    let mut happening = panel_section(t, "What was happening", 6.);
     if v.snap.is_empty() {
         happening = happening.child(kit::help(t, "No snapshot was saved with this issue."));
     } else {
-        let mut kv = div().flex().flex_col().rounded(px(if compact { 10. } else { 12. })).border_1().border_color(t.border);
+        let mut kv = div().flex().flex_col().rounded(px(12.)).border_1().border_color(t.border);
         for (i, (k, val)) in v.snap.iter().enumerate() {
             kv = kv.child(
                 div()
                     .flex()
-                    .gap(px(if compact { 10. } else { 12. }))
-                    .px(px(if compact { 12. } else { 16. }))
-                    .py(px(if compact { 7. } else { 9. }))
+                    .gap(px(12.))
+                    .px(px(16.))
+                    .py(px(9.))
                     .when(i > 0, |d| d.border_t_1().border_color(t.divider))
-                    .child(div().flex_none().w(px(if compact { 96. } else { 110. })).text_size(px(if compact { 12. } else { 12.5 })).font_weight(FontWeight::SEMIBOLD).text_color(t.muted).child(sel(t, SharedString::from(format!("issue-snap-k-{i}")), k.clone())))
-                    .child(div().flex_1().min_w_0().text_size(px(if compact { 12.5 } else { 13. })).child(sel(t, SharedString::from(format!("issue-snap-v-{i}")), val.clone()))),
+                    .child(div().flex_none().w(px(110.)).text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(t.muted).child(sel(t, SharedString::from(format!("issue-snap-k-{i}")), k.clone())))
+                    .child(div().flex_1().min_w_0().text_size(px(13.)).child(sel(t, SharedString::from(format!("issue-snap-v-{i}")), val.clone()))),
             );
         }
         happening = happening.child(kv);
     }
     if let Some((fr, label)) = v.found_log.clone() {
-        happening = happening.child(div().flex().text_size(px(13.)).child(kit::link(t, SharedString::from(format!("issue-found-log-{r}")), label).when(!compact, |d| d.underline()).on_click(cx.listener(move |m, _, _, cx| open_log(m, &fr, cx)))));
+        happening = happening.child(div().flex().text_size(px(13.)).child(kit::link(t, SharedString::from(format!("issue-found-log-{r}")), label).underline().on_click(cx.listener(move |m, _, _, cx| open_log(m, &fr, cx)))));
     }
     col.child(happening)
 }
 
 /// The History heading, and "Nothing yet." when there's none.
-fn history_head(t: &Theme, compact: bool, empty: bool) -> Div {
-    let history = if compact { section(t, "History") } else { panel_section(t, "History", 8.) };
-    history.when(empty, |d| d.child(kit::help(t, "Nothing yet.")))
+fn history_head(t: &Theme, empty: bool) -> Div {
+    panel_section(t, "History", 8.).when(empty, |d| d.child(kit::help(t, "Nothing yet.")))
 }
 
-/// One history event: time · dot · text.
-fn hist_row(t: &Theme, r: &str, n: usize, h: &HistRow, compact: bool) -> Div {
-    if !compact {
-        // `.hist li`: 52px time · 10px dot · text, gap 8px.
-        let text = match &h.who {
-            Some(w) => div().flex_1().min_w_0().text_size(px(13.5)).child(sel_styled(
-                t,
-                SharedString::from(format!("issue-hist-text-{n}")),
-                format!("{w} · {}", h.what),
-                vec![(0..w.len(), HighlightStyle { font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() })],
-            )),
-            None => div().flex_1().min_w_0().text_size(px(13.5)).child(sel(t, SharedString::from(format!("issue-hist-text-{n}")), h.what.clone())),
-        };
-        return div()
-            .flex()
-            .items_start()
-            .gap(px(8.))
-            .child(div().id(SharedString::from(format!("issue-hist-{r}-{n}"))).flex_none().w(px(52.)).whitespace_nowrap().text_color(t.muted).text_size(px(12.5)).child(h.time.clone()).tooltip(kit::tip(h.full.clone())))
-            .child(div().flex_none().w(px(10.)).pt(px(6.)).child(kit::dot(hist_color(t, &h.kind), 8.)))
-            .child(text);
-    }
+/// One history event (`.hist li`): 52px time · 10px dot · text, gap 8px.
+fn hist_row(t: &Theme, r: &str, n: usize, h: &HistRow) -> Div {
+    let text = match &h.who {
+        Some(w) => div().flex_1().min_w_0().text_size(px(13.5)).child(sel_styled(
+            t,
+            SharedString::from(format!("issue-hist-text-{n}")),
+            format!("{w} · {}", h.what),
+            vec![(0..w.len(), HighlightStyle { font_weight: Some(FontWeight::SEMIBOLD), ..Default::default() })],
+        )),
+        None => div().flex_1().min_w_0().text_size(px(13.5)).child(sel(t, SharedString::from(format!("issue-hist-text-{n}")), h.what.clone())),
+    };
     div()
         .flex()
         .items_start()
-        .gap(px(10.))
-        .text_size(px(13.))
-        .child(div().id(SharedString::from(format!("issue-hist-{r}-{n}"))).flex_none().w(px(64.)).text_color(t.muted).text_size(px(12.)).child(h.time.clone()).tooltip(kit::tip(h.full.clone())))
-        .child(div().flex_none().pt(px(6.)).child(kit::dot(hist_color(t, &h.kind), 7.)))
-        .child(div().flex_1().min_w_0().child(sel(t, SharedString::from(format!("issue-hist-text-{n}")), h.text.clone())))
+        .gap(px(8.))
+        .child(div().id(SharedString::from(format!("issue-hist-{r}-{n}"))).flex_none().w(px(52.)).whitespace_nowrap().text_color(t.muted).text_size(px(12.5)).child(h.time.clone()).tooltip(kit::tip(h.full.clone())))
+        .child(div().flex_none().w(px(10.)).pt(px(6.)).child(kit::dot(hist_color(t, &h.kind), 8.)))
+        .child(text)
 }
 
-/// The issue panel, over whichever page opened it.
-pub fn render(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWindow>) -> AnyElement {
+/// The issue panel. `docked`: it sits beside the page, which stays usable, so clicking another
+/// row swaps what it shows; otherwise it floats over whichever page opened it.
+pub fn render(m: &mut MainWindow, docked: bool, window: &mut Window, cx: &mut Context<MainWindow>) -> AnyElement {
     let t = cx.global::<Theme>().clone();
     let r = match &m.panel {
         Some(Panel::Issue { r }) => r.clone(),
@@ -1234,6 +1318,10 @@ pub fn render(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWind
             .child(kit::help(&t, "Loading…")),
     };
     let picker = m.issue_panel.picker.as_ref().is_some_and(|p| p.fixed.is_none()).then(|| render_picker(m, &t, window, cx)).flatten();
+    if docked {
+        // Beside the page: an edge, no shadow and no scrim. The picker draws over everything itself.
+        return div().id("issue-panel").size_full().bg(t.card).border_l_1().border_color(t.border).occlude().child(body).children(picker).into_any_element();
+    }
     deferred(
         // The web's `.panel` sits over the board without dimming it; a click outside still closes it.
         kit::scrim(&t, "issue-scrim")
@@ -1305,27 +1393,33 @@ fn panel_sheet(m: &mut MainWindow, t: &Theme, b: &Value, empty: bool, cx: &mut C
     // The history's rows follow as the list's own items; the end item gives the bottom padding.
     let mut col = div().flex().flex_col().gap(px(18.)).px(px(24.)).pt(px(24.)).line_height(relative(1.5)).child(top)
         .child(title);
-    match &v.open_box {
-        Some((what, acts)) => {
-            col = col.child(
+    if let Some(mv) = &v.miss {
+        let mut choices = div().flex().flex_col().gap(px(8.));
+        for (n, (a, what)) in mv.acts.iter().enumerate() {
+            let b = act_el(t, &r, a, if n == 0 { "primary" } else { "" }, false, "issue", cx).w(px(176.)).flex_none();
+            choices = choices.child(div().flex().items_center().gap(px(16.)).child(b).child(div().flex_1().min_w_0().text_size(px(12.5)).text_color(t.muted).child(what.clone())));
+        }
+        col = col
+            .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(10.))
-                    .px(px(16.))
-                    .py(px(14.))
-                    .rounded(px(12.))
-                    .bg(accent_tint(t))
-                    .border_1()
-                    .border_color(t.accent_line)
-                    .child(div().text_size(px(13.)).child(sel(t, "issue-open-what", what.clone())))
-                    .child(action_row(t, &r, acts, false, "issue", cx))
-                    .children(note_el(t, &v.note)),
+                    .gap(px(4.))
+                    .px(px(12.))
+                    .py(px(10.))
+                    .rounded(px(10.))
+                    .bg(t.goal_tint)
+                    .text_color(t.goal)
+                    .text_size(px(12.5))
+                    .child(div().font_weight(FontWeight::BOLD).child(sel(t, "issue-miss-head", mv.head.clone())))
+                    .children(mv.done_when.clone().map(|d| sel(t, "issue-miss-done", d))),
             )
-        }
-        None => col = col.children(note_el(t, &v.note)),
+            .child(choices);
+    } else if !v.acts.is_empty() {
+        col = col.child(action_row(t, &r, &v.acts, false, "issue", cx));
     }
-    col.child(detail_sections(t, &v.detail, false, cx)).child(history_head(t, false, empty))
+    col = col.children(note_el(t, &v.note));
+    col.child(detail_sections(t, &v.detail, cx)).child(history_head(t, empty))
 }
 
 /// "Blocks PR" or "Blocks goal" and its why, for an item that holds its task's PR or its goal.
@@ -1360,8 +1454,7 @@ fn web_pill(t: &Theme, fg: Hsla, bg: Hsla, text: impl Into<SharedString>, mono: 
 /// `.icon-btn` (36px, bordered) holding `ICON.x`.
 fn close_btn(t: &Theme) -> Stateful<Div> {
     let hover = t.border_2;
-    div()
-        .id("issue-close")
+    focus::stop(t, div().id("issue-close"))
         .flex()
         .flex_none()
         .items_center()
@@ -1377,51 +1470,10 @@ fn close_btn(t: &Theme) -> Stateful<Div> {
         .child(kit::glyph(kit::Glyph::X, 16., t.muted))
 }
 
-/// `--accent-tint` (#f5f8ff light, #172036 dark), which the theme doesn't carry.
-fn accent_tint(t: &Theme) -> Hsla {
-    if matches!(t.mode, crate::theme::ThemeMode::Dark) { rgb(0x172036).into() } else { rgb(0xf5f8ff).into() }
-}
-
-/// `issueAside`: the issue (and its view) beside the Backlog page's list. None = still loading
-/// (or `err`).
-pub fn render_aside(t: &Theme, issue: Option<(&Value, &AsideView)>, err: Option<&str>, cx: &mut Context<MainWindow>) -> AnyElement {
-    let card = div().flex().flex_col().gap(px(16.)).p(px(18.)).rounded(px(14.)).border_1().border_color(t.border).bg(t.card);
-    let Some((b, v)) = issue else {
-        return card.child(div().text_size(px(13.)).text_color(if err.is_some() { t.down } else { t.muted }).child(err.unwrap_or("Loading…").to_string())).into_any_element();
-    };
-    let head = div()
-        .flex()
-        .flex_col()
-        .gap(px(6.))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .child({
-                    let (fg, bg) = kind_colors(t, s(b, "kind"));
-                    kit::pill(fg, bg, v.kind.clone())
-                })
-                .when_some(blocks_label(b), |d, (pill, _)| d.child(kit::pill(t.warn_text, t.warn_soft, pill)))
-                .child(div().flex_1().min_w_0().text_size(px(12.5)).text_color(t.muted).child(v.help.clone()))
-                .child(kit::chip(t, v.r.clone())),
-        )
-        .child(div().text_size(px(17.)).font_weight(FontWeight::BOLD).line_height(px(23.)).child(sel(t, "aside-title", v.title.clone())))
-        .when_some(blocks_label(b).and_then(|(_, why)| why), |d, why| d.child(div().text_size(px(12.5)).text_color(t.warn_text).child(sel(t, "aside-blocks-why", why))))
-        .when_some(v.open_task.clone(), |d, tr| {
-            let label = format!("Open task {tr}");
-            d.child(div().flex().text_size(px(12.5)).child(kit::link(t, "aside-open-task", label).on_click(cx.listener(move |m, _, _, cx| m.open_task(tr.clone(), cx)))))
-        });
-    card.child(head)
-        .children(err.map(|e| div().text_size(px(12.5)).text_color(t.down).child(e.to_string())))
-        .child(render_detail(t, &v.detail, true, cx))
-        .into_any_element()
-}
-
 #[cfg(test)]
 mod tests {
     // Not `super::*`: that brings GPUI's `test` attribute, which `#[gpui_kit::test]` then recurses on.
-    use super::{Ctx, drop_issue, filter_items, home_tilde, issue_from, issue_how, issue_state, kind_label, panel_view, picker_items, picker_label, promote, search, snap_rows, ticket};
+    use super::{Ctx, defer, drop_issue, filter_items, finish_without, home_tilde, panel_head, select_for_goal, issue_from, issue_how, issue_state, issue_task, kind_label, panel_view, picker_items, picker_label, promote, reopen, search, snap_rows, ticket};
     use crate::app::Panel;
     use crate::backend::Backend;
     use crate::fmt::{self, arr, s};
@@ -1473,6 +1525,21 @@ mod tests {
             let (text, acts) = panel_view(&fix.ctx(), &i["issue"]).text_and_acts();
             json!({"text": text, "acts": acts})
         });
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_fixed_issue_says_fixed_and_opens_the_task_that_fixed_it() {
+        let b = json!({"id": 3, "state": "drop", "closed_as": "fixed", "fixed_by": 12, "fixed_pr": "https://github.com/o/r/pull/45"});
+        assert_eq!(issue_state(&b), Some(("Fixed".to_string(), "Closed as fixed by T12".to_string())));
+        assert_eq!(issue_task(&b).as_deref(), Some("T12"));
+        let pr_only = json!({"state": "drop", "closed_as": "fixed", "fixed_pr": "https://github.com/o/r/pull/45"});
+        assert_eq!(issue_state(&pr_only).map(|x| x.1).as_deref(), Some("Closed as fixed by PR #45"));
+        assert!(issue_task(&pr_only).is_none());
+        let tidied = json!({"state": "drop", "closed_as": "fixed"});
+        assert_eq!(issue_state(&tidied).map(|x| x.1).as_deref(), Some("Closed as fixed"));
+        let wont = json!({"state": "drop", "fixed_by": 12});
+        assert_eq!(issue_state(&wont).map(|x| x.0).as_deref(), Some("Won’t do"));
+        assert!(issue_task(&wont).is_none(), "only a fixed close links a task");
     }
 
     #[::core::prelude::v1::test]
@@ -1542,7 +1609,25 @@ mod tests {
         w.update(cx, |m, _, cx| drop_issue(m, &r, cx)).unwrap();
         parity::settle(cx);
         assert_eq!(rec.last(&format!("backlog/{r}/drop")), Some(json!({})));
-        w.update(cx, |m, _, _| assert_eq!(m.issue_panel.notes.get(&format!("issue:{r}")).map(|n| n.0.clone()), Some("Closed as won’t do".into()))).unwrap();
+        // Won't do can be taken back, so it says so in a toast with Undo rather than in the panel.
+        w.update(cx, |m, _, _| {
+            let t = m.toasts.last().expect("a toast");
+            assert_eq!(t.text, "Closed as won’t do");
+            assert!(t.undo.as_deref().is_some_and(|u| u.starts_with("backlog/undo/")), "{:?}", t.undo);
+            assert!(m.issue_panel.notes.get(&format!("issue:{r}")).is_none());
+        })
+        .unwrap();
+        // Closed as won't do, it offers only Reopen.
+        let closed = rec.board().get(&format!("backlog/{r}"), &[]).unwrap();
+        w.update(cx, |m, _, cx| {
+            let acts: Vec<_> = panel_head(&Ctx::of(m), &closed).acts.iter().map(|a| a.act).collect();
+            assert_eq!(acts, ["reopen"]);
+            reopen(m, &r, cx);
+        })
+        .unwrap();
+        parity::settle(cx);
+        assert_eq!(rec.last(&format!("backlog/{r}/reopen")), Some(json!({})));
+        assert_eq!(rec.board().get(&format!("backlog/{r}"), &[]).unwrap()["state"], "open");
     }
 
     #[gpui_kit::test]
@@ -1557,6 +1642,112 @@ mod tests {
         parity::settle(cx);
         assert_eq!(rec.last(&format!("backlog/{r}/promote")), Some(json!({"where": "board"})));
         w.update(cx, |m, _, _| assert!(matches!(&m.panel, Some(Panel::Task { .. })), "the new task's panel opens")).unwrap();
+    }
+
+    #[test]
+    fn only_the_last_miss_on_finished_work_finishes_the_goal() {
+        assert!(super::finishes_goal(&json!({"total": 2, "done": 2, "misses": 1})));
+        assert!(!super::finishes_goal(&json!({"total": 2, "done": 2, "misses": 2})), "another miss still holds it");
+        assert!(!super::finishes_goal(&json!({"total": 2, "done": 1, "misses": 1})), "work is left");
+    }
+
+    #[gpui_kit::test]
+    fn settling_the_last_miss_asks_before_it_finishes_the_goal(cx: &mut gpui_kit::TestAppContext) {
+        let (w, rec) = parity::window(cx);
+        let g = rec.board().post("goals", json!({"name": "Ship it", "project": "webapp", "outcome": "Sign-in works offline"})).unwrap()["id"].as_i64().unwrap();
+        let r = add_issue(&rec, json!({"title": "Offline sign-in fails", "kind": "bug", "project": "webapp", "goal_id": g, "misses_goal": true}));
+        w.update(cx, |m, _, cx| m.open_issue(r.clone(), cx)).unwrap();
+        parity::settle(cx);
+        w.update(cx, |m, _, cx| {
+            for x in std::rc::Rc::make_mut(&mut m.data.goals).iter_mut().filter(|x| x["id"].as_i64() == Some(g)) {
+                *x = json!({"id": g, "ref": format!("G{g}"), "total": 1, "done": 1, "misses": 1, "outcome": "Sign-in works offline"});
+            }
+            let b = m.data.issue.clone().unwrap();
+            let mv = panel_head(&Ctx::of(m), &b).miss.unwrap();
+            assert_eq!(mv.head, format!("Last thing holding G{g} open."));
+            assert!(crate::ui::modals::ask_last_miss(m, &r, "drop", cx), "it asks first");
+            assert!(matches!(&m.modal, Some(crate::ui::modals::Modal::LastMiss(x)) if x.r == r && x.act == "drop" && x.goal == format!("G{g}")));
+        })
+        .unwrap();
+        assert_eq!(rec.last(&format!("backlog/{r}/drop")), None, "nothing is sent before the yes");
+        w.update(cx, |m, _, cx| {
+            std::rc::Rc::make_mut(&mut m.data.goals).iter_mut().filter(|x| x["id"].as_i64() == Some(g)).for_each(|x| x["misses"] = json!(2));
+            m.modal = None;
+            assert!(!crate::ui::modals::ask_last_miss(m, &r, "drop", cx), "another miss: it acts at once");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_miss_names_its_goal_and_what_each_choice_does(cx: &mut gpui_kit::TestAppContext) {
+        let (w, rec) = parity::window(cx);
+        let g = rec.board().post("goals", json!({"name": "Ship it", "project": "webapp", "outcome": "Sign-in works offline"})).unwrap()["id"].as_i64().unwrap();
+        let r = add_issue(&rec, json!({"title": "Offline sign-in fails", "kind": "bug", "project": "webapp", "goal_id": g, "misses_goal": true}));
+        add_issue(&rec, json!({"title": "Spinner never stops", "kind": "bug", "project": "webapp", "goal_id": g, "misses_goal": true}));
+        let plain = add_issue(&rec, json!({"title": "Add retries", "kind": "follow", "project": "webapp", "goal_id": null}));
+        w.update(cx, |m, _, cx| m.open_issue(r.clone(), cx)).unwrap();
+        parity::settle(cx);
+        w.update(cx, |m, _, _| {
+            let b = m.data.issue.clone().unwrap();
+            let v = panel_head(&Ctx::of(m), &b);
+            assert!(v.acts.is_empty(), "a miss offers its choices in the goal's box");
+            let mv = v.miss.expect("the goal's box");
+            assert_eq!(mv.head, format!("Holds G{g} open, with 1 other miss."));
+            assert_eq!(mv.done_when.as_deref(), Some("Done when: Sign-in works offline"));
+            let choices: Vec<_> = mv.acts.iter().map(|(a, what)| (a.label.as_str(), what.as_str())).collect();
+            assert_eq!(choices[0], ("Make it a task", &*format!("G{g} stays open until the task is done.")));
+            assert_eq!(choices.last().unwrap(), &("Finish without it", &*format!("Stays in the backlog. G{g} stops waiting for it.")));
+        })
+        .unwrap();
+        w.update(cx, |m, _, cx| finish_without(m, &r, cx)).unwrap();
+        parity::settle(cx);
+        assert_eq!(rec.last(&format!("backlog/{r}/without-goal")), Some(json!({})));
+
+        w.update(cx, |m, _, cx| m.open_issue(plain.clone(), cx)).unwrap();
+        parity::settle(cx);
+        w.update(cx, |m, _, _| {
+            let v = panel_head(&Ctx::of(m), m.data.issue.as_ref().unwrap());
+            assert!(v.miss.is_none());
+            let labels: Vec<_> = v.acts.iter().map(|a| a.act).collect();
+            assert_eq!(labels.first(), Some(&"pick"), "Select for goal comes first while it's in no goal");
+            assert!(labels.contains(&"defer") && labels.contains(&"drop"));
+            assert!(v.state_line.starts_with("Open · reported at "), "{}", v.state_line);
+        })
+        .unwrap();
+        w.update(cx, |m, _, cx| defer(m, &plain, cx)).unwrap();
+        parity::settle(cx);
+        assert_eq!(rec.last("backlog/bulk"), Some(json!({"ids": [plain.clone()], "action": "defer"})));
+        let other = add_issue(&rec, json!({"title": "Retry the upload", "kind": "follow", "project": "webapp", "goal_id": null}));
+        w.update(cx, |m, _, cx| {
+            m.open_issue(other.clone(), cx);
+            select_for_goal(m, &other, cx);
+        })
+        .unwrap();
+        parity::settle(cx);
+        w.update(cx, |m, _, _| {
+            assert!(m.backlog.picked.contains(&other), "it joins the new goal's picks");
+            assert!(m.panel.is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn making_a_miss_a_task_joins_the_plan_of_a_goal_that_isnt_running(cx: &mut gpui_kit::TestAppContext) {
+        let (w, rec) = parity::window(cx);
+        let g = rec.board().post("goals", json!({"name": "Ship it", "project": "webapp"})).unwrap()["id"].as_i64().unwrap();
+        let r = add_issue(&rec, json!({"title": "Offline sign-in fails", "kind": "bug", "project": "webapp", "goal_id": g, "misses_goal": true}));
+        w.update(cx, |m, _, cx| m.open_issue(r.clone(), cx)).unwrap();
+        parity::settle(cx);
+        w.update(cx, |m, _, cx| promote(m, &r, "board", cx)).unwrap();
+        parity::settle(cx);
+        w.update(cx, |m, _, _| {
+            let toast = m.toasts.last().map(|t| t.text.clone()).unwrap_or_default();
+            assert!(toast.starts_with(&format!("Made {r} into T")), "{toast}");
+            assert!(toast.ends_with(&format!(" as planned work in G{g}. It starts when you start G{g}")), "the goal isn't running, so the task joins its plan: {toast}");
+            assert!(m.backlog.open_toast.as_ref().is_some_and(|(_, t)| t.starts_with('T')), "the toast offers Open it");
+            assert!(m.panel.is_none(), "the panel closes");
+        })
+        .unwrap();
     }
 
     fn draw(cx: &mut gpui_kit::TestAppContext, w: &gpui_kit::WindowHandle<crate::app::MainWindow>) {

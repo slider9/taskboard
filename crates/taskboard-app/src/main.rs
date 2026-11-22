@@ -5,19 +5,25 @@
 //!   no runner, no Midna).
 //! - `TASKBOARD_URL` — where taskboardd answers (default from `config.toml`: 127.0.0.1:8792).
 //! - `TASKBOARD_THEME=dark|light` — override the system appearance.
-//! - `TASKBOARD_PAGE=board|backlog|sessions|settings|G3|releases:webapp`, `TASKBOARD_OPEN=T2|B1` — initial page / panel.
+//! - `TASKBOARD_PAGE=board|backlog|goals|projects|days|recap|review|ideas|releases|releases:webapp|G3|I2|settings`,
+//!   `TASKBOARD_OPEN=T2|B1` — initial page / panel. Anything else opens Needs you (the board).
 //! - `TASKBOARD_FAKE_RELEASES=1` — with the fake backend, sample releases and a pending cut too.
 //! - `TASKBOARD_FAKE_STOPPED=1` — with the fake backend, two tasks whose terminals were closed by hand.
 //! - `TASKBOARD_FAKE_NEEDS=1` — with the fake backend, misses, an alert, to-dos and items put off on Needs you.
+//! - `TASKBOARD_FAKE_STOPS=1` — with the fake backend, goals stopped at a failed, held and review wave, a paused goal and a chained one.
 //! - `TASKBOARD_FAKE_QUIET=1` — with the fake backend, work gone quiet under Agents waiting.
+//! - `TASKBOARD_FAKE_RECAPS=1` — with the fake backend, this week's and this month's recaps, unseen.
+//! - `TASKBOARD_FAKE_JIRA=1` — with the fake backend, Jira set up (acme.atlassian.net, QA on) and GitHub, Slack and Jira connected.
 //! - `TASKBOARD_W` / `TASKBOARD_H` — window size.
 //! - `taskboard://task/T12` (also `goal/G3`, `issue/B7`, `session/<id>`) opens that page; the
 //!   daemon's notifications link there. `TASKBOARD_LINK=<url>` follows one at startup.
 //! - `TASKBOARD_DEV=1` — dev mode even inside a bundle: no install / login item. See `install.rs`.
 //! - `TASKBOARD_PICK=B2,B3` — check these issues on the Backlog page.
-//! - `TASKBOARD_SNAPSHOT=out.png` (feature `snapshot`) — draw the window offscreen, save, quit;
-//!   `TASKBOARD_SNAPSHOT_MOUSE=x,y` moves the mouse there first (hover cards and tooltips),
-//!   `TASKBOARD_SNAPSHOT_CLICK=x,y;x,y` clicks there in turn first (menus and opened rows).
+//! - `TASKBOARD_FAKE_PLAN=B2,B3` — with the fake backend, the Backlog's new goal already planned for these.
+//! - `TASKBOARD_NO_ACTIVATE=1` — don't take focus on launch.
+//! - `SLATE=1` (set by `slate shoot` / `slate drive`, see `scripts/slate.sh`) — run hidden below
+//!   the desktop, never focused, and shoot or drive the main window, or Settings with
+//!   `TASKBOARD_PAGE=settings` (`hidden.rs`). Debug and `snapshot` builds only.
 //!
 //! A release build on Windows is a windowed program: no console opens with it, so its daemon
 //! supervisor (`--daemon`) runs unseen. Debug builds keep the console, for `cargo run`.
@@ -26,10 +32,13 @@ mod app;
 mod backend;
 mod fingerprint;
 mod fmt;
+mod hidden;
 mod hooks;
 mod install;
 mod log;
+mod menu_bar;
 mod prefs;
+mod relaunch;
 mod settings;
 #[cfg(test)]
 mod parity;
@@ -42,7 +51,7 @@ mod win;
 use gpui_kit::*;
 use theme::Theme;
 
-actions!(taskboard, [Quit, Hide, HideOthers, ShowAll, CloseWindow, OpenSettings, OpenSystemSettings, ExportForDebugging]);
+actions!(taskboard, [Quit, Hide, HideOthers, ShowAll, CloseWindow, OpenSettings, OpenSystemSettings, OpenUsageSettings, OpenHoursSettings, ExportForDebugging]);
 
 /// Writes the same redacted zip as `tb export` into Downloads and shows it in Finder (Explorer on
 /// Windows), off the UI thread.
@@ -137,12 +146,16 @@ fn main() {
             std::mem::forget(lock);
         }
     }
-    let application = gpui_kit::application();
+    // Under `slate shoot` / `slate drive` (SLATE=1) the app runs hidden: an accessory app whose
+    // window sits below the desktop without focus (hidden.rs). Unchanged otherwise.
+    let application = hidden::application(gpui_kit::application());
     application.on_open_urls(move |urls| drop(link_tx.try_send(urls)));
     application.run(move |cx| {
         let (ui_font, mono_font) = theme::load_fonts(cx);
         let system_dark = matches!(cx.window_appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
         cx.set_global(Theme::new(theme::startup_mode(system_dark), ui_font, mono_font));
+        // Entrances and transitions stay still when the Mac asks for less motion.
+        gpui_kit::base::apply_system_reduce_motion(cx);
         app::bind_keys(cx);
         // `secondary` is ⌘ on macOS and Ctrl on Windows.
         cx.bind_keys([
@@ -163,6 +176,18 @@ fn main() {
                 let _ = h.update(cx, |s, _, cx| s.show_system(cx));
             }
         });
+        let b = backend.clone();
+        cx.on_action(move |_: &OpenUsageSettings, cx| {
+            if let Some(h) = settings::open(b.clone(), cx) {
+                let _ = h.update(cx, |s, _, cx| s.show_usage(cx));
+            }
+        });
+        let b = backend.clone();
+        cx.on_action(move |_: &OpenHoursSettings, cx| {
+            if let Some(h) = settings::open(b.clone(), cx) {
+                let _ = h.update(cx, |s, _, cx| s.show_hours(cx));
+            }
+        });
         cx.on_action(|_: &ExportForDebugging, _| export_for_debugging());
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &Hide, cx| cx.hide());
@@ -173,46 +198,9 @@ fn main() {
                 let _ = w.update(cx, |_, window, _| window.remove_window());
             }
         });
-        let mut app_menu = vec![MenuItem::action("Settings…", OpenSettings), MenuItem::separator()];
-        if cfg!(target_os = "macos") {
-            app_menu.extend([
-                MenuItem::action("Hide Task board", Hide),
-                MenuItem::action("Hide Others", HideOthers),
-                MenuItem::action("Show All", ShowAll),
-                MenuItem::separator(),
-            ]);
-        }
-        app_menu.push(MenuItem::action("Quit Task board", Quit));
-        cx.set_menus(vec![
-            Menu { name: "Task board".into(), items: app_menu, disabled: false },
-            Menu {
-                name: "File".into(),
-                items: if backend.label() == "fake" {
-                    vec![MenuItem::action("Close Window", CloseWindow)]
-                } else {
-                    vec![MenuItem::action("Close Window", CloseWindow), MenuItem::separator(), MenuItem::action("Export for Debugging…", ExportForDebugging)]
-                },
-                disabled: false,
-            },
-            Menu {
-                name: "View".into(),
-                items: vec![
-                    MenuItem::action("Needs you", app::GoBoard),
-                    MenuItem::action("Projects", app::GoProjects),
-                    MenuItem::action("Goals", app::GoGoals),
-                    MenuItem::action("Backlog", app::GoBacklog),
-                    MenuItem::action("Days", app::GoDays),
-                    MenuItem::separator(),
-                    MenuItem::action("Search…", app::Search),
-                    MenuItem::separator(),
-                    MenuItem::action("Back", app::NavBack),
-                    MenuItem::action("Forward", app::NavForward),
-                    MenuItem::separator(),
-                    MenuItem::action("Refresh", app::Refresh),
-                ],
-                disabled: false,
-            },
-        ]);
+        menu_bar::bind_keys(cx);
+        menu_bar::on_app_actions(backend.label() == "fake", cx);
+        cx.set_menus(menu_bar::menus(backend.label() == "fake", &app::Page::Board, "Needs you", true));
         // Installed: register the daemon's LaunchAgent and link `tb` (off the UI thread).
         install::start(backend.label());
         // Installed release builds: check GitHub for a newer release now and then.
@@ -233,8 +221,14 @@ fn main() {
             focus: std::env::var("TASKBOARD_NO_ACTIVATE").is_err(),
             ..Default::default()
         };
+        let opts = hidden::main_options(opts, cx);
         let b = backend.clone();
-        let handle = cx.open_window(opts, |window, cx| cx.new(|cx| app::MainWindow::new(b, window, cx))).expect("open main window");
+        let handle = cx
+            .open_window(opts, |window, cx| {
+                hidden::attach_main(window, cx);
+                cx.new(|cx| app::MainWindow::new(b, window, cx))
+            })
+            .expect("open main window");
         cx.spawn(async move |cx| {
             while let Ok(urls) = link_rx.recv().await {
                 cx.update(|cx| {
@@ -242,95 +236,32 @@ fn main() {
                     if urls.iter().any(|u| u == "--quit") {
                         return cx.quit();
                     }
-                    cx.activate(true);
-                    // GPUI's Windows backend doesn't activate the app, only a window.
-                    if cfg!(windows) {
-                        let _ = handle.update(cx, |_, window, _| window.activate_window());
+                    if !hidden::enabled() {
+                        cx.activate(true);
+                        // GPUI's Windows backend doesn't activate the app, only a window.
+                        if cfg!(windows) {
+                            let _ = handle.update(cx, |_, window, _| window.activate_window());
+                        }
                     }
                     for u in &urls {
-                        let _ = handle.update(cx, |m, _, cx| m.open_link(u, cx));
+                        let _ = handle.update(cx, |m, window, cx| m.arrive(u, window, cx));
                     }
                 });
             }
         })
         .detach();
-        let settings_page = std::env::var("TASKBOARD_PAGE").as_deref() == Ok("settings");
-        let settings = settings_page.then(|| settings::open(backend.clone(), cx)).flatten();
-        #[cfg(feature = "snapshot")]
-        snapshot(settings.map_or(handle.into(), Into::into), cx);
-        let _ = settings;
-        let _ = handle;
-        if std::env::var("TASKBOARD_NO_ACTIVATE").is_err() {
+        // Restart to update keeps what's typed, and the new app says it's updated.
+        cx.on_app_quit(move |cx| {
+            let _ = handle.update(cx, |m, _, cx| relaunch::save(m, cx));
+            async {}
+        })
+        .detach();
+        let _ = handle.update(cx, |m, _, cx| relaunch::restore(m, cx));
+        if std::env::var("TASKBOARD_PAGE").as_deref() == Ok("settings") {
+            settings::open(backend.clone(), cx);
+        }
+        if hidden::may_activate() {
             cx.activate(true);
         }
     });
-}
-
-/// Dev: render the main window offscreen to `TASKBOARD_SNAPSHOT` after
-/// `TASKBOARD_SNAPSHOT_DELAY_MS` (default 1500), then quit.
-#[cfg(feature = "snapshot")]
-fn snapshot(any: AnyWindowHandle, cx: &mut App) {
-    let Ok(path) = std::env::var("TASKBOARD_SNAPSHOT") else {
-        return;
-    };
-    let delay: u64 = std::env::var("TASKBOARD_SNAPSHOT_DELAY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
-    cx.spawn(async move |cx| {
-        cx.background_executor().timer(std::time::Duration::from_millis(delay)).await;
-        let spot = |v: &str| {
-            let (x, y) = v.split_once(',')?;
-            Some(point(px(x.trim().parse().ok()?), px(y.trim().parse().ok()?)))
-        };
-        let clicks = std::env::var("TASKBOARD_SNAPSHOT_CLICK").unwrap_or_default();
-        for position in clicks.split(';').filter_map(spot) {
-            let _ = cx.update_window(any, |_, window, cx| {
-                window.refresh();
-                window.draw(cx).clear(cx);
-                window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: None, modifiers: Modifiers::default() }), cx);
-                window.refresh();
-                window.draw(cx).clear(cx);
-                let (button, modifiers, click_count) = (MouseButton::Left, Modifiers::default(), 1);
-                window.dispatch_event(PlatformInput::MouseDown(MouseDownEvent { button, position, modifiers, click_count, first_mouse: false }), cx);
-                window.dispatch_event(PlatformInput::MouseUp(MouseUpEvent { button, position, modifiers, click_count }), cx);
-            });
-            cx.background_executor().timer(std::time::Duration::from_millis(400)).await;
-        }
-        let mouse = std::env::var("TASKBOARD_SNAPSHOT_MOUSE").ok().and_then(|v| spot(&v));
-        if let Some(position) = mouse {
-            for _ in 0..2 {
-                let _ = cx.update_window(any, |_, window, cx| {
-                    window.refresh();
-                    window.draw(cx).clear(cx);
-                    window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent { position, pressed_button: None, modifiers: Modifiers::default() }), cx);
-                });
-                cx.background_executor().timer(std::time::Duration::from_millis(200)).await;
-            }
-            for _ in 0..5 {
-                cx.background_executor().timer(std::time::Duration::from_millis(400)).await;
-                let _ = cx.update_window(any, |_, window, cx| {
-                    window.refresh();
-                    window.draw(cx).clear(cx);
-                });
-            }
-        }
-        for _ in 0..2 {
-            let _ = cx.update_window(any, |_, window, cx| {
-                window.refresh();
-                window.draw(cx).clear(cx);
-            });
-            cx.background_executor().timer(std::time::Duration::from_millis(300)).await;
-        }
-        let _ = cx.update_window(any, |_, window, cx| {
-            window.refresh();
-            window.draw(cx).clear(cx);
-            match window.render_to_image() {
-                Ok(img) => match img.save(&path) {
-                    Ok(()) => eprintln!("taskboard-app: snapshot saved to {path}"),
-                    Err(e) => eprintln!("taskboard-app: snapshot save failed: {e}"),
-                },
-                Err(e) => eprintln!("taskboard-app: render_to_image failed: {e:#}"),
-            }
-        });
-        let _ = cx.update(|cx| cx.quit());
-    })
-    .detach();
 }

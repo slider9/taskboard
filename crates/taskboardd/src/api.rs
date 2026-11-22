@@ -99,6 +99,10 @@ fn review_id(s: &str) -> Result<i64> {
     s.parse().map_err(|_| ApiError::new(404, "There's no review with that id."))
 }
 
+fn recap_id(s: &str) -> Result<i64> {
+    s.parse().map_err(|_| ApiError::new(404, "There's no recap with that id."))
+}
+
 fn required(body: &Value, key: &str, limit: usize, label: &str) -> Result<String> {
     let v = clip(&body_str(body, key), limit);
     if v.is_empty() {
@@ -178,6 +182,7 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
         ("POST", ["accounts", id, "disconnect"]) => accounts::disconnect(app, id),
         ("POST", ["accounts", id]) => accounts::connect(app, id, body),
         ("GET", ["info"]) => Ok(info()),
+        ("GET", ["restart"]) => crate::code_review::restart_would_interrupt(app),
         ("GET", ["summary"]) => get_summary(app),
         ("GET", ["locks"]) => crate::locks::overview(app),
         ("GET", ["slots"]) => crate::slots::overview(app, query.get("project").map(|s| s.as_str())),
@@ -191,6 +196,8 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
         ("POST", ["projects", "agents-merge"]) => set_agents_merge(app, body),
         ("GET", ["projects", "owner-review"]) => Ok(projects::describe_owner_review(app)),
         ("POST", ["projects", "owner-review"]) => set_owner_review(app, body),
+        ("GET", ["projects", "review"]) => Ok(projects::describe_review(app)),
+        ("POST", ["projects", "review"]) => set_review(app, body),
         ("POST", ["projects", name]) => patch_project(app, name, body),
         ("GET", ["sessions"]) => Ok(json!({"sessions": ops::session_list(app, q(query, "project", "all"))?})),
         ("GET", ["sessions", "closed"]) => {
@@ -293,6 +300,7 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
             }
             Ok(v)
         }
+        ("POST", ["tasks", "start"]) => start_many(app, body),
         ("POST", ["tasks", id]) => patch_task(app, tid(id)?, body),
         ("POST", ["tasks", id, "queue"]) => patch_task(app, tid(id)?, &json!({"status": "queued"})),
         ("POST", ["tasks", id, "start"]) => start(app, tid(id)?, query, body),
@@ -300,12 +308,23 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
         ("POST", ["tasks", id, "pick"]) => pick(app, tid(id)?, body),
         ("POST", ["tasks", id, "step"]) => owner_step(app, tid(id)?, body),
         ("POST", ["tasks", id, "did"]) => owner_did(app, tid(id)?, query, body),
+        ("POST", ["tasks", id, "owner-reopen"]) => owner_undo(app, tid(id)?, query, "reopen", crate::human::reopen),
+        ("POST", ["tasks", id, "owner-wait"]) => owner_undo(app, tid(id)?, query, "wait for again", crate::human::wait_again),
+        ("POST", ["humans", "done"]) => {
+            let done = crate::human::done_on_word(app, body, |via, id| crate::doneword::owners_word(app, via, id))?;
+            Ok(json!({"done": done}))
+        }
         ("POST", ["tasks", id, "owner-answer"]) => {
             let id = tid(id)?;
             crate::human::answer(app, id, body)?;
             task_detail(app, id)
         }
         ("POST", ["tasks", id, "talk"]) => crate::human::talk(app, tid(id)?),
+        ("POST", ["tasks", id, "merged-note", "ask"]) => {
+            let id = tid(id)?;
+            let asked = app.db.tx(|| crate::merged_note::ask_now(app, id))?;
+            Ok(json!({"ok": true, "asked": asked}))
+        }
         ("POST", ["tasks", id, "detach"]) => detach(app, tid(id)?),
         ("POST", ["tasks", id, "close-terminal"]) => close_terminal(app, tid(id)?, body),
         ("POST", ["tasks", id, "focus"]) => focus_task(app, tid(id)?),
@@ -336,6 +355,7 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
         ("POST", ["tasks", id, "delete"]) => delete_task(app, tid(id)?),
         ("POST", ["tasks", id, "pr", "wait"]) => pr_wait(app, tid(id)?),
         ("POST", ["tasks", id, "slot", "claim"]) => slot_claim(app, tid(id)?, body),
+        ("GET", ["tasks", id, "slot"]) => slot_held(app, tid(id)?),
         ("POST", ["tasks", id, "slot", "release"]) => slot_release(app, tid(id)?),
         ("POST", ["tasks", id, "pr", "skip-checks"]) => pr_skip_checks(app, tid(id)?, body),
         ("POST", ["tasks", id, "pr", "merged"]) => pr_merged(app, tid(id)?, body),
@@ -347,6 +367,7 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
         ("POST", ["tasks", id, "pr", "addressed"]) => crate::prcmds::addressed(app, tid(id)?, body),
         ("POST", ["tasks", id, "pr", "merge"]) => crate::prcmds::merge(app, tid(id)?, body),
         ("POST", ["tasks", id, "pr", "close"]) => crate::prcmds::close(app, tid(id)?, body),
+        ("POST", ["tasks", id, "pr", "rebase"]) => crate::prcmds::ask_rebase(app, tid(id)?, body),
         ("POST", ["tasks", id, "pr", "checks-running"]) => crate::prcmds::checks_running(app, tid(id)?, body),
         ("POST", ["tasks", id, "pr", "not-ours"]) => crate::prcmds::not_ours(app, tid(id)?, body),
         ("POST", ["tasks", id, "pr", "needs-owner"]) => crate::prcmds::needs_owner(app, tid(id)?, body),
@@ -459,11 +480,14 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
         ("GET", ["backlog"]) => list_backlog(app, query),
         ("POST", ["backlog"]) => post_issue(app, body),
         ("POST", ["backlog", "bulk"]) => backlog_bulk(app, body),
+        ("POST", ["backlog", "fixed"]) => crate::fixes::close_by(app, body, &issue_actor(body)),
         ("GET", ["backlog", "triage"]) => triage::list(app, query),
         ("GET", ["backlog", "plan"]) => Ok(triage::plan_get(app)),
         ("POST", ["backlog", "plan"]) => triage::plan_start(app, body),
+        ("POST", ["backlog", "plan", "add"]) => triage::plan_add(app, body),
         ("POST", ["backlog", "goal"]) => triage::create_goal(app, body),
         ("GET", ["backlog", "tidy"]) => Ok(crate::tidy::state(app)),
+        ("GET", ["backlog", "closed"]) => closed_issues(app, query),
         ("POST", ["backlog", "tidy"]) => crate::tidy::set(app, body),
         ("GET", ["backlog", id]) => issue_detail(app, iid(id)?),
         ("GET", ["backlog", id, "history"]) => get_issue_history(app, iid(id)?, query),
@@ -476,8 +500,22 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
             Ok(v)
         }
         ("POST", ["backlog", id, "ticket"]) => app.db.tx(|| ticket(app, iid(id)?, body)),
-        ("POST", ["backlog", id, "drop"]) => app.db.tx(|| drop_issue(app, iid(id)?, body)),
-        ("POST", ["backlog", id, "without-goal"]) => app.db.tx(|| finish_goal_without(app, iid(id)?, body)),
+        ("POST", ["backlog", "undo", n]) => crate::undo::route(app, n, body),
+        ("POST", ["backlog", id, "drop"]) => {
+            let i = iid(id)?;
+            let mut v = app.db.tx(|| drop_issue(app, i, body))?;
+            v["undo"] = json!(crate::undo::keep(app, crate::undo::closed(&[i], "drop")));
+            Ok(v)
+        }
+        ("POST", ["backlog", id, "without-goal"]) => {
+            let i = iid(id)?;
+            let (mut v, rec) = app.db.tx(|| {
+                let rec = crate::undo::without(&board::get_issue(app, i)?);
+                Ok((finish_goal_without(app, i, body)?, rec))
+            })?;
+            v["undo"] = json!(crate::undo::keep(app, rec));
+            Ok(v)
+        }
         ("POST", ["backlog", id, "reopen"]) => app.db.tx(|| reopen_issue(app, iid(id)?, body)),
         ("POST", ["backlog", id, "move"]) => app.db.tx(|| move_issue(app, iid(id)?, body)),
         ("POST", ["backlog", id, "note"]) => {
@@ -504,6 +542,7 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
             reports::handle(app, body.clone(), false)
         }
         ("GET", ["home"]) => crate::home::page(app, q(query, "project", "all")),
+        ("POST", ["home", "talk"]) => crate::needs_talk::start(app, body),
         ("GET", ["reviews"]) => crate::review::list(app),
         ("GET", ["reviews", "now"]) => {
             let (start, end) = crate::review::period(app, query.get("since").map(String::as_str), query.get("week").map(String::as_str))?;
@@ -519,12 +558,21 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
         ("GET", ["reviews", id]) => crate::review::get(app, review_id(id)?),
         ("POST", ["reviews", id, "fixes"]) => crate::review_fixes::start(app, review_id(id)?),
         ("POST", ["reviews", id, "seen"]) => app.db.tx(|| crate::review::seen(app, review_id(id)?)),
+        ("GET", ["recaps"]) => crate::recap::list(app),
+        ("POST", ["recaps"]) => {
+            let day = crate::recap::parse_day(&body_str(body, "day"))?;
+            let again = body.get("again").and_then(Value::as_bool).unwrap_or(false);
+            crate::recap::get(app, crate::recap::make(app, &body_str(body, "kind"), day, again)?)
+        }
+        ("GET", ["recaps", id]) => crate::recap::get(app, recap_id(id)?),
+        ("POST", ["recaps", id, "seen"]) => app.db.tx(|| crate::recap::seen(app, recap_id(id)?)),
         ("GET", ["tasks", id, "spans"]) => crate::review::task_spans(app, tid(id)?),
-        ("GET", ["lanes"]) => crate::lanes::page(app, q(query, "goals", "0") == "1"),
         ("GET", ["days"]) => days::page(app, query.get("date").map(|s| s.as_str()), query.get("hide").map(|s| s.as_str())),
         ("GET", ["history"]) => days::history(app),
         ("POST", ["history"]) => days::set_history(app, body),
         ("POST", ["history", "cleanup"]) => days::cleanup(app),
+        ("GET", ["buried-questions"]) => crate::buried::settings(app),
+        ("POST", ["buried-questions"]) => app.db.tx(|| crate::buried::set_settings(app, body)),
         ("GET", ["qa"]) => qa::settings(app),
         ("POST", ["qa"]) => app.db.tx(|| qa::set_settings(app, body)),
         ("POST", ["jira", "comment"]) => qa::intake(app, body),
@@ -679,7 +727,15 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
                 };
                 return err(409, why);
             }
-            app.db.tx(|| alerts::clear_alerts(app, None, Some(id)))?;
+            app.db.tx(|| alerts::dismiss_alert(app, id))?;
+            Ok(json!({"alerts": alerts::listing(app)}))
+        }
+        ("POST", ["alerts", id, "restore"]) if crate::home::not_an_alert(id) => {
+            crate::home::bring_back(app, id)?;
+            Ok(json!({"alerts": alerts::listing(app)}))
+        }
+        ("POST", ["alerts", id, "restore"]) => {
+            app.db.tx(|| alerts::restore_alert(app, id))?;
             Ok(json!({"alerts": alerts::listing(app)}))
         }
         ("POST", ["alerts", id, "talk"]) => crate::human::talk_alert(app, id),
@@ -840,6 +896,7 @@ fn build_state_board(app: &App, query: &Query) -> Result<Value> {
     counts.insert("open_issues".into(), json!(open_issues.len()));
     counts.insert("untriaged".into(), json!(app.db.count("SELECT COUNT(*) FROM issues WHERE state = 'open' AND goal_id IS NULL", p![])?));
     counts.insert("waiting".into(), json!(crate::home::waiting_count(app)?));
+    counts.insert("recaps_unseen".into(), json!(app.db.count("SELECT COUNT(*) FROM recaps WHERE seen_at IS NULL", p![])?));
     let mut planned = vec![];
     for t in app.db.q("SELECT * FROM tasks WHERE status = 'planned' ORDER BY goal_id, position, id", p![])? {
         if project_match(t.s("project"), project) && task_goal_match(app, &t, goal)? {
@@ -905,15 +962,28 @@ fn set_owner_review(app: &App, body: &Value) -> Result<Value> {
     Ok(projects::describe_owner_review(app))
 }
 
+/// `tb project review on|off|default`: whether projects that don't say have the Review step.
+fn set_review(app: &App, body: &Value) -> Result<Value> {
+    let on = match body.get("review") {
+        Some(Value::Bool(b)) => Some(*b),
+        Some(Value::String(s)) if s == "on" => Some(true),
+        Some(Value::String(s)) if s == "off" => Some(false),
+        Some(Value::Null) => None,
+        _ => return err(400, "review is true (on), false (off) or null (config.toml's pr.review)."),
+    };
+    app.db.tx(|| projects::set_review(app, on))?;
+    Ok(projects::describe_review(app))
+}
+
 fn patch_project(app: &App, name: &str, body: &Value) -> Result<Value> {
     let list = projects::list_projects(app)?;
     let Some(p) = list.iter().find(|p| p["name"] == name) else { return err(404, format!("There's no project called {name}.")) };
     let rules = projects::PR_RULE_KEYS.iter().any(|k| body.get(*k).is_some());
     let flow = body.get("pr_flow").filter(|v| !v.is_null()).map(|_| body_str(body, "pr_flow"));
-    if flow.is_none() && !rules && body.get("max_terminals").is_none() && body.get("waits_on").is_none() && body.get("stack_merge_default").is_none() && body.get("releases").is_none() && body.get("release_tags").is_none() && body.get("release_script").is_none() && body.get("code_review").is_none() && !crate::slots::KEYS.iter().any(|k| body.get(*k).is_some()) {
+    if flow.is_none() && !rules && body.get("max_terminals").is_none() && body.get("waits_on").is_none() && body.get("stack_merge_default").is_none() && body.get("releases").is_none() && body.get("release_tags").is_none() && body.get("release_script").is_none() && body.get("code_review").is_none() && body.get("devices").is_none() && !crate::slots::KEYS.iter().any(|k| body.get(*k).is_some()) {
         return err(
             400,
-            format!("Say what to change: pr_flow, max_terminals, waits_on, stack_merge_default, releases, release_tags, release_script, code_review, the worktree pool's {}, or the PR rules {}.", crate::slots::KEYS.join(", "), projects::PR_RULE_KEYS.join(", ")),
+            format!("Say what to change: pr_flow, max_terminals, waits_on, stack_merge_default, releases, release_tags, release_script, code_review, devices, the worktree pool's {}, or the PR rules {}.", crate::slots::KEYS.join(", "), projects::PR_RULE_KEYS.join(", ")),
         );
     }
     if flow.as_ref().is_some_and(|f| !projects::PR_FLOWS.contains(&f.as_str())) {
@@ -930,6 +1000,7 @@ fn patch_project(app: &App, name: &str, body: &Value) -> Result<Value> {
         crate::release_tags::set_setting(app, name, body)?;
         crate::releases::set_script(app, name, body)?;
         crate::code_review::set(app, name, body)?;
+        crate::devices::set_project_needs(app, name, body)?;
         crate::slots::set(app, name, body)?;
         projects::set_pr_rules(app, name, body).map(|_| ())
     })?;
@@ -986,11 +1057,17 @@ fn close_sessions(app: &App, body: &Value) -> Result<Value> {
     })
 }
 
+/// Refused while Midna is down: a focus job would wait for it and the app would read it as done.
+const FOCUS_DOWN: &str = "Midna isn't running, so the board can't show that terminal.";
+
 fn focus_session(app: &App, id: &str) -> Result<Value> {
     app.db.tx(|| {
         let s = board::get_session(app, Some(id))?.filter(|s| s.s("status") != Some("gone"));
         if s.is_none() {
             return err(404, "That terminal isn't open any more.");
+        }
+        if !midna::up(app) {
+            return err(409, FOCUS_DOWN);
         }
         board::create_job(app, "focus", json!({"session": id}), None, "focus", None)?;
         Ok(json!({"ok": true}))
@@ -1368,6 +1445,7 @@ fn patch_task(app: &App, id: i64, body: &Value) -> Result<Value> {
                 f.push(("jira_status", Value::Null));
                 f.push(("jira_status_at", Value::Null));
                 f.push(("jira_none", json!(1)));
+                jira::drop_pending_for_task(app, id)?;
             } else if k.eq_ignore_ascii_case("new") {
                 projects::refuse_without_prs(app, &t.st("project"))?;
                 f.push(("jira_none", json!(0)));
@@ -1383,7 +1461,6 @@ fn patch_task(app: &App, id: i64, body: &Value) -> Result<Value> {
                     f.push(("jira_key", json!(key)));
                     f.push(("jira_status", Value::Null));
                     f.push(("jira_status_at", Value::Null));
-                f.push(("jira_status_at", Value::Null));
                     jira::request(app, "status", id, &key, None, None)?;
                     board::log_event(app, id, &who, "jira", &format!("Linked {key}"))?;
                     bump = true;
@@ -1406,6 +1483,7 @@ fn patch_task(app: &App, id: i64, body: &Value) -> Result<Value> {
         }
         // Stacking (`--stack-on`) and the PR plan (`--pr yes|no`) log their own change.
         let mut planned = false;
+        let mut restacked = false;
         if has_key("stack_on") {
             let mut moved = t.clone();
             if let Some(w) = wave_changed {
@@ -1414,7 +1492,7 @@ fn patch_task(app: &App, id: i64, body: &Value) -> Result<Value> {
             if let Some(g) = new_goal_id {
                 moved.insert("goal_id".into(), json!(g));
             }
-            planned |= crate::stack::set(app, &moved, &body["stack_on"], &who)?;
+            restacked |= crate::stack::set(app, &moved, &body["stack_on"], &who)?;
         }
         if has_key("same_pr") {
             let mut moved = board::get_task(app, id)?;
@@ -1427,19 +1505,37 @@ fn patch_task(app: &App, id: i64, body: &Value) -> Result<Value> {
             planned |= crate::samepr::set(app, &moved, &body["same_pr"], &who)?;
         }
         if has_key("stack_merge") {
-            planned |= crate::stack::set_merge(app, &board::get_task(app, id)?, &body["stack_merge"], &who)?;
+            restacked |= crate::stack::set_merge(app, &board::get_task(app, id)?, &body["stack_merge"], &who)?;
+        }
+        // Fixed stacking is a new reason to try a merge that ran out of tries on the old one (#1033): this
+        // task's, and its old and new parent's, whose merge holds for its head-merge children.
+        if restacked {
+            let now = crate::stack::parent_id(&board::get_task(app, id)?);
+            let mut ids = vec![id];
+            ids.extend(crate::stack::parent_id(&t).into_iter().chain(now).filter(|p| *p != id));
+            ids.dedup();
+            for n in ids {
+                prflow::merge_setup_changed(app, n, &who)?;
+            }
+            planned = true;
         }
         if has_key("kind") {
             planned |= crate::design::set(app, &board::get_task(app, id)?, &body["kind"], &who)?;
         }
         if has_key("ships_pr") {
             planned |= projects::set_task_ships_pr(app, &board::get_task(app, id)?, &body["ships_pr"], &who)?;
+            if !projects::task_ships_pr(app, &board::get_task(app, id)?)? {
+                jira::drop_pending_for_task(app, id)?;
+            }
         }
         if has_key("landed") {
             planned |= crate::declined::set_landed(app, &board::get_task(app, id)?, &body["landed"], &who)?;
         }
         if has_key("pr_link") {
             planned |= crate::declined::set_pr_link(app, &board::get_task(app, id)?, &body["pr_link"], &who)?;
+        }
+        if has_key("issues") {
+            planned |= link_issues(app, &board::get_task(app, id)?, &issue_ids(body, "issues")?, &who)?;
         }
         if planned && f.is_empty() {
             return board::bump_ctx(app, id);
@@ -1458,6 +1554,9 @@ fn patch_task(app: &App, id: i64, body: &Value) -> Result<Value> {
         }
         if let Some(text) = &moved_text {
             crate::reproject::leave_old(app, &t)?;
+            if let Some(p) = &moved_to {
+                crate::reproject::carry_history(app, id, p)?;
+            }
             board::log_event(app, id, &who, "status", text)?;
         }
         if wave_changed.is_some() || new_goal_id.is_some() {
@@ -1519,6 +1618,16 @@ fn patch_task(app: &App, id: i64, body: &Value) -> Result<Value> {
     })?;
     if body.get("landed").is_some() || body.get("pr_link").is_some() {
         app.wake_runner();
+    }
+    // A change to what the task waits for or needs can slow its goal down: say so as the plan check does.
+    if ["same_pr", "stack_on", "waits_for", "wave", "devices"].iter().any(|k| body.get(*k).is_some()) {
+        if let Some(g) = board::get_task(app, id)?.i("goal_id").map(|g| board::get_goal(app, g)).transpose()? {
+            for w in crate::pace::plan_warnings(app, &g, None)?.into_iter().chain(crate::devices::plan_warnings(app, &g)?) {
+                if !warnings.contains(&w) {
+                    warnings.push(w);
+                }
+            }
+        }
     }
     let mut d = task_detail(app, id)?;
     if !warnings.is_empty() {
@@ -1592,7 +1701,11 @@ fn start(app: &App, id: i64, query: &Query, body: &Value) -> Result<Value> {
         if !crate::startword::granted(app, &via, id, false)? && crate::startword::owners_word(app, &via, id)?.is_none() {
             if let Some(grant) = crate::start_grants::honored(app, &via, &t)? {
                 let started = format!("{grant} via {}", board::session_name(app, Some(&via), None));
-                return launch(app, id, &mode, body["session_id"].as_str(), &started, &via);
+                return with_wait_line(app, &via, &[id], launch(app, id, &mode, body["session_id"].as_str(), &started, &via)?);
+            }
+            if crate::agent_starts::allowed(app, &via, t.s("project"))? {
+                let started = format!("Started by {}", board::session_name(app, Some(&via), None));
+                return with_wait_line(app, &via, &[id], launch(app, id, &mode, body["session_id"].as_str(), &started, &via)?);
             }
             // An ask for the goal ("start the goal") is no word for each of its tasks; the goal runs them.
             let goal = board::find_goal(app, t.i("goal_id"))?
@@ -1611,7 +1724,102 @@ fn start(app: &App, id: i64, query: &Query, body: &Value) -> Result<Value> {
         }
         format!("Started by {} via {}", app.cfg.owner, board::session_name(app, Some(&via), None))
     };
-    launch(app, id, &mode, body["session_id"].as_str(), &started, &via)
+    with_wait_line(app, &via, &[id], launch(app, id, &mode, body["session_id"].as_str(), &started, &via)?)
+}
+
+/// A start's reply with `wait_line` when the terminal that started them is on a task they name
+/// (`waitsfor::caller_needs_line`), so `tb start` prints the `tb wait-for` line to run.
+fn with_wait_line(app: &App, via: &str, ids: &[i64], mut v: Value) -> Result<Value> {
+    if let (Some(line), Some(o)) = (crate::waitsfor::caller_needs_line(app, Some(via), ids)?, v.as_object_mut()) {
+        o.insert("wait_line".into(), json!(line));
+    }
+    Ok(v)
+}
+
+/// `tb start T4 T5 T6` from terminal `via_session`: each task starts on the owner's word there, all or none.
+/// Every task is checked before any starts: one that waits on unfinished work, is done or is already on a
+/// terminal refuses them all, and so does one nobody asked for, which asks the owner to start them all.
+fn start_many(app: &App, body: &Value) -> Result<Value> {
+    let mode = { let m = body_str(body, "mode"); if m.is_empty() { "new".to_string() } else { m } };
+    if !["new", "queue"].contains(&mode.as_str()) {
+        return err(400, "Start mode must be new or queue.");
+    }
+    let mut ids: Vec<i64> = vec![];
+    for r in body["tasks"].as_array().into_iter().flatten() {
+        let id = match r {
+            Value::Number(n) => n.as_i64(),
+            Value::String(s) => parse_ref_str(s, "task")?,
+            _ => None,
+        };
+        let Some(id) = id else { return err(400, format!("{r} isn't a task.")) };
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return err(400, "Name the tasks to start.");
+    }
+    let via = body_str(body, "via_session");
+    let all = alerts::say_refs(&ids.iter().map(|&id| rf("task", id)).collect::<Vec<_>>());
+    if via.is_empty() {
+        return err(403, format!("Only a human can start {all}: {} can press Start on each on the board, or tell an agent in a terminal to start them (tb start).", app.cfg.owner));
+    }
+    let name = board::session_name(app, Some(&via), None);
+    let (mut go, mut no_word, mut cant) = (vec![], vec![], vec![]);
+    for &id in &ids {
+        let t = board::get_task(app, id)?;
+        let by = if crate::startword::granted(app, &via, id, false)? || crate::startword::owners_word(app, &via, id)?.is_some() {
+            Some(format!("Started by {} via {name}", app.cfg.owner))
+        } else if let Some(g) = crate::start_grants::honored(app, &via, &t)? {
+            Some(format!("{g} via {name}"))
+        } else {
+            crate::agent_starts::allowed(app, &via, t.s("project"))?.then(|| format!("Started by {name}"))
+        };
+        if let Some(b) = crate::waitsfor::blocker(app, &t)? {
+            cant.push(format!("{} can't start yet. {b}.", rf("task", id)));
+        } else if t.s("status") == Some("done") {
+            cant.push(format!("{} is done.", rf("task", id)));
+        } else if matches!(t.s("status"), Some("working") | Some("needs")) && board::live_session(app, &t)?.is_some() && !t.b("lost") {
+            cant.push(format!("{} is already on {}.", rf("task", id), t.s("session_name").unwrap_or("a terminal")));
+        }
+        match by {
+            Some(by) => go.push((id, by)),
+            None => no_word.push(id),
+        }
+    }
+    if !cant.is_empty() {
+        return err(409, format!("Started none of {all}. {} Leave those out and run tb start again for the rest.", cant.join(" ")));
+    }
+    if !no_word.is_empty() {
+        let missing = alerts::say_refs(&no_word.iter().map(|&id| rf("task", id)).collect::<Vec<_>>());
+        let mut asked = false;
+        for &id in &ids {
+            if no_word.contains(&id) {
+                log_miss(app, &rf("task", id), &via)?;
+            }
+            asked |= alerts::ask_start(app, "task", id, &via, json!({"mode": mode}))?;
+        }
+        return err(
+            403,
+            format!(
+                "Only a human can start {all}: nobody asked for {missing} in this terminal's conversation, so none of them started. {}",
+                owner_asked(app, asked, "start", "Start")
+            ),
+        );
+    }
+    // A start that fails past the checks above (a hook stops it, no worktree) leaves the ones before it started.
+    let (mut started, mut done) = (vec![], vec![]);
+    for (id, by) in go {
+        match launch(app, id, &mode, None, &by, &via) {
+            Ok(v) => {
+                started.push(v);
+                done.push(rf("task", id));
+            }
+            Err(e) if done.is_empty() => return Err(e),
+            Err(e) => return err(e.status, format!("{} didn't start: {} {} started before it.", rf("task", id), e.message, alerts::say_refs(&done))),
+        }
+    }
+    with_wait_line(app, &via, &ids, json!({"tasks": started}))
 }
 
 /// A standing start grant (`tb start-grant add`): only the owner's. From the app it's added; from a terminal
@@ -1639,7 +1847,10 @@ fn schedule_start(app: &App, what: &str, query: &Query, via: &str, at: &str, app
             log_miss(app, what, via)?;
             return err(
                 403,
-                format!("Only a human can schedule {what}: nobody in this terminal's conversation named it with a time to start. {} can use Start at… on the board, or tell you when to start it.", app.cfg.owner),
+                format!(
+                    "Only a human can schedule {what}: nobody in this terminal's conversation named it with a time to start. {} can use Start at… on the board, or say \"start {what} tomorrow 6am\" here; tell them that once.",
+                    app.cfg.owner
+                ),
             );
         }
         format!("{verb} by {} via {}", app.cfg.owner, board::session_name(app, Some(via), None))
@@ -1780,6 +1991,7 @@ fn launch(app: &App, id: i64, mode: &str, session_id: Option<&str>, started: &st
                     "session_id" => if t.b("lost") { None } else { t.s("session_id").map(|s| s.to_string()) }],
         )?;
         board::log_event(app, id, board::OWNER, "status", started)?;
+        crate::startwatch::start_over(app, &t)?;
         if waits {
             board::update_task(
                 app,
@@ -1961,6 +2173,16 @@ fn owner_did(app: &App, id: i64, query: &Query, body: &Value) -> Result<Value> {
     task_detail(app, id)
 }
 
+/// The owner took back Done or Don't wait for me on a human task (Reopen, or the toast's Undo): only
+/// the app may, as only the app presses Done.
+fn owner_undo(app: &App, id: i64, query: &Query, what: &str, undo: fn(&App, i64) -> Result<()>) -> Result<Value> {
+    if !from_app(query) {
+        return err(403, format!("Only {} can {what} a human task, from the app.", app.cfg.owner));
+    }
+    undo(app, id)?;
+    task_detail(app, id)
+}
+
 /// `POST /alerts/:id/snooze`: puts a Needs you item off. `{mins}`, `{until}` of `tomorrow` or
 /// `next_week` (when those work hours start) or `back` (after the owner's next stretch away), or
 /// `{after_goal}` (once that goal finishes).
@@ -2056,12 +2278,18 @@ fn close_terminal(app: &App, id: i64, body: &Value) -> Result<Value> {
 fn focus_task(app: &App, id: i64) -> Result<Value> {
     let t = board::get_task(app, id)?;
     if board::live_session(app, &t)?.is_none() && t.s("status") == Some("needs") && has(t.s("question")) {
+        if !midna::up(app) {
+            return err(409, "Midna isn't running, so the board can't open a terminal.");
+        }
         resume(app, id, &json!({"mode": "ask"}))?;
         return Ok(json!({"ok": true, "opened": true}));
     }
     app.db.tx(|| {
         let t = board::get_task(app, id)?;
         let s = need_live(app, &t)?;
+        if !midna::up(app) {
+            return err(409, FOCUS_DOWN);
+        }
         board::create_job(app, "focus", json!({"session": s.v("id")}), Some(id), "focus", None)?;
         Ok(json!({"ok": true}))
     })
@@ -2116,6 +2344,7 @@ fn resume(app: &App, id: i64, body: &Value) -> Result<Value> {
             return err(409, "Only a task that lost its terminal is marked done from here.");
         }
         // Read before `lost` is cleared: what the board found goes in the new terminal's prompt.
+        crate::startwatch::start_over(app, &t)?;
         let finish = (mode == "finish").then(|| crate::lost_done::finish_prompt(&t, &board::tb_cmd(app)));
         let ask = (mode == "ask").then(|| ask_again_prompt(&t, &board::tb_cmd(app), &app.cfg.owner));
         let ctx = board::task_context(&t);
@@ -2129,7 +2358,7 @@ fn resume(app: &App, id: i64, body: &Value) -> Result<Value> {
             board::log_event(app, id, OWNER, "handoff", "Reopening the old conversation in a new terminal")?;
         } else {
             let edited = body_str(body, "handoff");
-            let mut text = if edited.is_empty() { handoff::build(app, id)? } else { edited.clone() };
+            let mut text = if edited.is_empty() { handoff::start_prompt(app, id)? } else { edited.clone() };
             if let Some(f) = finish.as_ref().or(ask.as_ref()) {
                 text = format!("{marker} {f}\n\n{text}");
             }
@@ -2830,8 +3059,11 @@ fn run_goal(app: &App, id: i64, query: &Query, body: &Value) -> Result<Value> {
             ),
         );
     } else {
-        board::get_goal(app, id)?;
-        if !crate::startword::granted(app, &via, id, true)? && crate::startword::owners_goal_word(app, &via, id)?.is_none() {
+        let g = board::get_goal(app, id)?;
+        if !crate::startword::granted(app, &via, id, true)?
+            && crate::startword::owners_goal_word(app, &via, id)?.is_none()
+            && !crate::agent_starts::allowed_goal(app, &via, &g)?
+        {
             log_miss(app, &rf("goal", id), &via)?;
             let asked = alerts::ask_start(app, "goal", id, &via, json!({"now": now}))?;
             let how = if asked {
@@ -3073,6 +3305,46 @@ fn search(app: &App, query: &Query) -> Result<Value> {
     Ok(json!({"project": project, "hits": crate::relevance::search(app, &f, ref_project)?}))
 }
 
+/// The app's Deferred and won't do list: the issues closed one way (`state` is `defer` or `wont_do`; fixed
+/// ones aren't listed), last closed first, a page at a time, with how many each way.
+fn closed_issues(app: &App, query: &Query) -> Result<Value> {
+    let want = q(query, "state", "defer");
+    if want != "defer" && want != "wont_do" {
+        return err(400, "Say defer or wont_do.");
+    }
+    let project = q(query, "project", "all");
+    let page = Paging::of(query);
+    let ids: Option<Vec<i64>> = query.get("ids").map(|s| s.split(',').filter_map(|x| parse_ref_str(x.trim(), "issue").ok().flatten()).collect());
+    let way = |b: &Row| match (b.s("state"), b.s("closed_as")) {
+        (Some("defer"), _) => Some("defer"),
+        (Some("drop"), Some("fixed")) => None,
+        (Some("drop"), _) => Some("wont_do"),
+        _ => None,
+    };
+    let rows = app.db.q("SELECT * FROM issues WHERE state IN ('defer', 'drop')", p![])?;
+    let rows: Vec<&Row> = rows.iter().filter(|b| project_match(b.s("project"), project)).collect();
+    let counts = json!({"defer": rows.iter().filter(|b| way(b) == Some("defer")).count(), "wont_do": rows.iter().filter(|b| way(b) == Some("wont_do")).count()});
+    let at = |b: &Row| (b.st("updated_at"), b.id());
+    let mut matched: Vec<&Row> = rows.into_iter().filter(|b| way(b) == Some(want)).filter(|b| ids.as_ref().is_none_or(|ids| ids.contains(&b.id()))).collect();
+    matched.sort_by_key(|b| std::cmp::Reverse(at(b)));
+    let total = matched.len();
+    if let Some(c) = page.before.as_deref().and_then(|b| parse_ref_str(b, "issue").ok().flatten()) {
+        if let Some(c) = app.db.q1("SELECT * FROM issues WHERE id = ?", p![c])? {
+            let c = at(&c);
+            matched.retain(|b| at(b) < c);
+        }
+    }
+    let more = page.cut(&mut matched);
+    let next = matched.last().filter(|_| more).map(|b| b.id().to_string());
+    let mut out = vec![];
+    for b in matched {
+        let mut d = board::issue_card(app, b)?;
+        d["closed_at"] = b.v("updated_at");
+        out.push(d);
+    }
+    Ok(json!({"issues": out, "total": total, "next": next, "counts": counts}))
+}
+
 fn list_backlog(app: &App, query: &Query) -> Result<Value> {
     let (project, goal, kind, state, sort) =
         (q(query, "project", "all"), q(query, "goal", "all"), q(query, "kind", "all"), q(query, "state", "open"), q(query, "sort", "new"));
@@ -3219,6 +3491,69 @@ pub(crate) fn issue_tasked(app: &App, id: i64, task_id: i64, who: &str, text: &s
     board::miss_settled(app, &board::get_issue(app, id)?)
 }
 
+/// The backlog issues a request names under `key` (`"B3"`, `["B3", "B4"]` or ids), each once, in order.
+pub(crate) fn issue_ids(body: &Value, key: &str) -> Result<Vec<i64>> {
+    let list = match body.get(key) {
+        None | Some(Value::Null) => vec![],
+        Some(Value::Array(a)) => a.clone(),
+        Some(x) => vec![x.clone()],
+    };
+    let mut ids = vec![];
+    for x in &list {
+        if let Some(id) = parse_ref(x, "issue")? {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Refuses a backlog issue task `task` (None for one not made yet) can't link: one that isn't open, is
+/// another task's, or is in another project than `project`. One already linked to `task` passes.
+pub(crate) fn need_linkable(b: &Row, task: Option<i64>, project: &str) -> Result<()> {
+    let r = rf("issue", b.id());
+    match (b.s("state"), b.i("task_id")) {
+        (Some("open"), _) => {}
+        (Some("task"), Some(t)) if Some(t) == task => {}
+        (Some("task"), Some(t)) => return err(409, format!("{r} is already {}.", rf("task", t))),
+        _ => return err(409, format!("{r} isn't open any more, so nothing changed.")),
+    }
+    if b.st("project") != project {
+        return err(400, format!("{r} is in {}'s backlog, not {project}'s: a task links issues from its own project.", b.st("project")));
+    }
+    Ok(())
+}
+
+/// Links more open backlog issues to task `t` (`--issue` past the first on `tb task new`, or `tb task set
+/// --issue`), all or none: each becomes the task the way the one it's made from does, so it closes with it.
+/// Returns whether it linked any.
+pub(crate) fn link_issues(app: &App, t: &Row, ids: &[i64], who: &str) -> Result<bool> {
+    let mut issues = vec![];
+    for &id in ids {
+        let b = board::get_issue(app, id)?;
+        need_linkable(&b, Some(t.id()), &t.st("project"))?;
+        if b.s("state") == Some("open") {
+            issues.push(b);
+        }
+    }
+    if issues.is_empty() {
+        return Ok(false);
+    }
+    let me = rf("task", t.id());
+    if t.s("status") == Some("done") {
+        let refs: Vec<String> = issues.iter().map(|b| rf("issue", b.id())).collect();
+        return err(409, format!("{me} is done, so linking can't close anything. If it fixed them: tb backlog fixed {} --by {me}", refs.join(" ")));
+    }
+    let text = format!("Linked to {me}, which fixes it too; it closes with that task.");
+    for b in &issues {
+        issue_tasked(app, b.id(), t.id(), who, &text)?;
+    }
+    let refs: Vec<String> = issues.iter().map(|b| rf("issue", b.id())).collect();
+    board::log_event(app, t.id(), who, "status", &format!("Linked {}: {} with this task", refs.join(", "), if refs.len() == 1 { "it closes" } else { "they close" }))?;
+    Ok(true)
+}
+
 pub(crate) fn promote(app: &App, id: i64, body: &Value) -> Result<Value> {
     let who = issue_actor(body);
     let where_ = { let w = body_str(body, "where"); if w.is_empty() { "board".to_string() } else { w } };
@@ -3227,8 +3562,8 @@ pub(crate) fn promote(app: &App, id: i64, body: &Value) -> Result<Value> {
     }
     let b = board::get_issue(app, id)?;
     need_open(&b)?;
-    // In its goal: planned, or queued when the goal is running so its run picks the task up.
-    let join = match b.i("goal_id").filter(|_| where_ == "goal") {
+    // In its goal, from either place: planned, or queued when the goal is running so its run picks the task up.
+    let join = match b.i("goal_id") {
         Some(g) => Some(board::joining_status(app, g, as_bool(body.get("planned"), false))?),
         None => None,
     };
@@ -3247,10 +3582,7 @@ pub(crate) fn promote(app: &App, id: i64, body: &Value) -> Result<Value> {
     let text = if join.is_some() {
         format!("Made into {cref}, a {} task in its goal. Its handoff starts with this report and snapshot.", if planned { "planned" } else { "queued" })
     } else {
-        format!(
-            "Made into {cref}, a queued task{}. Its handoff starts with this report and snapshot.",
-            if b.i("goal_id").is_some() { "" } else { " with no goal" }
-        )
+        format!("Made into {cref}, a queued task with no goal. Its handoff starts with this report and snapshot.")
     };
     issue_tasked(app, id, c["id"].as_i64().unwrap_or(0), &who, &text)?;
     Ok(json!({"issue": issue_detail(app, id)?, "task": task_detail(app, c["id"].as_i64().unwrap_or(0))?, "why": join.map(|(_, why)| why)}))
@@ -3301,13 +3633,17 @@ fn finish_goal_without(app: &App, id: i64, body: &Value) -> Result<Value> {
     issue_detail(app, id)
 }
 
-fn reopen_issue(app: &App, id: i64, body: &Value) -> Result<Value> {
+pub(crate) fn reopen_issue(app: &App, id: i64, body: &Value) -> Result<Value> {
     let b = board::get_issue(app, id)?;
     if b.s("state") == Some("open") {
         return err(409, format!("{} is already open.", rf("issue", id)));
     }
-    app.db.update("issues", &json!(id), fields!["state" => "open", "updated_at" => now_iso()])?;
+    app.db.update("issues", &json!(id), fields!["state" => "open", "closed_as" => null, "fixed_by" => null, "fixed_pr" => null, "updated_at" => now_iso()])?;
     board::add_issue_event(app, id, &issue_actor(body), "note", "Opened again", None)?;
+    // A miss on its goal's done-when holds the goal open again, so its alert comes back too.
+    if let Some(g) = b.i("goal_id").filter(|_| b.b("misses_goal")) {
+        blocks::miss_alert(app, id, g, &b.st("title"))?;
+    }
     issue_detail(app, id)
 }
 
@@ -3420,9 +3756,10 @@ fn backlog_bulk(app: &App, body: &Value) -> Result<Value> {
             ids.push(id);
         }
     }
-    app.db.tx(|| {
+    let (mut out, undo) = app.db.tx(|| {
         let mut count = 0;
         let mut tasks = vec![];
+        let mut moved = vec![];
         for id in &ids {
             let b = board::get_issue(app, *id)?;
             if ["task", "ticket", "drop", "defer", "goal"].contains(&action.as_str()) && b.s("state") != Some("open") {
@@ -3464,6 +3801,7 @@ fn backlog_bulk(app: &App, body: &Value) -> Result<Value> {
                     if let (Some(w), Some(tid)) = (wave, made["task"]["id"].as_i64()) {
                         app.db.update("tasks", &json!(tid), fields!["wave" => w])?;
                     }
+                    moved.push(crate::undo::moved(&b, made["task"]["id"].as_i64().unwrap_or(0)));
                     tasks.push(made["task"].clone());
                 }
                 _ => {
@@ -3472,8 +3810,18 @@ fn backlog_bulk(app: &App, body: &Value) -> Result<Value> {
             }
             count += 1;
         }
-        Ok(json!({"ok": true, "action": action, "count": count, "tasks": tasks}))
-    })
+        // Closing and Move to goal can be taken back from the app's toast.
+        let undo = match action.as_str() {
+            "drop" | "defer" => Some(crate::undo::closed(&ids, &action)),
+            "goal" => Some(json!({"kind": "goal", "goal_id": opt_goal(body, "goal_id")?, "items": moved})),
+            _ => None,
+        };
+        Ok((json!({"ok": true, "action": action, "count": count, "tasks": tasks}), undo))
+    })?;
+    if let Some(rec) = undo {
+        out["undo"] = json!(crate::undo::keep(app, rec));
+    }
+    Ok(out)
 }
 
 fn set_hours(app: &App, body: &Value) -> Result<Value> {
@@ -3501,8 +3849,19 @@ fn get_pr(app: &App, id: i64) -> Result<Value> {
         return err(404, format!("{} has no PR linked.", rf("task", id)));
     }
     let f = jloads_obj(t.s("pr_flow"));
+    let watched = crate::prhost::watched(t.s("pr_host")) && app.cfg.pr.watch;
     Ok(json!({"task": rf("task", id), "pr": board::pr_card(app, &t), "record": f.v("rec"), "checked_at": f.v("checked_at"),
-              "agents_merge": crate::prflow::agents_merge_on(app, t.s("project")), "watched": crate::prhost::watched(t.s("pr_host")) && app.cfg.pr.watch}))
+              "agents_merge": crate::prflow::agents_merge_on(app, t.s("project")), "watched": watched,
+              "watching": watching(app, &t, &f, watched)?}))
+}
+
+/// The board watching a handed-in task's open PR, with no visit on: since when the agent last handed it
+/// back (`tb pr wait`), when that's known. Null while the PR isn't watched, or a visit is on.
+fn watching(app: &App, t: &Row, f: &serde_json::Map<String, Value>, watched: bool) -> Result<Value> {
+    if !watched || t.s("status") != Some("done") || !board::pr_still_open(t) || prflow::waking(app, t)? {
+        return Ok(Value::Null);
+    }
+    Ok(json!({"since": f.v("watched_at")}))
 }
 
 fn pr_wait(app: &App, id: i64) -> Result<Value> {
@@ -3525,6 +3884,9 @@ fn pr_wait(app: &App, id: i64) -> Result<Value> {
         if let Some(why) = crate::comments::task_refusal(app, &t, None, "handing the PR back for review")? {
             return err(409, why);
         }
+        if app.cfg.comments.guard {
+            crate::progress::stage(&format!("Checked PR #{} for comments it adds", t.i0("pr_num")));
+        }
     }
     if let Some(why) = crate::slots::release_refusal(app, &t)? {
         return err(409, why);
@@ -3538,6 +3900,7 @@ fn pr_wait(app: &App, id: i64) -> Result<Value> {
         board::log_event(app, id, board::BOARD, "status", &format!("The agent finished its visit to PR #{}; the board watches it again", t.i0("pr_num")))?;
         Ok(())
     })?;
+    crate::progress::stage("Handed the PR back to the board to watch");
     crate::slots::release(app, &board::get_task(app, id)?)?;
     get_pr(app, id)
 }
@@ -3554,6 +3917,11 @@ fn slot_claim(app: &App, id: i64, body: &Value) -> Result<Value> {
             409,
             format!("{me} is on the alone lane: it runs with nothing else in its goal, in the shared checkout, so it takes no slot. To work in one, put it on the slot lane first: tb task set {me} --lane slot."),
         );
+    }
+    if t.s("status") != Some("done") && crate::bring::asked(body)?.is_none() {
+        if let Some(path) = crate::slots::held(app, &t)?.map(|s| s.st("path")) {
+            return Ok(holding(&me, &path));
+        }
     }
     let bring = match crate::bring::asked(body)? {
         Some(files) => Some(crate::bring::plan(app, &t, &files, &crate::bring::picks(body)?)?),
@@ -3612,6 +3980,25 @@ fn slot_claim(app: &App, id: i64, body: &Value) -> Result<Value> {
         board::log_event(app, id, board::BOARD, "note", &format!("{}: claimed {slot}{what}", crate::worklane::text("slot")))?;
     }
     Ok(out)
+}
+
+/// A task working in a slot already gets that slot back from a repeat claim, as it is: no wait behind
+/// other tasks' claims and no git, so a `tb` that stopped waiting on the first claim learns it went
+/// through instead of taking a second slot (#930). A done task's claim still goes the long way, which
+/// marks the slot as claimed for its PR visit.
+fn holding(me: &str, path: &str) -> Value {
+    let slot = path.rsplit(crate::util::SEPARATORS).next().unwrap_or_default();
+    json!({"ok": true, "task": me, "path": path, "slot": slot, "held": true, "brought": [], "left": []})
+}
+
+/// `GET /tasks/T<n>/slot`: the live slot the task holds, for a `tb slot claim` that stopped waiting.
+fn slot_held(app: &App, id: i64) -> Result<Value> {
+    let t = board::get_task(app, id)?;
+    let me = rf("task", id);
+    Ok(match crate::slots::held(app, &t)? {
+        Some(s) => holding(&me, &s.st("path")),
+        None => json!({"ok": true, "task": me, "path": null, "slot": null, "held": false}),
+    })
 }
 
 fn shared_checkout(app: &App, t: &Row, path: &str) -> bool {

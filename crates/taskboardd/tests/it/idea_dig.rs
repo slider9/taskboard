@@ -184,3 +184,85 @@ fn a_round_goes_stale_once_the_checkout_moves_far() {
     let r = &b.get(&format!("/ideas/{i}"))["rounds"][0];
     assert_eq!((r["behind"].clone(), r["stale"].clone()), (json!(50), json!(true)));
 }
+
+/// The board's slow worker runs digs on its own thread from here on, and Claude takes a while.
+fn slow_board() -> Board {
+    let mut b = board();
+    Arc::get_mut(&mut b.app).unwrap().inline_deferred = false;
+    let claude = b.dir.path().join("fake-claude");
+    std::fs::write(&claude, "#!/bin/sh\nd=$(dirname \"$0\")\nprintf '%s\\n' \"$@\" >> \"$d/all-args.txt\"\nexec sleep 30\n").unwrap();
+    b
+}
+
+#[test]
+fn a_running_dig_can_be_stopped() {
+    let b = slow_board();
+    let i = b.idea();
+    let id: i64 = i[1..].parse().unwrap();
+    let (code, msg) = b.try_post(&format!("/ideas/{i}/stop"), json!({})).unwrap_err();
+    assert_eq!(code, 409, "nothing to stop yet");
+    assert!(msg.contains("isn't being dug into"), "{msg}");
+
+    assert_eq!(b.post(&format!("/ideas/{i}/dig"), json!({}))["state"], "digging");
+    let job = b.app.next_slow(std::time::Duration::ZERO).expect("the dig is queued");
+    let app = b.app.clone();
+    let started = std::time::Instant::now();
+    let worker = std::thread::spawn(move || job(&app));
+    while !b.dir.path().join("all-args.txt").exists() {
+        assert!(started.elapsed().as_secs() < 10, "Claude was never asked");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let v = b.post(&format!("/ideas/{i}/stop"), json!({}));
+    assert_eq!(v["state"], "new", "back to how it was before the dig");
+    let r = &v["rounds"][0];
+    assert_eq!((r["stopped"].clone(), r["error"].clone()), (json!(true), json!(taskboardd::dig::STOPPED)));
+    assert!(r["finished_at"].is_string());
+    worker.join().unwrap();
+    assert!(started.elapsed().as_secs() < 20, "Claude was stopped, not waited out");
+    let s = b.app.shared.lock();
+    assert!(!s.digging.contains(&id) && s.dig_stop.is_empty(), "nothing is left holding the idea");
+    drop(s);
+    let v = b.get(&format!("/ideas/{i}"));
+    assert_eq!(v["rounds"][0]["error"], json!(taskboardd::dig::STOPPED), "the worker didn't write over the stop");
+
+    // Stopped while still waiting its turn: Claude is never asked.
+    b.calls();
+    b.post(&format!("/ideas/{i}/dig"), json!({}));
+    b.post(&format!("/ideas/{i}/stop"), json!({}));
+    let job = b.app.next_slow(std::time::Duration::ZERO).unwrap();
+    job(&b.app);
+    assert_eq!(b.calls(), "");
+    let v = b.get(&format!("/ideas/{i}"));
+    assert_eq!((v["state"].clone(), v["rounds"][0]["stopped"].clone()), (json!("new"), json!(true)));
+    assert!(b.app.shared.lock().dig_stop.is_empty());
+}
+
+#[test]
+fn a_dig_that_ends_waiting_on_the_owner_is_on_needs_you() {
+    let b = board();
+    let i = b.idea();
+    assert_eq!(b.get("/home")["ideas"], json!([]), "not dug yet");
+
+    b.answer(report());
+    let v = b.post(&format!("/ideas/{i}/dig"), json!({}));
+    let ideas = b.get("/home")["ideas"].clone();
+    assert_eq!(ideas.as_array().unwrap().len(), 1, "{ideas}");
+    let n = &ideas[0];
+    assert_eq!((n["id"].clone(), n["ref"].clone(), n["title"].clone(), n["project"].clone()),
+        (json!(format!("idea:{i}")), json!(i), json!("Offline mode"), json!("webapp")));
+    assert_eq!((n["verdict"].clone(), n["questions"].clone()), (json!("partly"), json!(1)));
+    assert_eq!(n["at"], v["rounds"][0]["finished_at"], "when the report came in");
+
+    let round = v["rounds"][0]["id"].clone();
+    b.post(&format!("/ideas/{i}/answer"), json!({"round": round, "question": "web", "answer": "No"}));
+    assert_eq!(b.get("/home")["ideas"], json!([]), "answered, and it only partly fits: nothing waits on the owner");
+
+    b.answer(json!({"blocks": [{"type": "gist", "text": "It fits."}, {"type": "scorecard", "fit": "fits", "size": "s", "risk": "low"}]}));
+    b.post(&format!("/ideas/{i}/dig"), json!({}));
+    let ideas = b.get("/home")["ideas"].clone();
+    assert_eq!((ideas[0]["verdict"].clone(), ideas[0]["questions"].clone()), (json!("fits"), json!(0)), "fits and asks nothing: ready to plan");
+
+    b.post(&format!("/ideas/{i}/shelve"), json!({}));
+    assert_eq!(b.get("/home")["ideas"], json!([]), "put aside");
+}

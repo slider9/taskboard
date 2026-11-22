@@ -1,10 +1,12 @@
 //! The time review: where a period's agent time went, built from the stored spans (`spans.rs`) and the
 //! tasks' status changes (`task_states`). It runs on `[review]`'s schedule, keeps every review it makes,
-//! and tells the owner with a notification and a Needs you item that stays until the review is opened.
+//! and tells the owner with a notification and a Needs you item. The item stays until its fixes are dealt
+//! with (each planned into a goal, deferred, dropped or done), or, for a review that filed none, until
+//! it's opened (`holds_owner`).
 
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::{Datelike, Duration, Local, NaiveDateTime, NaiveTime, TimeZone};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -49,9 +51,15 @@ const WRAPPERS: &[&str] = &["Task", "Agent"];
 const WAITS: &[&str] = &["background poll", "load wait", "ci wait"];
 
 pub fn run(app: std::sync::Arc<App>) {
+    if let Err(e) = crate::review_fixes::resume(&app) {
+        app.info(format!("review: picking up fixes a restart cut short: {}", e.message));
+    }
     while !app.stopping() {
         if let Err(e) = tick(&app, hours::now_local()) {
             app.info(format!("review: {}", e.message));
+        }
+        if let Err(e) = app.db.tx(|| settle(&app)) {
+            app.info(format!("review: settling Needs you: {}", e.message));
         }
         app.sleep(TICK_SECS);
     }
@@ -226,8 +234,11 @@ fn rerun_chains(spans: &[&Span]) -> Vec<Value> {
     out
 }
 
-/// The time tasks spent waiting on the owner (status `needs`, other than lost terminals), within the period.
-fn owner_wait(app: &App, start: f64, end: f64) -> Result<Value> {
+/// The time tasks spent waiting on the owner's answer (status `needs`; not human tasks or lost terminals), within the
+/// period. Like the day view, it counts only while the owner could answer: not while the Mac slept, the
+/// owner was away from it, or outside the work hours. The total is the time at least one task waited, so
+/// tasks waiting side by side count once; the reasons and tasks keep each task's own wait.
+pub(crate) fn owner_wait(app: &App, start: f64, end: f64) -> Result<Value> {
     let rows = app.db.q(
         "SELECT task_id, at, status, needs_reason FROM task_states WHERE at < ?2 AND task_id IN (
            SELECT task_id FROM task_states WHERE at >= ?1 AND at < ?2
@@ -238,20 +249,27 @@ fn owner_wait(app: &App, start: f64, end: f64) -> Result<Value> {
     )?;
     let mut by_reason: HashMap<String, f64> = HashMap::new();
     let mut by_task: HashMap<i64, f64> = HashMap::new();
+    let mut spans: Vec<(f64, f64)> = Vec::new();
+    let away = days::away(app, start, end);
     for (i, r) in rows.iter().enumerate() {
-        if r.s("status") != Some("needs") || r.s("needs_reason") == Some("lost") {
+        if r.s("status") != Some("needs") || !days::waits_on_owner(r.s("needs_reason")) {
             continue;
         }
         let Some(from) = r.s("at").and_then(parse_iso) else { continue };
         let task = r.i0("task_id");
         let to = rows.get(i + 1).filter(|n| n.i0("task_id") == task).and_then(|n| n.s("at")).and_then(parse_iso).unwrap_or(end);
-        let secs = to.min(end) - from.max(start);
+        let (a, b) = (from.max(start), to.min(end));
+        if b <= a {
+            continue;
+        }
+        spans.push((a, b));
+        let secs = days::counted(a, b, &away);
         if secs > 0.0 {
             *by_reason.entry(r.s("needs_reason").filter(|s| !s.is_empty()).unwrap_or("other").to_string()).or_default() += secs;
             *by_task.entry(task).or_default() += secs;
         }
     }
-    let total: f64 = by_task.values().sum();
+    let total: f64 = crate::clock::merge(spans).iter().map(|&(a, b)| days::counted(a, b, &away)).sum();
     let mut tasks: Vec<(i64, f64)> = by_task.into_iter().collect();
     tasks.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     let tasks: Vec<Value> = tasks.into_iter().take(TOP).map(|(t, s)| json!({"task": rf("task", t), "title": title(app, t), "seconds": round1(s)})).collect();
@@ -335,7 +353,40 @@ pub fn report(app: &App, start: f64, end: f64) -> Result<Value> {
     });
     r["change"] = change(app, &r, start)?;
     r["suggestions"] = json!(suggest(&r));
+    r["shipped"] = shipped(app, &iso(start), &iso(end))?;
     Ok(r)
+}
+
+/// What the period shipped, from `start` up to `end` (ISO times): the tasks finished done (not
+/// failed), the goals that finished, and the releases cut (not failed), each newest first.
+pub fn shipped(app: &App, start: &str, end: &str) -> Result<Value> {
+    let tasks: Vec<Value> = app
+        .db
+        .q("SELECT * FROM tasks WHERE status = 'done' AND COALESCE(failed, 0) = 0 AND finished_at >= ? AND finished_at < ? \
+            ORDER BY finished_at DESC, id DESC", p![start, end])?
+        .iter()
+        .map(|t| json!({"ref": crate::human::task_ref(t), "title": t.v("title"), "project": t.v("project"),
+                        "goal": rf_opt("goal", t.i("goal_id")), "finished_at": t.v("finished_at"),
+                        "pr_num": t.v("pr_num"), "pr_url": t.v("pr_url")}))
+        .collect();
+    let mut goals = vec![];
+    let candidates = app.db.q(
+        "SELECT g.id, g.name, g.project, MAX(COALESCE(t.finished_at, t.updated_at)) AS at FROM goals g JOIN tasks t ON t.goal_id = g.id \
+         GROUP BY g.id HAVING at >= ? AND at < ? ORDER BY at DESC, g.id DESC",
+        p![start, end],
+    )?;
+    for g in candidates {
+        if crate::board::goal_finished(app, g.id())? {
+            goals.push(json!({"ref": rf("goal", g.id()), "name": g.v("name"), "project": g.v("project"), "finished_at": g.v("at")}));
+        }
+    }
+    let releases: Vec<Value> = app
+        .db
+        .q("SELECT * FROM releases WHERE failed_at IS NULL AND cut_at >= ? AND cut_at < ? ORDER BY cut_at DESC, id DESC", p![start, end])?
+        .iter()
+        .map(|r| json!({"ref": rf("release", r.id()), "project": r.v("project"), "name": r.v("name"), "notes": r.v("notes"), "cut_at": r.v("cut_at")}))
+        .collect();
+    Ok(json!({"tasks": tasks, "goals": goals, "releases": releases}))
 }
 
 fn category_secs(r: &Value, name: &str) -> f64 {
@@ -444,11 +495,15 @@ fn fix_count(data: &Value, fixes: &Value) -> usize {
     data["suggestions"].as_array().map_or(0, Vec::len)
 }
 
+/// "12.5 h on builds".
+fn builds_text(r: &Value) -> String {
+    format!("{} h on builds", round1(category_secs(r, "build") / 3600.0))
+}
+
 /// "Weekly review: 12.5 h on builds, 3 fixes suggested".
 pub fn headline(r: &Value, fixes: &Value) -> String {
-    let builds = round1(category_secs(r, "build") / 3600.0);
     let n = fix_count(r, fixes);
-    format!("Weekly review: {builds} h on builds, {n} {} suggested", if n == 1 { "fix" } else { "fixes" })
+    format!("Weekly review: {}, {n} {} suggested", builds_text(r), if n == 1 { "fix" } else { "fixes" })
 }
 
 fn key(id: i64) -> String {
@@ -459,7 +514,8 @@ fn notification_id(id: i64) -> String {
     format!("taskboard-review-{id}")
 }
 
-/// Tells the owner review `id` is ready: a notification that opens it, and a Needs you item that stays until it's opened.
+/// Tells the owner review `id` is ready: a notification that opens it, and a Needs you item that stays
+/// while the review holds the owner (`holds_owner`).
 pub fn announce(app: &App, id: i64) -> Result<()> {
     let r = get(app, id)?;
     let text = headline(&r["data"], &r["fixes"]);
@@ -499,17 +555,107 @@ pub fn get(app: &App, id: i64) -> Result<Value> {
     let Some(r) = app.db.q1("SELECT * FROM reviews WHERE id = ?", p![id])? else { return err(404, "There's no review with that id.") };
     let mut v = card(&r);
     v["data"] = serde_json::from_str(&r.st("data")).unwrap_or(Value::Null);
+    // A review kept before reviews listed what shipped.
+    if v["data"].is_object() && v["data"].get("shipped").is_none() {
+        v["data"]["shipped"] = shipped(app, &r.st("period_start"), &r.st("period_end"))?;
+    }
     v["fix_issues"] = json!(crate::review_fixes::issues(app, id)?);
     Ok(v)
 }
 
-/// The owner opened review `id`: its Needs you item and notification go.
+/// The owner opened review `id`: its notification goes, and its Needs you item too unless fixes it
+/// filed still wait to be dealt with.
 pub fn seen(app: &App, id: i64) -> Result<Value> {
     get(app, id)?;
     app.db.x("UPDATE reviews SET seen_at = COALESCE(seen_at, ?) WHERE id = ?", p![now_iso(), id])?;
-    dispatch::clear_alert_key(app, &key(id))?;
     dispatch::withdraw_id(app, &notification_id(id));
+    settle_one(app, id)?;
     get(app, id)
+}
+
+/// How many fixes review `id` filed or linked, and how many of those are dealt with: no longer
+/// untriaged in the Backlog (open and in no goal). An issue that's gone counts as dealt with.
+pub fn fixes_dealt(app: &App, id: i64) -> Result<(usize, usize)> {
+    let st = crate::review_fixes::status(app, id)?;
+    let ids: Vec<i64> = ["filed", "linked"].iter().flat_map(|k| str_list(st.get(*k))).filter_map(|r| r.trim_start_matches('B').parse().ok()).collect();
+    let mut dealt = 0;
+    for n in &ids {
+        if app.db.count("SELECT COUNT(*) FROM issues WHERE id = ? AND state = 'open' AND goal_id IS NULL", p![n])? == 0 {
+            dealt += 1;
+        }
+    }
+    Ok((ids.len(), dealt))
+}
+
+/// Whether review `id` still holds the owner in Needs you: its fixes are still being written, or some
+/// it filed aren't dealt with yet, or it filed none and hasn't been opened.
+pub fn holds_owner(app: &App, id: i64) -> Result<bool> {
+    let Some(r) = app.db.q1("SELECT seen_at FROM reviews WHERE id = ?", p![id])? else { return Ok(false) };
+    if crate::review_fixes::status(app, id)?["state"] == "running" {
+        return Ok(true);
+    }
+    Ok(match fixes_dealt(app, id)? {
+        (0, _) => r.s("seen_at").is_none(),
+        (n, dealt) => dealt < n,
+    })
+}
+
+fn settle_one(app: &App, id: i64) -> Result<()> {
+    if !holds_owner(app, id)? {
+        dispatch::clear_alert_key(app, &key(id))?;
+        dispatch::withdraw_id(app, &notification_id(id));
+    }
+    Ok(())
+}
+
+/// Takes down the Needs you items of the reviews that no longer hold the owner (`holds_owner`).
+pub fn settle(app: &App) -> Result<()> {
+    for a in dispatch::alerts(app) {
+        if let Some(id) = a["review_id"].as_i64() {
+            settle_one(app, id)?;
+        }
+    }
+    Ok(())
+}
+
+/// Review `id`'s Needs you row once it has fixes: a title that counts them, and when it was opened and
+/// how many are dealt with under it (its build hours until there's either). Its `fixes` and `opened`
+/// say what the row's button opens.
+pub fn needs_row(app: &App, id: i64, a: &mut Value) -> Result<()> {
+    let Some(r) = app.db.q1("SELECT created_at, period_end, seen_at, data FROM reviews WHERE id = ?", p![id])? else { return Ok(()) };
+    let (n, dealt) = fixes_dealt(app, id)?;
+    if n == 0 {
+        return Ok(());
+    }
+    let today = local_now().date_naive();
+    let day = |s: Option<&str>| s.and_then(parse_iso).map(|t| local_dt(t).date_naive());
+    a["title"] = json!(row_title(n, day(r.s("created_at")), day(r.s("period_end")), today));
+    let detail = row_detail(day(r.s("seen_at")), dealt, today);
+    a["detail"] = json!(if detail.is_empty() { builds_text(&serde_json::from_str(&r.st("data")).unwrap_or(Value::Null)) } else { detail });
+    a["fixes"] = json!(n);
+    a["opened"] = json!(r.s("seen_at").is_some());
+    Ok(())
+}
+
+/// "3 fixes from this week's review", or "from the Nov 7 review" once it's a week old.
+fn row_title(n: usize, made: Option<NaiveDate>, end: Option<NaiveDate>, today: NaiveDate) -> String {
+    let fixes = if n == 1 { "1 fix".to_string() } else { format!("{n} fixes") };
+    match (made, end) {
+        (Some(m), Some(e)) if (today - m).num_days() >= 7 => format!("{fixes} from the {} review", e.format("%b %-d")),
+        _ => format!("{fixes} from this week’s review"),
+    }
+}
+
+/// "Opened Monday · 2 dealt with": each part only when there is one.
+fn row_detail(opened: Option<NaiveDate>, dealt: usize, today: NaiveDate) -> String {
+    let opened = opened.map(|d| match (today - d).num_days() {
+        0 => "Opened today".to_string(),
+        1 => "Opened yesterday".to_string(),
+        2..=6 => format!("Opened {}", d.format("%A")),
+        _ => format!("Opened {}", d.format("%b %-d")),
+    });
+    let dealt = (dealt > 0).then(|| format!("{dealt} dealt with"));
+    [opened, dealt].into_iter().flatten().collect::<Vec<_>>().join(" · ")
 }
 
 /// One task's spans in order (`tb review T12`), with its time by category.
@@ -566,6 +712,20 @@ mod tests {
         assert_eq!(quantile(&v, 0.5), 6.0);
         assert_eq!(quantile(&v, 0.9), 9.0);
         assert_eq!(quantile(&[], 0.5), 0.0);
+    }
+
+    #[test]
+    fn the_needs_you_row_counts_fixes_and_says_when_it_was_opened() {
+        let d = |s: &str| NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+        let today = d("2026-11-19");
+        assert_eq!(row_title(3, Some(d("2026-11-13")), Some(d("2026-11-13")), today), "3 fixes from this week’s review");
+        assert_eq!(row_title(1, Some(d("2026-11-06")), Some(d("2026-11-06")), today), "1 fix from the Nov 6 review", "a week on, it names its week");
+        assert_eq!(row_detail(Some(d("2026-11-16")), 2, today), "Opened Monday · 2 dealt with");
+        assert_eq!(row_detail(Some(d("2026-11-19")), 0, today), "Opened today");
+        assert_eq!(row_detail(Some(d("2026-11-18")), 1, today), "Opened yesterday · 1 dealt with");
+        assert_eq!(row_detail(Some(d("2026-11-02")), 0, today), "Opened Nov 2");
+        assert_eq!(row_detail(None, 1, today), "1 dealt with");
+        assert_eq!(row_detail(None, 0, today), "");
     }
 
     #[test]

@@ -56,8 +56,8 @@ pub enum Look {
     Ref,
     /// A header chip (`.hchip`); `on` while its dropdown is open.
     Chip { on: bool },
-    /// A footer view (`.foot-btn`); `on` while it's the one open.
-    Foot { on: bool },
+    /// A tab under the header; `on` while it's the one open.
+    PanelTab { on: bool },
     /// One of a question's options in the needs-you banner (`.opt`); `on` while it's a picked
     /// choice waiting for Send.
     Opt { on: bool },
@@ -94,6 +94,8 @@ pub enum LinkLook {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Go {
     Goal(String),
+    /// The goal's page scrolled to this wave's card: the goal chip.
+    GoalWave(String, i64),
     Session(String),
     /// The board page with this issue's panel open.
     Issue(String),
@@ -205,7 +207,6 @@ pub enum K {
     List,
     Li,
     Files,
-    MetaRow,
     Chips,
     LogItem,
     Md,
@@ -232,8 +233,8 @@ pub enum K {
     TermMenu,
     /// A menu row: its button, then what it does.
     MenuItem { danger: bool },
-    /// The views at the panel's foot: What to do, Context, Full log.
-    Foot,
+    /// The tabs under the header: Timeline, Brief, Context, Full log.
+    PanelTabs,
     /// A reviewer's name in the PR's Reviewers rows, then their popover while it's `open`.
     RevName { open: bool },
     /// The reviewer popover: its head, the open asks (or that there are none), the week's answered ones.
@@ -361,16 +362,19 @@ pub struct Ui {
     pub drafts: HashMap<String, String>,
     pub busy: HashSet<String>,
     pub notes: HashMap<String, (String, bool)>,
-    pub meta_edit: HashMap<String, Vec<(String, String)>>,
+    /// Human tasks whose empty Done was already asked about once: the next Done sends.
+    pub did_asked: HashSet<String>,
     pub handoffs: HashMap<String, String>,
     /// "" means "all".
     pub log_filter: String,
-    pub att_menu: Option<String>,
-    pub att_edit: Option<String>,
     /// The header's Attached dropdown is open.
     pub att_drop: bool,
     /// The now stop's ⋯ terminal menu is open.
     pub term_menu: bool,
+    /// The need box's ⋯ menu (Reopen the old conversation, See what the new terminal gets) is open.
+    pub box_menu: bool,
+    /// The PR steps' ⋯ menu (Merge anyway…) is open.
+    pub pr_menu: bool,
     /// The finished timeline stops opened in place.
     pub tl_open: HashSet<TlStep>,
     /// Whose reviewer popover is open, by their host login.
@@ -546,6 +550,11 @@ pub fn scheduled_at(t: &Value) -> Option<String> {
     })
 }
 
+/// The terminal a start opened while no agent has checked in from it (`start_terminal` on its card).
+fn start_terminal(t: &Value) -> Option<&Value> {
+    obj(t, "start_terminal").filter(|_| s(t, "status") == "queued")
+}
+
 fn starts_by_hand(t: &Value) -> bool {
     matches!(s(t, "status"), "queued" | "planned") && obj(t, "goal").is_none() && !b(t, "starting") && start_retry_at(t).is_none()
 }
@@ -649,6 +658,9 @@ pub fn status_pill(t: &Value) -> Node {
     }
     let k = st_key(t);
     if k == "queued" && b(t, "starting") {
+        if let Some(w) = start_terminal(t).and_then(|_| opt_s(t, "waiting")) {
+            return Node::Pill { s: "Starting".into(), tone: Tone::Queued, tip: Some(w.to_string()) };
+        }
         return pill("Starting", Tone::Queued);
     }
     pill(status_label(k), st_tone(k))
@@ -722,8 +734,8 @@ fn head_chips(c: &Ctx, t: &Value) -> Option<Node> {
     (!chips.is_empty()).then(|| el(K::Head, chips))
 }
 
-/// `goalChip(t)`: "Wave 5 · 18 of 20", opening the goal.
-fn goal_chip(t: &Value) -> Option<Node> {
+/// `goalChip(t)`: "Wave 5 · 18 of 20", opening the goal at the task's wave.
+pub fn goal_chip(t: &Value) -> Option<Node> {
     let g = obj(t, "goal").filter(|g| g.get("id").is_some_and(|x| !x.is_null()) || opt_s(g, "ref").is_some())?;
     let gr = rf(g, "G");
     let wave = t["wave"].as_i64();
@@ -737,7 +749,11 @@ fn goal_chip(t: &Value) -> Option<Node> {
     let mut tip = format!("Open {gr}");
     tip.extend(wave.map(|w| format!(" at wave {w}")));
     tip.extend(opt_s(g, "next_ref").map(|n| format!(" · next up: {n}")));
-    Some(Node::Link { s: words.join(" · "), go: Go::Goal(gr), tip: Some(tip), look: LinkLook::Chip })
+    let go = match wave {
+        Some(w) => Go::GoalWave(gr, w),
+        None => Go::Goal(gr),
+    };
+    Some(Node::Link { s: words.join(" · "), go, tip: Some(tip), look: LinkLook::Chip })
 }
 
 /// `dropItem(a)`: one attachment in the Attached dropdown; its summary, when it has one, rides
@@ -871,33 +887,31 @@ pub fn panel(c: &Ctx) -> Node {
     }
     kids.push(txt(or_empty(&t["title"]), St::Title));
     kids.extend(head_chips(c, t));
-    kids.extend(banner(c, t, alert));
+    kids.push(panel_tabs(c, t, tab));
     let body = match tab {
         "what" => vec![what_view(t)],
         "context" => context_tab(c, t),
         "log" => log_tab(c, t),
-        _ => timeline(c, t),
+        // The one thing the owner can do, on top; the steps under it.
+        _ => banner(c, t, alert).into_iter().chain(timeline(c, t)).collect(),
     };
     kids.push(el(K::Body, body));
-    kids.push(panel_foot(c, t, tab));
     el(K::Col, kids)
 }
 
-/// `panelFoot(t, tab)`: What to do, Context and the full log; Timeline goes back.
-fn panel_foot(c: &Ctx, t: &Value, tab: &str) -> Node {
+/// The tabs under the header, all four always, the open one marked: Timeline, Brief, Context and
+/// the full log with its count.
+fn panel_tabs(c: &Ctx, t: &Value, tab: &str) -> Node {
     // The task carries only its newest page of the log; `log_total` counts them all.
     let n = t["log_total"].as_u64().map_or(arr(t, "log").len(), |n| n as usize);
     let mut kids = Vec::new();
-    for (id, label) in [("overview", "Timeline"), ("what", "What to do"), ("context", "Context"), ("log", "Full log")] {
-        if id == "overview" && tab == "overview" {
-            continue;
-        }
-        kids.push(c.btn(label, Act::new("tab", id, "", ""), Look::Foot { on: tab == id }, false, None));
+    for (id, label) in [("overview", "Timeline"), ("what", "Brief"), ("context", "Context"), ("log", "Full log")] {
+        kids.push(c.btn(label, Act::new("tab", id, "", ""), Look::PanelTab { on: tab == id }, false, None));
         if id == "log" && n > 0 {
             kids.push(txt(n.to_string(), St::Count));
         }
     }
-    el(K::Foot, kids)
+    el(K::PanelTabs, kids)
 }
 
 /// `whatView(t)`.
@@ -908,17 +922,18 @@ fn what_view(t: &Value) -> Node {
     }
 }
 
-/// `answerBtns(r)`.
+/// `answerBtns(r)`: off until something's typed in the answer box.
 fn answer_btns(c: &Ctx, r: &str) -> Vec<Node> {
     let at = hours_open_at(c.state);
     let grp = format!("ask:{r}");
-    let mut out = vec![c.btn("Send answer", Act::new("answer", "", r, &grp), Look::Primary, false, None)];
+    let empty = c.draft(&format!("answer:{r}")).trim().is_empty();
+    let mut out = vec![c.btn("Send answer", Act::new("answer", "", r, &grp), Look::Primary, empty, None)];
     if !at.is_empty() {
         out.push(c.btn(
             &format!("Send at {at}"),
             Act::new("answer", "morning", r, &grp),
             Look::Plain,
-            false,
+            empty,
             Some("Hold the answer until work hours start; the task doesn’t start before then"),
         ));
     }
@@ -1024,6 +1039,33 @@ fn step_links(text: &str) -> Vec<String> {
     out
 }
 
+/// The step of a human task that asks for something in the note ("4. Send back the Key ID in the
+/// note."), as the sentence Done answers an empty note with. None when no step wants a note.
+pub fn note_ask(detail: &str) -> Option<String> {
+    for line in detail.lines() {
+        let line = line.trim();
+        let digits = line.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 || !line[digits..].starts_with(['.', ')']) {
+            continue;
+        }
+        let (n, text) = (&line[..digits], line[digits + 1..].trim());
+        let lower = text.to_lowercase();
+        if !lower.split(|c: char| !c.is_alphanumeric()).any(|w| w == "note") {
+            continue;
+        }
+        let what = ["send back ", "send ", "paste ", "write ", "put ", "add "].iter().find_map(|v| {
+            let rest = lower.strip_prefix(v).map(|_| &text[v.len()..])?;
+            let end = [" in the note", " into the note", " to the note", " on the note"].iter().filter_map(|e| rest.to_lowercase().find(e)).min()?;
+            Some(rest[..end].trim().to_string())
+        });
+        return Some(match what.filter(|w| !w.is_empty()) {
+            Some(w) => format!("Step {n} asks for {w}. Press Done again to send no note."),
+            None => format!("Step {n} asks for a note. Press Done again to send no note."),
+        });
+    }
+    None
+}
+
 fn link_label(u: &str) -> String {
     let host = u.split("://").nth(1).unwrap_or(u).split('/').next().unwrap_or(u);
     format!("Open {}", host.trim_start_matches("www."))
@@ -1043,10 +1085,13 @@ fn human_tab(c: &Ctx, t: &Value) -> Vec<Node> {
         if let Some(n) = opt_s(t, "owner_note") {
             bx.push(txt(n, St::Plain));
         }
+        let reopen = c.btn("Reopen", Act::new("owner-reopen", "", &r, &grp), Look::Plain, false, Some("Back in Needs you, waiting on you"));
+        bx.push(el(K::Row, vec![reopen]));
         out.push(el(K::Box(BoxTone::Done), bx));
     } else {
         let mut bx = vec![txt("Yours to do", St::BoxLabel)];
-        if let Some(w) = opt_s(t, "waiting").filter(|_| status == "queued") {
+        // What it waits on has its own box below.
+        if let Some(w) = opt_s(t, "waiting").filter(|_| status == "queued" && arr(t, "blocked_by").is_empty()) {
             bx.push(txt(w, St::Small));
         }
         bx.push(note_body(detail));
@@ -1055,17 +1100,48 @@ fn human_tab(c: &Ctx, t: &Value) -> Vec<Node> {
             bx.push(el(K::Row, links.iter().map(|u| c.btn(&link_label(u), Act::new("open-url", u, &r, &grp), Look::Plain, false, Some(u))).collect()));
         }
         let k = format!("did:{r}");
+        bx.push(txt("Note for the agents", St::LrowKey));
         bx.push(Node::Field { value: c.draft(&k), key: k, placeholder: "", multi: true, mono: false });
+        // Waiting on another task: Done stays off until that one's done.
+        let blockers: Vec<String> = arr(t, "blocked_by").iter().map(|x| or_empty(&x["ref"])).filter(|x| !x.is_empty()).collect();
+        let done_tip = if blockers.is_empty() { "Anything waiting for this goes on, with what you wrote".to_string() } else { format!("Opens once {} is done", blockers.join(" and ")) };
         let mut row = vec![
-            c.btn("Done", Act::new("did", "", &r, &grp), Look::Primary, false, Some("Anything waiting for this goes on, with what you wrote")),
+            c.btn("Done", Act::new("did", "", &r, &grp), Look::Primary, !blockers.is_empty(), Some(&done_tip)),
             c.btn("Talk it over", Act::new("talk", "", &r, &grp), Look::Out, false, Some("Ask Claude about it in a Midna terminal")),
         ];
         row.extend(c.note(&grp));
         bx.push(el(K::Row, row));
         out.push(el(K::Box(BoxTone::Ask), bx));
+        out.extend(waiting_box(c, t));
+        return out;
     }
     out.extend(blocked_row(c, t));
     out
+}
+
+/// A blocked human task's quiet box: "Waiting on T5 Set up signing", each task it waits on opening in
+/// the panel, with its PR when it has one.
+fn waiting_box(c: &Ctx, t: &Value) -> Option<Node> {
+    let bs = arr(t, "blocked_by");
+    if bs.is_empty() {
+        return None;
+    }
+    let mut kids = vec![txt("Waiting on", St::BoxLabel)];
+    for x in bs {
+        let br = or_empty(&x["ref"]);
+        let mut row = vec![c.btn(&br, Act::new("open-task", "", &br, ""), Look::Ref, false, Some(&format!("Open {br}"))), txt(or_empty(&x["title"]), St::Plain)];
+        if let Some(p) = obj(x, "pr") {
+            let label = format!("PR #{}", or_empty(&p["num"]));
+            row.push(match opt_s(p, "url").filter(|u| is_web(u)) {
+                Some(u) => Node::Link { s: format!("{label} ↗"), go: Go::Url(u.to_string()), tip: Some("Open the pull request".into()), look: LinkLook::Small },
+                None => txt(label, St::Small),
+            });
+        }
+        kids.push(el(K::Row, row));
+        // Done but still holding it: why.
+        kids.extend(opt_s(x, "why").filter(|_| s(x, "status") == "done").map(|why| txt(why, St::Small)));
+    }
+    Some(el(K::Box(BoxTone::Quiet), kids))
 }
 
 /// `tlNode(st, head, body, card)`.
@@ -1107,7 +1183,8 @@ fn timeline(c: &Ctx, t: &Value) -> Vec<Node> {
     if status == "done" {
         nodes.push(done_node(c, t));
     }
-    if status != "done" || pr_stopped(t).is_some() {
+    // A done task whose PR stopped: the box up top is the one call to action, the PR's steps say where.
+    if status != "done" {
         nodes.push(now_node(c, t));
     }
     nodes.extend(pr_nodes(c, t));
@@ -1159,6 +1236,11 @@ fn started_detail(c: &Ctx, t: &Value) -> Vec<Node> {
                 kids.push(txt(closed.map_or("Closed".to_string(), |h| format!("Closed {h}")), St::Time));
             } else {
                 kids.push(term_state(x));
+                // Another terminal of the task's still open: bring that one up.
+                let sid = js_string(&x["id"]);
+                if !sid.is_empty() {
+                    kids.push(c.btn("", Act::new("term-focus", "", sid, format!("manage:{r}")), Look::Icon(Icon::Focus), false, Some("Focus in Midna")));
+                }
             }
             el(K::DetTerm { live }, kids)
         })
@@ -1370,6 +1452,10 @@ fn done_node(c: &Ctx, t: &Value) -> Node {
             body.push(el(K::Line, line));
         }
     }
+    // A member that added its work to the PR it shares: that PR's steps show on its anchor.
+    if pr_of(t).is_none() {
+        body.extend(group_line(c, t));
+    }
     // Failed tasks get Try again; a done one isn't queued again from here. Closing its terminal waits
     // behind the ⋯ menu.
     let mut row = Vec::new();
@@ -1397,7 +1483,7 @@ fn now_node(c: &Ctx, t: &Value) -> Node {
     let act = format!("act:{r}");
     let status = s(t, "status");
     let working = status == "working";
-    let warn = b(t, "lost") || status == "needs" || pr_stopped(t).is_some();
+    let warn = b(t, "lost") || status == "needs";
     let sub = if working {
         let mut sub = vec![fmt::run_span(t)];
         sub.extend(opt_s(t, "updated_at").map(|at| format!("updated {}", fmt::ago(at))));
@@ -1409,23 +1495,36 @@ fn now_node(c: &Ctx, t: &Value) -> Node {
     if warn {
         // Lost or a failed start isn't a question: nothing was asked.
         let asked = status == "needs" && !b(t, "lost") && !matches!(s(t, "needs_reason"), "start_failed" | "compact_failed");
-        let (sub, at) = match opt_s(t, "updated_at").filter(|_| asked) {
-            Some(at) => {
-                let mut sub = vec![format!("Asked {}", fmt::ago(at))];
-                sub.extend(Some(fmt::span_between(fmt::run_start(t), at)).filter(|x| !x.is_empty()).map(|x| format!("after {x} of work")));
-                (sub.join(", "), fmt::hhmm(at))
-            }
-            None => (String::new(), String::new()),
-        };
+        // The box up top says what and when; here just how long it had worked first.
+        let sub = opt_s(t, "updated_at")
+            .filter(|_| asked)
+            .map(|at| fmt::span_between(fmt::run_start(t), at))
+            .filter(|x| !x.is_empty())
+            .map(|x| format!("After {x} of work"))
+            .unwrap_or_default();
         let mut out: Vec<Node> = blocked_row(c, t).into_iter().collect();
-        if status != "done" {
-            out.extend(term_actions(c, t));
-        }
-        return tl_node(TlSt::Warn, tl_head(txt("Waiting on you", St::TlHWarn), &sub, &at), out, true);
+        out.extend(term_actions(c, t));
+        out.extend(then_line(c, t));
+        return tl_node(TlSt::Warn, tl_head(txt("Waiting on you", St::TlHWarn), &sub, ""), out, true);
     }
     let mut out = Vec::new();
     if let Some(latest) = opt_s(t, "latest").filter(|_| working) {
         out.push(txt(latest, St::TlText));
+    }
+
+    if let Some(term) = start_terminal(t) {
+        let name = opt_s(term, "name").unwrap_or("its terminal");
+        let line = opt_s(t, "waiting").map(str::to_string).unwrap_or_else(|| format!("Opened {name}; waiting for its agent to check in"));
+        let tone = if b(term, "folder_trust") { St::WarnHelp } else { St::TlText };
+        let mut st = vec![
+            txt(line, tone),
+            el(
+                K::Row,
+                vec![c.btn("Start over", Act::new("start", "new", &r, &act), Look::SoftWide, false, Some(&format!("Close {name} and start it again")))],
+            ),
+        ];
+        st.extend(c.note(&act));
+        out.push(el(K::Stack, st));
     }
 
     if let Some(at) = fmt::outside(t) {
@@ -1496,20 +1595,47 @@ fn now_node(c: &Ctx, t: &Value) -> Node {
     }
 
     out.extend(blocked_row(c, t));
-    if status != "done" {
-        out.extend(term_actions(c, t));
-    }
+    out.extend(term_actions(c, t));
+    out.extend(then_line(c, t));
     tl_node(TlSt::Now, tl_head(status_pill(t), &sub, ""), out, true)
 }
 
-/// `banner(t, alert)`: what the task needs from you, full width under the chips: a question with its
-/// options and Write an answer, a lost or failed start with its ways back, a stuck check-in, or the
-/// PR's terminal stopping. A board alert about the task shows in it too.
+/// "Terminal lost · 9:02 AM": what happened, then when (12-hour, with the day once it isn't today).
+fn stamp(label: &str, at: Option<&str>) -> String {
+    match at.map(fmt::day_time).filter(|w| !w.is_empty()) {
+        Some(w) => format!("{label} · {w}"),
+        None => label.to_string(),
+    }
+}
+
+/// A need box's ⋯ button, and its menu while it's open.
+fn box_menu(c: &Ctx, r: &str, items: Vec<Node>) -> Vec<Node> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![c.btn("", Act::new("box-menu", "", r, ""), Look::Icon(Icon::More), false, Some("More ways back"))];
+    if c.ui.box_menu {
+        out.push(el(K::TermMenu, items));
+    }
+    out
+}
+
+/// The board's own work on an open PR (fixing checks, rebasing, answering comments, merging), with
+/// nothing for the owner to do.
+fn quiet_stage(p: &Value) -> bool {
+    pr_open(p) && obj(p, "stage").is_some_and(|st| matches!(s(st, "phase"), "fix" | "rebase" | "comments" | "merge") && obj(st, "owner").is_none() && obj(st, "stopped").is_none())
+}
+
+/// The one thing the task needs from you, on top of the Timeline: a question with its options and
+/// Focus in Midna, a lost terminal or failed start with its ways back, a stuck check-in, the PR's
+/// terminal stopping, or the PR waiting on your review. While the PR's work is the board's, a quiet
+/// box says nothing's needed. Each leads with what happened and when. A board alert about the task
+/// shows in it too.
 fn banner(c: &Ctx, t: &Value, alert: Option<&Value>) -> Option<Node> {
     let r = rf(t, "T");
-    let who = who(t);
     let act = format!("act:{r}");
     let status = s(t, "status");
+    let human = s(t, "kind") == "human";
     let (tone, mut bx) = if b(t, "lost") {
         let saved = saved_line(t);
         let claude = opt_s(t, "claude_session_id").is_some();
@@ -1520,11 +1646,16 @@ fn banner(c: &Ctx, t: &Value, alert: Option<&Value>) -> Option<Node> {
         let label = match (quiet, found.is_empty()) {
             (true, _) => "Stopped",
             (_, true) => "Terminal lost",
-            _ => "Looks finished",
+            _ => "Terminal lost, looks finished",
         };
-        let mut bx = vec![txt(label, St::BoxLabel), txt(opt_s(t, "latest").unwrap_or("The terminal closed before the task was done."), St::BannerText)];
+        let closed = opt_s(t, "terminal_closed_at").or(opt_s(t, "updated_at"));
+        let said = match opt_s(t, "latest") {
+            Some(l) => format!("Last update: {l}"),
+            None => "The terminal closed before the task was done.".to_string(),
+        };
+        let mut bx = vec![txt(stamp(label, closed), St::BoxLabel), txt(said, St::BannerText)];
         for f in found {
-            let line = format!("{} · {}", s(f, "what"), fmt::hhmm(s(f, "at")));
+            let line = format!("{} · {}", s(f, "what"), fmt::day_time(s(f, "at")));
             bx.push(match opt_s(f, "url").filter(|u| is_web(u)) {
                 Some(u) => Node::Link { s: line, go: Go::Url(u.to_string()), tip: None, look: LinkLook::Small },
                 None => txt(line, St::Small),
@@ -1533,22 +1664,19 @@ fn banner(c: &Ctx, t: &Value, alert: Option<&Value>) -> Option<Node> {
         if !saved.is_empty() {
             bx.push(txt(saved, St::Small));
         }
-        let mut row = vec![
-            c.btn("Resume in a new terminal", Act::new("resume", "fresh", &r, &grp), Look::Primary, false, None),
-            c.btn(
-                "Reopen the old conversation",
-                Act::new("resume", "reopen", &r, &grp),
-                Look::Plain,
-                !claude,
-                (!claude).then_some("No conversation was saved for this task"),
-            ),
-            // A new terminal checks the work shipped and hands it in with `tb submit`.
-            c.btn("Mark done", Act::new("resume", "finish", &r, &grp), Look::Plain, false, None),
-        ];
+        let fresh = |look| c.btn("Resume in a new terminal", Act::new("resume", "fresh", &r, &grp), look, false, Some("Picks up from its handoff"));
+        // A new terminal checks the work shipped and hands it in with `tb submit`.
+        let finish = |look| c.btn("Check and finish", Act::new("resume", "finish", &r, &grp), look, false, Some("A new terminal checks the work and hands it in"));
+        let mut row = if found.is_empty() { vec![fresh(Look::Primary), finish(Look::Plain)] } else { vec![finish(Look::Primary), fresh(Look::Plain)] };
+        let mut items = Vec::new();
+        if claude {
+            items.push(menu_item(c, "Reopen the old conversation", "Opens its last conversation as it was", Act::new("resume", "reopen", &r, &grp), false));
+        }
+        items.push(menu_item(c, "See what the new terminal gets", "Its handoff, in Context", Act::new("tab", "context", "", ""), false));
         row.extend(c.note(&grp));
-        bx.push(el(K::Row, row));
-        bx.push(c.btn("See what the new terminal gets", Act::new("tab", "context", "", ""), Look::Link, false, None));
-        (if quiet { BoxTone::Quiet } else { BoxTone::Lost }, bx)
+        row.extend(box_menu(c, &r, items));
+        bx.push(el(K::TlActs, row));
+        (if quiet { BoxTone::Quiet } else if found.is_empty() { BoxTone::Lost } else { BoxTone::Done }, bx)
     } else if status == "needs" && s(t, "needs_reason") == "start_failed" {
         let mut row = vec![
             c.btn("New Midna terminal", Act::new("start", "new", &r, &act), Look::Primary, false, None),
@@ -1556,7 +1684,7 @@ fn banner(c: &Ctx, t: &Value, alert: Option<&Value>) -> Option<Node> {
         ];
         row.extend(c.note(&act));
         let bx = vec![
-            txt("Couldn’t start in Midna", St::BoxLabel),
+            txt(stamp("Couldn’t start in Midna", opt_s(t, "updated_at")), St::BoxLabel),
             txt(opt_s(t, "latest").unwrap_or("Midna didn’t start a terminal for this task."), St::BannerText),
             el(K::Row, row),
         ];
@@ -1564,9 +1692,9 @@ fn banner(c: &Ctx, t: &Value, alert: Option<&Value>) -> Option<Node> {
     } else if let Some(at) = start_retry_at(t) {
         let mut row = vec![c.btn("Try again now", Act::new("start", "new", &r, &act), Look::Primary, false, None)];
         row.extend(c.note(&act));
-        let mut bx = vec![txt("Couldn’t start in Midna", St::BoxLabel)];
+        let mut bx = vec![txt(stamp("Couldn’t start in Midna", opt_s(t, "updated_at")), St::BoxLabel)];
         bx.extend(opt_s(t, "latest").map(|l| txt(l, St::BannerText)));
-        bx.push(txt(format!("Trying again at {}", fmt::hhmm(at)), St::Small));
+        bx.push(txt(format!("Trying again at {}", fmt::day_time(at)), St::Small));
         bx.push(el(K::Row, row));
         (BoxTone::Lost, bx)
     } else if status == "needs" && s(t, "needs_reason") == "compact_failed" {
@@ -1577,50 +1705,91 @@ fn banner(c: &Ctx, t: &Value, alert: Option<&Value>) -> Option<Node> {
         ];
         row.extend(c.note(&grp));
         let bx = vec![
-            txt("Couldn’t compact its conversation", St::BoxLabel),
+            txt(stamp("Couldn’t compact its conversation", opt_s(t, "updated_at")), St::BoxLabel),
             txt(opt_s(t, "latest").unwrap_or("The board couldn’t compact its cold conversation before resuming it."), St::BannerText),
             el(K::Row, row),
         ];
         (BoxTone::Lost, bx)
     } else if status == "needs" {
         let grp = format!("ask:{r}");
-        let mut bx = vec![txt(opt_s(t, "question").or(opt_s(t, "latest")).unwrap_or("It’s waiting for you in Midna."), St::BannerText)];
-        bx.extend(ask_options(c, &t["ask"], &r, &grp));
-        // A human task has no terminal to answer in: its box below holds Done and Talk it over.
-        if s(t, "kind") == "human" {
+        let question = opt_s(t, "question").filter(|q| !q.is_empty());
+        let options = ask_options(c, &t["ask"], &r, &grp);
+        // A human task's box below holds its steps and Done: a box up top only for a real question.
+        if human && question.is_none() && options.is_empty() {
+            return None;
+        }
+        let mut bx = vec![
+            txt(stamp("Asks you", opt_s(t, "updated_at")), St::BoxLabel),
+            txt(question.or(opt_s(t, "latest")).unwrap_or("It’s waiting for you in Midna."), St::BannerText),
+        ];
+        let chose = !options.is_empty();
+        bx.extend(options);
+        if human {
             return Some(el(K::Banner(BoxTone::Ask), bx));
         }
         let mut row = step_btns(c, t, &r, &grp);
+        // A plain question takes a typed answer beside its choices, sent like any answer. Not Claude's
+        // picker or a step to do: the answer is typed into the terminal, which those would misread.
+        if row.is_empty() && s(t, "needs_reason") == "question" && !b(&t["ask"], "picker") {
+            bx.push(answer_field(c, &r));
+            row.extend(answer_btns(c, &r));
+        }
         // Its terminal when it has one; a question with none reopens one that asks it again; otherwise a new one, picking up from its handoff.
-        let write = if session_live(t) || opt_s(t, "question").is_some_and(|q| !q.is_empty()) {
-            Act::new("focus", "", &r, &grp)
+        let (label, go) = if session_live(t) {
+            ("Focus in Midna", Act::new("focus", "", &r, &grp))
+        } else if question.is_some() {
+            ("Answer in Midna", Act::new("focus", "", &r, &grp))
         } else {
-            Act::new("resume", "fresh", &r, &grp)
+            ("Answer in a new terminal", Act::new("resume", "fresh", &r, &grp))
         };
-        row.push(c.btn("Write an answer", write, Look::Out, false, None));
+        let look = if chose || !row.is_empty() { Look::Plain } else { Look::Primary };
+        row.push(c.btn(label, go, look, false, None));
         row.extend(c.note(&grp));
         bx.push(el(K::Row, row));
         (BoxTone::Ask, bx)
-    } else if let Some(why) = fmt::stuck(t).filter(|_| status == "working") {
-        let mut bx = vec![txt(format!("{who} may be stuck"), St::BoxLabel), txt(why, St::BannerText)];
-        if let Some(tail) = opt_s(&t["stuck"], "tail").filter(|x| !x.is_empty()) {
-            bx.push(fold(Fold::Tail, c.fold_open(Fold::Tail, false), txt("Its terminal’s last lines", St::Small), vec![txt(tail, St::Code)]));
+    } else if let Some(st) = obj(t, "stuck").filter(|_| status == "working") {
+        let why = opt_s(st, "why").filter(|w| !w.is_empty()).unwrap_or("Its terminal hasn’t moved on");
+        let grp = format!("manage:{r}");
+        let mut bx = vec![txt(stamp(if st["slow"] == true { "Slow" } else { "May be stuck" }, opt_s(st, "at")), St::BoxLabel), txt(why, St::BannerText)];
+        if let Some(tail) = opt_s(st, "tail").filter(|x| !x.is_empty()) {
+            bx.push(fold(Fold::Tail, c.fold_open(Fold::Tail, false), txt("Last lines", St::Small), vec![txt(tail, St::Code)]));
+        }
+        if session_live(t) {
+            let mut row = vec![c.btn("Focus in Midna", Act::new("focus", "", &r, &grp), Look::Primary, false, None)];
+            row.extend(c.note(&grp));
+            bx.push(el(K::Row, row));
         }
         (BoxTone::Ask, bx)
     } else if let Some(stopped) = pr_stopped(t) {
-        let p = pr_of(t).unwrap_or(&Value::Null);
-        let term = arr(t, "terminals").iter().find(|x| js_eq(field(x, "id"), field(&p["stage"], "session"))).and_then(|x| opt_s(x, "name")).unwrap_or("Its terminal");
         let grp = format!("ask:{r}");
         let mut row = answer_btns(c, &r);
         row.push(c.btn("Focus in Midna", Act::new("focus", "", &r, &grp), Look::Plain, false, None));
         row.extend(c.note(&grp));
+        let label = if b(stopped, "asked") { "Asks you about the PR" } else { "Stopped on the PR" };
         let bx = vec![
-            txt(format!("{term} {}", if b(stopped, "asked") { "asks you about the PR" } else { "stopped on the PR" }), St::BoxLabel),
+            txt(stamp(label, opt_s(stopped, "at")), St::BoxLabel),
             txt(or_empty(&stopped["message"]), St::BannerText),
             answer_field(c, &r),
             el(K::Row, row),
         ];
         (BoxTone::Ask, bx)
+    } else if let Some(p) = pr_of(t).filter(|p| pr_open(p) && obj(p, "bar").is_some_and(|bar| s(bar, "you") == "waiting")) {
+        // Green and waiting on the owner's own look.
+        let grp = format!("pr:{r}");
+        let mut row = Vec::new();
+        if let Some(u) = opt_s(p, "url").filter(|u| is_web(u)) {
+            row.push(c.btn("Open PR ↗", Act::new("open-url", u, &r, &grp), Look::Primary, false, Some(u)));
+        }
+        row.push(c.btn("Mark reviewed", Act::new("pr-reviewed", "", &r, &grp), Look::Plain, false, Some("Tell the board you've looked at this PR")));
+        row.extend(c.note(&grp));
+        let title = opt_s(p, "title").filter(|x| !x.is_empty()).or(opt_s(p, "repo")).unwrap_or("");
+        let bx = vec![txt("Waiting on your review", St::BoxLabel), txt(format!("#{} {title}", or_empty(&p["num"])).trim_end(), St::BannerText), el(K::Row, row)];
+        (BoxTone::Ask, bx)
+    } else if let Some(stage) = pr_of(t).filter(|p| quiet_stage(p)).and_then(|p| obj(p, "stage")) {
+        // The board's own work on the PR: nothing for the owner to do.
+        let mut bx = vec![txt("Nothing needed from you", St::BoxLabel)];
+        bx.extend(opt_s(stage, "label").filter(|x| !x.is_empty()).map(|x| txt(x, St::BannerText)));
+        (BoxTone::Quiet, bx)
     } else {
         (BoxTone::Ask, Vec::new())
     };
@@ -1644,7 +1813,8 @@ fn term_actions(c: &Ctx, t: &Value) -> Vec<Node> {
     let grp = format!("manage:{r}");
     let live = session_live(t);
     let mut row = Vec::new();
-    if live && s(t, "status") == "working" {
+    // A stuck-looking one has Focus in Midna in its box up top.
+    if live && s(t, "status") == "working" && obj(t, "stuck").is_none() {
         row.push(c.btn("Focus in Midna", Act::new("focus", "", &r, &grp), Look::SoftSmall, false, None));
     }
     if opt_s(t, "session_id").is_some() || live {
@@ -1699,13 +1869,19 @@ fn done_blocker_reason<'a>(t: &Value, blocker: &'a Value) -> Option<&'a str> {
 }
 
 /// The note for testers the board posts on the ticket at merge (`[jira] merged_note`), or that it's waiting for one.
-/// It grows, so it stacks like Attached: the label on top, the note full width under it.
+/// It grows, so it stacks like Attached: the label on top, the note full width under it. A merge that went
+/// without one offers Write the note, which has the board bring the conversation back to write it.
 fn merged_note_row(c: &Ctx, t: &Value) -> Option<Node> {
     let n = obj(t, "merged_note")?;
     let mut body = vec![txt("Note for testers", St::LrowKey)];
     if b(n, "waiting") {
         let state = if opt_s(n, "text").is_some() { "Posting it, then moving the ticket" } else { "Merged without one; the ticket waits" };
         body.push(el(K::Line, vec![pill("Waiting", Tone::Needs), txt(state, St::Small)]));
+        if opt_s(n, "text").is_none() {
+            let grp = "merged-note";
+            body.push(el(K::Line, vec![c.btn("Write the note", Act::new("write-note", "", s(t, "ref"), grp), Look::Plain, false, None)]));
+            body.extend(c.note(grp));
+        }
     }
     if let Some(text) = opt_s(n, "text") {
         let (preview, more) = note_preview(text);
@@ -1770,19 +1946,19 @@ pub fn pr_steps(p: &Value) -> [(&'static str, StepSt, Option<String>); 3] {
     let checks = match c.as_str() {
         "none" => (StepSt::Done, Some("None".to_string())),
         "pass" => (StepSt::Done, Some("Passed".into())),
+        // Only the owner can fix it: theirs, so orange.
+        "fail" if phase == "fix" && obj(stage, "owner").is_some() => (StepSt::Ask, Some("Needs you".into())),
         "fail" if phase == "fix" => (
             StepSt::Fail,
-            // Being fixed only while a terminal is on it; `owner`: only the owner can fix it; `idle`: nobody is.
-            Some(if obj(stage, "owner").is_some() {
-                "Needs you"
-            } else if obj(stage, "stopped").is_some() {
+            // Being fixed only while a terminal is on it; `idle`: nobody is.
+            Some(if obj(stage, "stopped").is_some() {
                 "Fix stopped"
             } else if !stage["session"].is_null() && stage["session"] != "" {
-                "Being fixed"
+                "Agent fixing"
             } else if b(stage, "idle") {
                 "Failed"
             } else {
-                "Fix starting"
+                "Agent next"
             }
             .into()),
         ),
@@ -1794,9 +1970,9 @@ pub fn pr_steps(p: &Value) -> [(&'static str, StepSt, Option<String>); 3] {
     let review = if phase == "rereview" {
         (StepSt::Wait, Some("Awaiting re-review".to_string()))
     } else if rv == "changes" {
-        (StepSt::Ask, Some("Changes asked".to_string()))
+        (StepSt::Now, Some("Changes asked, agent next".to_string()))
     } else if phase == "comments" {
-        (StepSt::Ask, Some("New comments".into()))
+        (StepSt::Now, Some("New comments, agent next".into()))
     } else if rv == "approved" {
         (StepSt::Done, Some("Approved".into()))
     } else if let (Some(have), Some(need)) = (p["approvals"]["have"].as_i64().filter(|n| *n > 0), p["approvals"]["need"].as_i64().filter(|n| *n > 0)) {
@@ -1853,7 +2029,8 @@ fn author_review_round(r: &Value) -> PrStep {
     } else if b(r, "stale") {
         (StepSt::Wait, "Moved since".to_string())
     } else if open > 0 {
-        (StepSt::Ask, headline.to_string())
+        // Its findings are the agent's to fix.
+        (StepSt::Now, headline.to_string())
     } else if b(r, "passed") {
         (StepSt::Done, headline.to_string())
     } else {
@@ -1917,7 +2094,7 @@ pub fn pr_steps_full(p: &Value, bar: &Value) -> Vec<PrStep> {
         // "2 new comments", linking to the first unread thread.
         let words = if new_comments > 0 { fmt::plural(new_comments, "new comment", "new comments") } else { "New comments".to_string() };
         let go = opt_s(bar, "comments_url").filter(|u| is_web(u)).map(str::to_string).or(url);
-        step("Review", StepSt::Ask, Some(&words), go)
+        step("Review", StepSt::Now, Some(&format!("{words}, agent next")), go)
     } else if need.is_none() && rv == "approved" && phase != "rereview" {
         // No count set: the host decides, and it has approved, however few of the reviewers have.
         step("Review", StepSt::Done, Some("Approved"), url)
@@ -1941,7 +2118,7 @@ pub fn pr_steps_full(p: &Value, bar: &Value) -> Vec<PrStep> {
                 Some(why) => step(s(m, "name"), StepSt::Done, Some(&format!("Skipped: {why}")), None),
                 None => step(s(m, "name"), StepSt::Done, Some("Skipped"), None),
             },
-            _ if pr_open(p) && phase == "steps" => step(s(m, "name"), StepSt::Ask, Some("To do"), None),
+            _ if pr_open(p) && phase == "steps" => step(s(m, "name"), StepSt::Now, Some("Agent next"), None),
             _ => step(s(m, "name"), StepSt::Todo, None, None),
         });
     }
@@ -1979,6 +2156,37 @@ fn stacks_line(c: &Ctx, so: &Value) -> Node {
         _ => {}
     }
     el(K::Row, kids)
+}
+
+/// The PR it shares with other tasks (`pr_group`): "Shares a PR with T3 · PR #12" on a member, its anchor
+/// opening in the panel and its PR on the host; "Shared with T5, T6" on the anchor, each member opening
+/// in the panel, a member that hasn't added its work yet saying so on hover.
+fn group_line(c: &Ctx, t: &Value) -> Option<Node> {
+    let g = obj(t, "pr_group")?;
+    if let Some(a) = obj(g, "anchor") {
+        let r = s(a, "ref");
+        let mut kids = vec![txt("Shares a PR with", St::Small), c.btn(r, Act::new("open-task", "", r, ""), Look::Ref, false, Some(&format!("Open {r}")))];
+        if let Some(n) = a.get("num").filter(|n| !n.is_null()) {
+            let state = if b(a, "merged") { " · merged" } else if b(a, "declined") { " · closed" } else { "" };
+            let label = format!("PR #{}{state}", or_empty(n));
+            kids.push(match opt_s(a, "url").filter(|u| is_web(u)) {
+                Some(u) => Node::Link { s: label, go: Go::Url(u.to_string()), tip: Some("Open the pull request it shares".into()), look: LinkLook::Small },
+                None => txt(label, St::Small),
+            });
+        }
+        return Some(el(K::Row, kids));
+    }
+    let members = arr(g, "members");
+    if members.is_empty() {
+        return None;
+    }
+    let mut kids = vec![txt("Shared with", St::Small)];
+    for m in members {
+        let r = s(m, "ref");
+        let tip = if b(m, "added") { format!("Open {r}") } else { format!("Open {r}; it hasn’t added its work yet") };
+        kids.push(c.btn(r, Act::new("open-task", "", r, ""), Look::Ref, false, Some(&tip)));
+    }
+    Some(el(K::Row, kids))
 }
 
 /// "2 new comments ›" by the reviewer rows while the Review step shows the review instead (changes asked,
@@ -2296,7 +2504,7 @@ fn shown_bar(t: &Value) -> Option<&str> {
 /// `prNodes(t)`: Pull request, Checks and review, Merged.
 fn pr_nodes(c: &Ctx, t: &Value) -> Vec<Node> {
     let Some(p) = pr_of(t) else {
-        return no_pr_nodes(c, t);
+        return Vec::new();
     };
     let key = obj(t, "jira").and_then(|j| opt_s(j, "key"));
     let raw = opt_s(p, "title");
@@ -2350,28 +2558,36 @@ fn pr_nodes(c: &Ctx, t: &Value) -> Vec<Node> {
     }
     body.extend(bar.map(|bar| reviewer_rows(c, bar)).unwrap_or_default());
     body.extend(bar.and_then(|bar| comments_line(p, bar)));
-    // `prBar`
-    if let Some(stage) = obj(p, "stage").filter(|st| pr_open(p) && matches!(s(st, "phase"), "fix" | "rebase" | "comments" | "merge" | "ask")) {
-        let stopped = obj(stage, "stopped").is_some();
-        // The banner up top says it stopped; the warn dot marks the stage.
-        let mut kids = vec![Node::Dot(if stopped { Dot::Warn } else { Dot::Accent }), txt(or_empty(&stage["label"]), St::Plain)];
-        let tip = match opt_s(stage, "session") {
-            Some(sid) => {
-                kids.push(Node::Link { s: "Terminal ›".into(), go: Go::Session(sid.to_string()), tip: None, look: LinkLook::Plain });
-                if stopped { "Its terminal stopped before it was finished" } else { "Open the terminal doing this" }
+    // `prBar`: the terminal doing the PR's work, with Focus in Midna. Stopped, it's the box up top.
+    if let Some(stage) = obj(p, "stage").filter(|st| pr_open(p) && matches!(s(st, "phase"), "fix" | "rebase" | "comments" | "merge" | "ask") && obj(st, "stopped").is_none()) {
+        let r = rf(t, "T");
+        // The quiet box up top already says what it's doing.
+        let mut kids = vec![Node::Dot(Dot::Accent)];
+        let sid = opt_s(stage, "session").filter(|x| !x.is_empty());
+        let term = sid.and_then(|sid| arr(t, "terminals").iter().find(|x| s(x, "id") == sid)).and_then(|x| opt_s(x, "name"));
+        let line = if quiet_stage(p) {
+            match (sid, term) {
+                (Some(_), Some(n)) => format!("In {n}"),
+                (Some(_), None) => "In its terminal".to_string(),
+                _ => "Waiting for its terminal to open".to_string(),
             }
-            None => "Waiting for its terminal to open",
+        } else {
+            or_empty(&stage["label"])
         };
-        body.push(Node::El { k: K::PrBar { warn: stopped && opt_s(stage, "session").is_some() }, tip: Some(tip.into()), kids });
+        kids.push(txt(line, St::Plain));
+        if let Some(sid) = sid {
+            kids.push(c.btn("Focus in Midna", Act::new("term-focus", "", sid, format!("pr:{r}")), Look::SoftSmall, false, Some("Open the terminal doing this")));
+        }
+        body.push(Node::El { k: K::PrBar { warn: false }, tip: None, kids });
+        body.extend(c.note(&format!("pr:{r}")));
     }
-    // The owner's own look at the PR (the You step): "Waiting on your review · Mark reviewed ›" once it's
-    // green, "Not reviewed yet · Mark reviewed ›" before.
-    if let Some(you) = bar.map(|bar| s(bar, "you")).filter(|y| matches!(*y, "waiting" | "early")) {
+    // The owner's own look at the PR before it's green: "Not reviewed yet · Mark reviewed ›". Once it's
+    // green and waiting on them, the box up top asks.
+    if bar.is_some_and(|bar| s(bar, "you") == "early") {
         let r = rf(t, "T");
         let grp = format!("pr:{r}");
         let mark = c.btn("Mark reviewed ›", Act::new("pr-reviewed", "", &r, &grp), Look::Link, false, Some("Tell the board you've looked at this PR"));
-        let (dot, line) = if you == "waiting" { (Dot::Accent, "Waiting on your review") } else { (Dot::Faint, "Not reviewed yet") };
-        body.push(Node::El { k: K::PrBar { warn: false }, tip: None, kids: vec![Node::Dot(dot), txt(line, St::Plain), mark] });
+        body.push(Node::El { k: K::PrBar { warn: false }, tip: None, kids: vec![Node::Dot(Dot::Faint), txt("Not reviewed yet", St::Plain), mark] });
         body.extend(c.note(&grp));
     } else if bar.is_none() && obj(p, "stage").is_some_and(|st| b(st, "awaiting_you")) {
         // Native: the owner's one-click "I reviewed it" while a green PR waits for them.
@@ -2380,14 +2596,22 @@ fn pr_nodes(c: &Ctx, t: &Value) -> Vec<Node> {
         body.push(el(K::Row, vec![c.btn("I reviewed it", Act::new("pr-reviewed", "", &r, &grp), Look::SoftSmall, false, Some("Tell the board you've looked at this PR"))]));
         body.extend(c.note(&grp));
     }
-    // The owner's override: merges past whatever holds it once they confirm (only conflicts and the
-    // stack's order still stop it).
-    if pr_open(p) && !matches!(merge.st, StepSt::Done | StepSt::Fail) {
+    // The owner's override, behind ⋯: merges past whatever holds it once they confirm. Not while it
+    // waits on its stack, conflicts with its base or is already merging, unless the board ran out of
+    // tries to merge it.
+    let phase = obj(p, "stage").map(|st| s(st, "phase")).unwrap_or("");
+    let gave_up = phase == "merge" && obj(p, "stage").is_some_and(|st| b(st, "gave_up"));
+    let conflicted = p["mergeable"] == "CONFLICTING" || p["mergeable"] == false;
+    let merging = matches!(phase, "stack" | "rebase" | "merge") && !gave_up;
+    if pr_open(p) && !matches!(merge.st, StepSt::Done | StepSt::Fail) && !merging && !conflicted {
         let r = rf(t, "T");
         let grp = format!("merge:{r}");
-        let go = c.btn("Merge now ›", Act::new("pr-merge-now", "", &r, &grp), Look::Link, false, Some("Merge this PR now, past its checks and reviews"));
-        body.push(el(K::Row, vec![go]));
-        body.extend(c.note(&grp));
+        let mut row = vec![c.btn("", Act::new("pr-menu", "", &r, ""), Look::Icon(Icon::More), false, Some("More PR actions"))];
+        if c.ui.pr_menu {
+            row.push(el(K::TermMenu, vec![menu_item(c, "Merge anyway…", "Merges past its checks and reviews; asks first", Act::new("pr-merge-now", "", &r, &grp), true)]));
+        }
+        row.extend(c.note(&grp));
+        body.push(el(K::TlActs, row));
     }
 
     let merge_st = match merge.st {
@@ -2406,28 +2630,25 @@ fn pr_nodes(c: &Ctx, t: &Value) -> Vec<Node> {
     // "Updated 4m ago": when the board last read the open PR, so a stale read shows.
     let updated = opt_s(p, "checked_at").filter(|_| pr_open(p)).map(|at| format!("Updated {}", fmt::ago(at))).unwrap_or_default();
     vec![
-        tl_node(TlSt::Done, tl_head(tl_name("Pull request"), "", ""), vec![el(K::PrHead, vec![head, txt(repo, St::Small)])], false),
+        tl_node(TlSt::Done, tl_head(tl_name("Pull request"), "", ""), [el(K::PrHead, vec![head, txt(repo, St::Small)])].into_iter().chain(group_line(c, t)).collect(), false),
         tl_node(st, tl_head(tl_name("Checks and review"), "", &updated), body, false),
         tl_node(merge_st, tl_head(tl_name(merge_name), &merge_sub, ""), merged_note_row(c, t).into_iter().collect(), false),
     ]
 }
 
-/// What's left before it merges, on a task with no PR yet; nothing on one that doesn't end in a PR.
-fn no_pr_nodes(c: &Ctx, t: &Value) -> Vec<Node> {
-    if opt_s(t, "no_pr").is_some() || t["ships_pr"] == false {
+/// What's left before it merges, on a task with no PR yet, as one quiet line under now: "Then: Pull
+/// request, Checks, Review, Merge" (its review step first when it has one), and what it stacks on.
+/// Nothing on one that doesn't end in a PR.
+fn then_line(c: &Ctx, t: &Value) -> Vec<Node> {
+    if pr_of(t).is_some() || opt_s(t, "no_pr").is_some() || t["ships_pr"] == false {
         return Vec::new();
     }
-    let pr = obj(t, "stack_on").map(|so| stacks_line(c, so)).into_iter().collect();
-    // The whole way the PR will take, as it shows once the PR is open: the review step runs before the
-    // PR opens ("Not reviewed by <bar> yet" before its first round; a round it ran is its own node),
-    // then the steps still ahead.
-    let mut steps: Vec<PrStep> = obj(t, "author_review").filter(|_| shown_bar(t).is_none()).map(author_review_step).into_iter().collect();
-    steps.extend(["Checks", "You", "Review"].map(|name| step(name, StepSt::Todo, None, None)));
-    vec![
-        tl_node(TlSt::Todo, tl_head(tl_name("Pull request"), "", ""), pr, false),
-        tl_node(TlSt::Todo, tl_head(tl_name("Checks and review"), "", ""), vec![step_nodes(steps)], false),
-        tl_node(TlSt::Todo, tl_head(tl_name("Pending merge"), "", ""), vec![], false),
-    ]
+    let mut steps: Vec<String> = obj(t, "author_review").filter(|_| shown_bar(t).is_none()).map(|r| s(r, "bar").to_string()).filter(|x| !x.is_empty()).into_iter().collect();
+    steps.extend(["Pull request", "Checks", "Review", "Merge"].map(str::to_string));
+    let mut out = vec![txt(format!("Then: {}", steps.join(", ")), St::Small)];
+    out.extend(obj(t, "stack_on").map(|so| stacks_line(c, so)));
+    out.extend(group_line(c, t));
+    out
 }
 
 /// The "Failed, but not because of this PR" box: this push's checks cleared with `tb pr not-ours`,
@@ -2505,11 +2726,7 @@ pub fn handoff_text(t: &Value, ui: &Ui) -> Option<String> {
 }
 
 /// `metaRows(t)`.
-pub fn meta_rows(t: &Value, ui: &Ui) -> Vec<(String, String)> {
-    let r = rf(t, "T");
-    if let Some(rows) = ui.meta_edit.get(&r) {
-        return rows.clone();
-    }
+pub fn meta_rows(t: &Value) -> Vec<(String, String)> {
     arr(t, "meta")
         .iter()
         .map(|p| match p {
@@ -2546,10 +2763,8 @@ fn lent_devices(t: &Value) -> Vec<&str> {
     arr(d, "lent").iter().filter_map(|x| x.as_str()).collect()
 }
 
-/// The devices it has (or asks for) and its bits, as Context rows. A backend bit not made yet has
-/// "Mark created" (the owner's word that it's made in the flag tool, as on the goal page).
-fn pool_rows(c: &Ctx, t: &Value) -> Vec<Node> {
-    let r = rf(t, "T");
+/// The devices it has (or asks for) and its bits, as Context rows (shown only; the app doesn't mark a bit made).
+fn pool_rows(t: &Value) -> Vec<Node> {
     let mut out = vec![];
     let d = &t["devices"];
     let lent = lent_devices(t);
@@ -2562,9 +2777,6 @@ fn pool_rows(c: &Ctx, t: &Value) -> Vec<Node> {
         let state = if s(x, "kind") == "local" { "local" } else if b(x, "made") { "created" } else { "not created" };
         let sep = if ix + 1 < arr(t, "bits").len() { ", " } else { "" };
         bits.push(txt(format!("⚑ {} ({state}){sep}", s(x, "name")), St::Plain));
-        if s(x, "kind") != "local" && !b(x, "made") {
-            bits.push(c.btn("Mark created", Act::new("bit-made", s(x, "name"), &r, ""), Look::SoftSmall, false, Some(&format!("Tell the board {} is made", s(x, "name")))));
-        }
     }
     if !bits.is_empty() {
         out.push(el(K::KvRow, vec![txt("Bits", St::LrowKey), el(K::Line, bits)]));
@@ -2601,7 +2813,7 @@ fn context_tab(c: &Ctx, t: &Value) -> Vec<Node> {
     }
     let mut kv: Vec<Node> = wh.into_iter().map(|(k, v)| el(K::KvRow, vec![txt(k, St::LrowKey), txt(v, St::Plain)])).collect();
     kv.extend(origin_row(t));
-    kv.extend(pool_rows(c, t));
+    kv.extend(pool_rows(t));
     out.push(el(K::Kv, kv));
     for (title, key, glyph, dot) in [("Done so far", "done", "✓", Dot::Up), ("Next", "next", "→", Dot::Accent), ("Decisions", "decisions", "•", Dot::Faint), ("Your answers", "answers", "•", Dot::Warn)] {
         let items = arr(cx, key);
@@ -2646,20 +2858,12 @@ fn context_tab(c: &Ctx, t: &Value) -> Vec<Node> {
         ));
     }
     out.push(el(K::Stack, fl));
-    let meta = meta_rows(t, c.ui);
+    let meta = meta_rows(t);
     if !meta.is_empty() {
         let mut kids = vec![txt("Details", St::H3)];
-        for (i, (k, v)) in meta.iter().enumerate() {
-            kids.push(el(
-                K::MetaRow,
-                vec![
-                    Node::Field { key: format!("meta:{r}:{i}:0"), value: k.clone(), placeholder: "Name", multi: false, mono: false },
-                    Node::Field { key: format!("meta:{r}:{i}:1"), value: v.clone(), placeholder: "Value", multi: false, mono: false },
-                    c.btn("", Act::new("meta-del", i.to_string(), &r, ""), Look::Icon(Icon::Remove), false, None),
-                ],
-            ));
+        for (k, v) in &meta {
+            kids.push(el(K::KvRow, vec![txt(k.clone(), St::LrowKey), txt(v.clone(), St::Plain)]));
         }
-        kids.extend(c.note(&format!("meta:{r}")));
         out.push(el(K::Stack, kids));
     }
     let text = handoff_text(t, c.ui).unwrap_or_else(|| "Loading…".into());

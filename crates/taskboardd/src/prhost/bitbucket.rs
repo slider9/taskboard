@@ -324,7 +324,7 @@ const STAMP_BATCH: usize = 50;
 const STAMP_FIELDS: &str = "next,values.id,values.state,values.title,values.updated_on,values.source.commit.hash,values.destination.branch.name,values.destination.commit.hash,values.comment_count,values.task_count,values.reviewers.uuid,values.participants.user.uuid,values.participants.approved,values.participants.state,values.participants.participated_on";
 
 /// What a full read uses of the PR (`summarize`): Bitbucket answers only these (#743).
-const PR_FIELDS: &str = "state,title,author.uuid,author.account_id,source.branch.name,source.commit.hash,destination.branch.name,destination.commit.hash,reviewers.uuid,reviewers.account_id,reviewers.display_name,participants.user.uuid,participants.user.account_id,participants.user.display_name,participants.state,participants.approved,participants.participated_on";
+const PR_FIELDS: &str = "state,title,created_on,author.uuid,author.account_id,source.branch.name,source.commit.hash,destination.branch.name,destination.commit.hash,reviewers.uuid,reviewers.account_id,reviewers.display_name,participants.user.uuid,participants.user.account_id,participants.user.display_name,participants.state,participants.approved,participants.participated_on";
 /// What a full read uses of each comment, and of each PR task.
 const COMMENT_FIELDS: &str = "next,values.id,values.parent.id,values.deleted,values.pending,values.inline.path,values.inline.from,values.inline.to,values.resolution,values.content.raw,values.user.uuid,values.user.account_id,values.user.display_name,values.created_on,values.links.html.href";
 const TASK_FIELDS: &str = "next,values.id,values.state,values.content.raw,values.creator.uuid,values.creator.account_id,values.creator.display_name,values.comment.id,values.created_on";
@@ -441,6 +441,7 @@ impl PrHost for BitbucketHost {
         self.put_reviewers(pr, &p, list)
     }
 
+    // Bitbucket's merge endpoint takes no head commit, so `opts.head` can't be pinned here.
     fn merge(&self, pr: &PrRef, opts: &MergeOpts) -> HostResult<()> {
         let mut b = json!({"type": "pullrequest", "close_source_branch": opts.close_source_branch});
         if let Some(s) = &opts.strategy {
@@ -668,7 +669,7 @@ pub fn summarize(p: &Value, comments: &[Value], tasks: &[Value], statuses: &[Val
         if user.is_empty() || user == author {
             continue;
         }
-        reviewers.push(Reviewer { user, name: r["display_name"].as_str().unwrap_or("").to_string(), state: "pending".into(), requested: true, changes_at: None, ids: ids(&r) });
+        reviewers.push(Reviewer { user, name: r["display_name"].as_str().unwrap_or("").to_string(), state: "pending".into(), requested: true, changes_at: None, commented_at: None, ids: ids(&r) });
     }
     let mut changes_at: Option<String> = None;
     for part in p["participants"].as_array().cloned().unwrap_or_default() {
@@ -700,6 +701,7 @@ pub fn summarize(p: &Value, comments: &[Value], tasks: &[Value], statuses: &[Val
                 state: state.into(),
                 requested: false,
                 changes_at: mine,
+                commented_at: None,
                 ids: ids(&part["user"]),
             }),
             None => {}
@@ -811,6 +813,7 @@ pub fn summarize(p: &Value, comments: &[Value], tasks: &[Value], statuses: &[Val
         tasks_error: None,
         viewer: String::new(),
         mergeable: Value::Null,
+        created_at: p["created_on"].as_str().unwrap_or("").to_string(),
     }
 }
 
@@ -909,6 +912,7 @@ pub(crate) mod tests {
     fn pr_json() -> Value {
         json!({
             "id": 7, "title": "Add x", "state": "OPEN", "author": {"uuid": ME, "display_name": "Me"},
+            "created_on": "2026-10-01T08:00:00.000000+00:00",
             "source": {"branch": {"name": "feat"}, "commit": {"hash": "abc123"}},
             "destination": {"branch": {"name": "main"}, "commit": {"hash": "base1"}},
             "reviewers": [{"uuid": REV, "display_name": "Rev"}, {"uuid": "{new}", "display_name": "New"}],
@@ -994,6 +998,7 @@ pub(crate) mod tests {
         let h = BitbucketHost::new(Box::new(http), "https://api/").with_account("bitbucket:test-bot");
         let r = h.read(&pr()).unwrap();
         assert_eq!(r.viewer, "{bot}");
+        assert_eq!(r.created_at, "2026-10-01T08:00:00.000000+00:00");
         let open: Vec<&str> = r.threads.iter().filter(|t| t.waiting_on(r.us())).map(|t| t.id.as_str()).collect();
         assert_eq!(open, vec!["3"], "the bot had the last word on 1");
         assert_eq!(r.tasks_error.as_deref(), Some("Bitbucket answered 403"), "tasks that can't be read are unknown");
@@ -1156,7 +1161,7 @@ pub(crate) mod tests {
         h.request_reviews(&pr(), &["557058:abc".to_string()]).unwrap();
         h.retarget(&pr(), "develop").unwrap();
         h.set_description(&pr(), "## Summary").unwrap();
-        h.merge(&pr(), &MergeOpts { strategy: Some("squash".into()), close_source_branch: true }).unwrap();
+        h.merge(&pr(), &MergeOpts { strategy: Some("squash".into()), close_source_branch: true, head: None }).unwrap();
         h.re_request_reviews(&pr(), &[REV.to_string()]).unwrap();
         let pr7 = "https://api/repositories/ws/repo/pullrequests/7";
         let marks = marks.lock().clone();
@@ -1184,7 +1189,7 @@ pub(crate) mod tests {
         h.resolve(&pr(), &task).unwrap();
         h.re_request_reviews(&pr(), &[REV.to_string()]).unwrap();
         h.request_reviews(&pr(), &["557058:abc".to_string()]).unwrap();
-        h.merge(&pr(), &MergeOpts { strategy: Some("squash".into()), close_source_branch: true }).unwrap();
+        h.merge(&pr(), &MergeOpts { strategy: Some("squash".into()), close_source_branch: true, head: None }).unwrap();
         h.retarget(&pr(), "develop").unwrap();
         assert_eq!(h.cancel_builds(&pr(), "abc123").unwrap(), Cancelled::Stopped(vec!["feat #41".into(), "** #42".into()]), "the head's builds and the PR's own");
         assert_eq!(h.base_failures(&pr(), "main", 5).unwrap(), vec!["Tests".to_string()]);

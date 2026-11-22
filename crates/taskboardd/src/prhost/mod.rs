@@ -39,7 +39,7 @@
 //! [`Record`] is one read of a PR. [`Record::to_value`] turns it into the JSON the PR flow keeps as
 //! `pr_flow.rec` and steps on (`prflow::phase_of`): `state`, `head`, `branch`, `base`, `base_head`,
 //! `checks` (`name`, `state` = passed / failed / running / stopped, `url`), `failed`, `running`,
-//! `comments` (comments from others), `approvals` (not the author's or the board's own account's), `review_decision`, `changes_at`, `reviewers` (`user`, `name`, `state`, `requested`, `changes_at`),
+//! `comments` (comments from others), `approvals` (not the author's or the board's own account's), `review_decision`, `changes_at`, `reviewers` (`user`, `name`, `state`, `requested`, `changes_at`, `commented_at`),
 //! `threads`, `tasks_open`, `tasks_error`, `viewer`. A thread ([`Thread`]) is open while it's unresolved
 //! and someone other than the board's own account (`viewer`, the account it posts as; the PR's author
 //! when that isn't known) had the last word; a PR task (Bitbucket) is open until it's resolved. When the
@@ -134,6 +134,10 @@ pub struct Reviewer {
     /// is for the PR's latest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes_at: Option<String>,
+    /// When their standing comment-only review was made (`state` commented), so a comment newer than
+    /// an ask to look again tells it apart from the one it answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commented_at: Option<String>,
     /// Every id the host knows them by, when it has more than one (Bitbucket's `{uuid}` and
     /// `account_id`): the board renames `user` to the one the project's roster has.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -249,6 +253,8 @@ pub struct Record {
     /// when the host couldn't say.
     pub viewer: String,
     pub mergeable: Value,
+    /// When the PR was opened, as the host gives it (ISO 8601); empty when it didn't say.
+    pub created_at: String,
 }
 
 impl Record {
@@ -294,7 +300,8 @@ impl Record {
             .map(|r| {
                 let state = s(r, "state");
                 let changes_at = if state == "changes" { opt(r, "at") } else { None };
-                Reviewer { user: s(r, "who"), name: s(r, "who"), state, requested: true, changes_at, ids: vec![] }
+                let commented_at = if state == "commented" { opt(r, "at") } else { None };
+                Reviewer { user: s(r, "who"), name: s(r, "who"), state, requested: true, changes_at, commented_at, ids: vec![] }
             })
             .collect();
         let threads: Vec<Thread> = list(ev, "threads")
@@ -405,6 +412,10 @@ pub struct MergeOpts {
     pub strategy: Option<String>,
     /// Delete the PR's branch once it's merged.
     pub close_source_branch: bool,
+    /// The head commit the merge was judged on: a host that can pin it (GitHub) refuses the merge once
+    /// the branch has moved past it, so a push between the board's read and the merge can't land
+    /// unchecked. Bitbucket's merge API has no such pin and merges whatever the head is.
+    pub head: Option<String>,
 }
 
 /// What [`PrHost::cancel_builds`] did.
@@ -529,9 +540,9 @@ pub fn host_for(app: &App, host: &str) -> HostResult<Arc<dyn PrHost>> {
     match host {
         "github" => {
             let gh = crate::proc::which(&app.cfg.pr.gh).ok_or_else(|| "the gh command isn't installed".to_string())?;
-            let env = crate::accounts::gh_env(&app.cfg);
-            let key = account_key("github", &env.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>());
-            Ok(Arc::new(github::GithubHost::new(Box::new(github::GhCli { bin: gh, env })).with_account(&key)))
+            let cli = github::GhCli::for_board(app, gh);
+            let key = cli.account.clone();
+            Ok(Arc::new(github::GithubHost::new(Box::new(cli)).with_account(&key)))
         }
         "bitbucket" => {
             let (email, token) = crate::accounts::board_credentials(app, crate::accounts::Provider::Bitbucket)
@@ -587,6 +598,12 @@ pub struct FakeHost {
     pub review_error: Mutex<Option<String>>,
     /// What `merge` answers instead of merging, while set.
     pub merge_error: Mutex<Option<String>>,
+    /// What the next `merge` calls answer instead of merging, one each, before `merge_error`.
+    pub merge_errors: Mutex<Vec<String>>,
+    /// The merge goes through even when `merge` answers one of `merge_errors`.
+    pub merge_lands: Mutex<bool>,
+    /// A push that lands between the board's read and its merge: `merge` moves the head to it first.
+    pub push_before_merge: Mutex<Option<String>>,
     /// Reviewers `remove_reviewers` answers for without taking them off.
     pub keeps: Mutex<Vec<String>>,
     /// How many times `read` was called.
@@ -609,7 +626,7 @@ pub struct FakeHost {
 
 impl FakeHost {
     pub fn new(host: &'static str, rec: Record) -> Arc<FakeHost> {
-        Arc::new(FakeHost { host, rec: Mutex::new(rec), calls: Mutex::new(vec![]), base_failing: Mutex::new(vec![]), members: Mutex::new(vec![]), base_checks: Mutex::new(vec![]), comments: Mutex::new(vec![]), open_prs: Mutex::new(vec![]), commits: Mutex::new(vec![]), lines: Mutex::new(None), stops: Mutex::new(vec![]), review_error: Mutex::new(None), merge_error: Mutex::new(None), keeps: Mutex::new(vec![]), reads: Mutex::new(0), read_error: Mutex::new(None), read_fails: Mutex::new(vec![]), read_delay: Mutex::new(std::time::Duration::ZERO), stamp: Mutex::new(None), stamps_error: Mutex::new(None), held: Mutex::new(None), write_error: Mutex::new(None) })
+        Arc::new(FakeHost { host, rec: Mutex::new(rec), calls: Mutex::new(vec![]), base_failing: Mutex::new(vec![]), members: Mutex::new(vec![]), base_checks: Mutex::new(vec![]), comments: Mutex::new(vec![]), open_prs: Mutex::new(vec![]), commits: Mutex::new(vec![]), lines: Mutex::new(None), stops: Mutex::new(vec![]), review_error: Mutex::new(None), merge_error: Mutex::new(None), merge_errors: Mutex::new(vec![]), merge_lands: Mutex::new(false), push_before_merge: Mutex::new(None), keeps: Mutex::new(vec![]), reads: Mutex::new(0), read_error: Mutex::new(None), read_fails: Mutex::new(vec![]), read_delay: Mutex::new(std::time::Duration::ZERO), stamp: Mutex::new(None), stamps_error: Mutex::new(None), held: Mutex::new(None), write_error: Mutex::new(None) })
     }
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().clone()
@@ -706,7 +723,25 @@ impl PrHost for FakeHost {
         Ok(())
     }
     fn merge(&self, _pr: &PrRef, opts: &MergeOpts) -> HostResult<()> {
-        self.log(format!("merge close={} strategy={}", opts.close_source_branch, opts.strategy.as_deref().unwrap_or("default")));
+        let pinned = opts.head.as_deref().map(|h| format!(" head={h}")).unwrap_or_default();
+        self.log(format!("merge close={} strategy={}{pinned}", opts.close_source_branch, opts.strategy.as_deref().unwrap_or("default")));
+        if let Some(head) = self.push_before_merge.lock().take() {
+            self.rec.lock().head = head;
+        }
+        // As GitHub answers a merge pinned to a head the branch has moved past.
+        if opts.head.as_ref().is_some_and(|h| *h != self.rec.lock().head) {
+            return Err("GraphQL: Head branch was modified. Review and try the merge again. (mergePullRequest)".into());
+        }
+        let next = {
+            let mut errors = self.merge_errors.lock();
+            (!errors.is_empty()).then(|| errors.remove(0))
+        };
+        if let Some(e) = next {
+            if *self.merge_lands.lock() {
+                self.rec.lock().state = "MERGED".into();
+            }
+            return Err(e);
+        }
         if let Some(e) = self.merge_error.lock().clone() {
             return Err(e);
         }

@@ -2,11 +2,12 @@
 //! selected section's rows, grouped in cards; a row is its name, what it does and its control.
 //! "Agent commands" adds under the rows the exact command an agent would run (copyable).
 //!
-//! Worktrees shows each project's slot pool (`GET /slots`), read-only: its settings, each slot with
-//! the task holding it, its size and last use, and the tasks waiting for one.
+//! Worktrees shows each project's slot pool (`GET /slots`): its settings, changed in place
+//! (`POST projects/<name>`), then each slot with the task holding it, its size and last use, and
+//! the tasks waiting for one.
 //!
-//! Accounts: GitHub, Bitbucket, Azure DevOps and Slack, so the board and its agents can
-//! check PRs, comment, push, read failed builds and assign reviewers. The daemon owns them (`taskboardd::accounts`): each
+//! Accounts: GitHub, Bitbucket, Azure DevOps, Slack and Jira, so the board and its agents can
+//! check PRs, comment, push, read failed builds, assign reviewers and work Jira tickets. The daemon owns them (`taskboardd::accounts`): each
 //! is Taskboard's own token, checked with the service and kept in the Keychain, never the Mac's `gh`
 //! or git sign-in. GitHub's comes from a browser code, a pasted token or a copy of gh's. Tokens go to
 //! the daemon once and never come back to the window. An account missing scopes Taskboard needs shows
@@ -27,7 +28,14 @@ impl Global for SettingsHandle {}
 /// Open (or bring forward) the Settings window.
 pub fn open(backend: Arc<dyn Backend>, cx: &mut App) -> Option<WindowHandle<SettingsWindow>> {
     if let Some(h) = cx.try_global::<SettingsHandle>().and_then(|g| g.0)
-        && h.update(cx, |_, w, _| w.activate_window()).is_ok()
+        && h
+            .update(cx, |_, w, _| {
+                // A hidden run (Slate) keeps it off screen.
+                if !crate::hidden::enabled() {
+                    w.activate_window();
+                }
+            })
+            .is_ok()
     {
         return Some(h);
     }
@@ -41,7 +49,13 @@ pub fn open(backend: Arc<dyn Backend>, cx: &mut App) -> Option<WindowHandle<Sett
         focus: std::env::var("TASKBOARD_NO_ACTIVATE").is_err(),
         ..Default::default()
     };
-    let h = cx.open_window(opts, |window, cx| cx.new(|cx| SettingsWindow::new(backend, window, cx))).ok()?;
+    let opts = crate::hidden::settings_options(opts, cx);
+    let h = cx
+        .open_window(opts, |window, cx| {
+            crate::hidden::attach_settings(window, cx);
+            cx.new(|cx| SettingsWindow::new(backend, window, cx))
+        })
+        .ok()?;
     cx.set_global(SettingsHandle(Some(h)));
     Some(h)
 }
@@ -52,13 +66,15 @@ enum Sec {
     Accounts,
     History,
     Usage,
+    Hours,
     Qa,
+    Questions,
     Reviewers,
     Worktrees,
     System,
 }
 
-const SECS: [Sec; 7] = [Sec::Accounts, Sec::History, Sec::Usage, Sec::Qa, Sec::Reviewers, Sec::Worktrees, Sec::System];
+const SECS: [Sec; 9] = [Sec::Accounts, Sec::History, Sec::Usage, Sec::Hours, Sec::Qa, Sec::Questions, Sec::Reviewers, Sec::Worktrees, Sec::System];
 
 impl Sec {
     fn label(self) -> &'static str {
@@ -66,7 +82,9 @@ impl Sec {
             Sec::Accounts => "Accounts",
             Sec::History => "History",
             Sec::Usage => "Usage",
+            Sec::Hours => "Work hours",
             Sec::Qa => "QA",
+            Sec::Questions => "Questions",
             Sec::Reviewers => "Reviewers",
             Sec::Worktrees => "Worktrees",
             Sec::System => "System",
@@ -78,10 +96,12 @@ impl Sec {
             Sec::Accounts => "Sign in once. The board and its agents use these to check PRs, comment, push and assign reviewers.",
             Sec::History => "How far back the Days page goes, and when the board cleans up old work.",
             Sec::Usage => "A daily share of Claude's weekly limit. Once today's share is used, the board starts no new work until midnight; running agents carry on.",
+            Sec::Hours => "When the board starts agents. Outside work hours it waits; running agents carry on.",
             Sec::Qa => "Testers' Jira comments on the board's tickets, turned into follow-up tasks or questions for you. Off until you switch it on.",
+            Sec::Questions => "Questions agents ask you in their replies, and whether the board sends back one asked above the reply's last paragraph to ask it properly.",
             Sec::Reviewers => "Who reviews each project's PRs. Agents and tb reviewers change the roster.",
-            Sec::Worktrees => "Each project's reusable worktree slots, kept warm between tasks. tb project set sizes a project's pool.",
-            Sec::System => "Updates, and the versions of the app and the daemon.",
+            Sec::Worktrees => "Each project's reusable worktree slots, kept warm between tasks.",
+            Sec::System => "Updates, and the versions of the app and the board.",
         }
     }
 
@@ -90,7 +110,9 @@ impl Sec {
             Sec::Accounts => "@",
             Sec::History => "◷",
             Sec::Usage => "◔",
+            Sec::Hours => "◴",
             Sec::Qa => "✓",
+            Sec::Questions => "?",
             Sec::Reviewers => "☺",
             Sec::Worktrees => "⑂",
             Sec::System => "⚙",
@@ -98,13 +120,66 @@ impl Sec {
     }
 }
 
-/// Each account's card: id, a short mark and its color, and what it's used for.
-const CARDS: [(&str, &str, u32, &str); 4] = [
-    ("github", "GH", 0x24292f, "PR checks and reviews, comments, reviewers and git push"),
-    ("bitbucket", "BB", 0x2684ff, "Pull requests, comments, reviewers and git push over HTTPS"),
-    ("azure", "AZ", 0x0078d4, "Failed Azure Pipelines steps and tests on PR checks"),
-    ("slack", "S", 0x4a154b, "Posting and reading messages for the board and its agents"),
-];
+/// Each account's row: id and a short mark.
+const CARDS: [(&str, &str); 5] = [("github", "GH"), ("bitbucket", "BB"), ("azure", "AZ"), ("slack", "SL"), ("jira", "JI")];
+
+/// What stops while an account's sign-in is refused.
+fn refused_means(id: &str) -> &'static str {
+    match id {
+        "github" | "bitbucket" => "agents can't push",
+        "azure" => "no failed pipeline steps on PR checks",
+        "jira" => "tickets and QA comments wait",
+        _ => "no Slack messages",
+    }
+}
+
+/// What forgetting an account's sign-in stops, asked before Disconnect does it.
+fn forget_means(id: &str) -> &'static str {
+    match id {
+        "github" => "Agents can't push to github.com or read PR checks until you sign in again.",
+        "bitbucket" => "Agents can't push to bitbucket.org or read pull requests until you connect it again.",
+        "azure" => "PR checks stop showing failed pipeline steps until you connect it again.",
+        "jira" => "The board stops using this token for tickets and QA comments until you connect it again.",
+        _ => "The board and its agents can't post to Slack until you connect it again.",
+    }
+}
+
+/// An account's status line, and whether the service refused its sign-in: "Signed in as sam ·
+/// checked 3:05 PM, works", "GitHub refused the sign-in at 2:51 PM · agents can't push",
+/// "Not connected".
+fn account_line(id: &str, a: &Value) -> (String, bool) {
+    if a["connected"] != true {
+        return ("Not connected".into(), false);
+    }
+    let at = a["checked_at"].as_str().map(crate::fmt::day_time).filter(|s| !s.is_empty());
+    if a["error"].is_string() {
+        let label = a["label"].as_str().unwrap_or(id);
+        let when = at.map(|at| format!(" at {at}")).unwrap_or_default();
+        return (format!("{label} refused the sign-in{when} · {}", refused_means(id)), true);
+    }
+    let org = a["detail"].as_str().and_then(|d| d.split("dev.azure.com/").nth(1)).map(|o| o.trim_end_matches('/').to_string());
+    let site = [&a["detail"], &a["site"]].into_iter().filter_map(|s| s.as_str()).find(|s| !s.is_empty());
+    let who = match (id, org, site) {
+        ("azure", Some(org), _) => format!("Signed in to {org}"),
+        ("jira", _, Some(site)) => format!("{site} · QA comments {}", if a["qa"] == true { "on" } else { "off" }),
+        _ => match a["user"].as_str().filter(|u| !u.is_empty()) {
+            Some(u) => format!("Signed in as {u}"),
+            None => "Signed in".into(),
+        },
+    };
+    (match at { Some(at) => format!("{who} · checked {at}, works"), None => who }, false)
+}
+
+/// What the Accounts page shows in place of its rows before the board's first answer: `None` once
+/// accounts loaded; otherwise a title and line, either still asking or the board is down. Never
+/// "Not connected" rows, which would ask for a sign-in nothing needs.
+fn accounts_wait(loaded: bool, error: Option<&str>) -> Option<(&'static str, String)> {
+    match (loaded, error) {
+        (true, _) => None,
+        (false, None) => Some(("Asking the board…", String::new())),
+        (false, Some(e)) => Some(("The board isn’t answering", format!("{e} Your sign-ins show once it’s back; trying again every {} seconds.", POLL.as_secs() * IDLE_TICKS as u64))),
+    }
+}
 
 /// What a row's agent line shows, per account.
 fn agent_cli(id: &str) -> &'static str {
@@ -112,6 +187,7 @@ fn agent_cli(id: &str) -> &'static str {
         "github" => "tb pr status   # anything else: gh, or tb api github repos/OWNER/REPO/…",
         "bitbucket" => "tb pr status   # anything else: tb api bitbucket repositories/WORKSPACE/REPO/…",
         "azure" => "tb pr status   # anything else: tb api azure PROJECT/_apis/build/builds/ID?api-version=7.1",
+        "jira" => "tb api jira issue/KEY-123   # the REST API under https://SITE/rest/api/3/",
         _ => "tb api slack chat.postMessage -d '{\"channel\":\"#dev\",\"text\":\"PR is ready\"}'",
     }
 }
@@ -122,7 +198,7 @@ const IDLE_TICKS: u32 = 15;
 
 pub struct SettingsWindow {
     backend: Arc<dyn Backend>,
-    focus: FocusHandle,
+    pub(crate) focus: FocusHandle,
     scroll: ScrollHandle,
     view: Sec,
     accounts: Vec<Value>,
@@ -142,12 +218,20 @@ pub struct SettingsWindow {
     bb_form: bool,
     /// Azure DevOps's token form is open while connected (to replace a token missing scopes).
     az_form: bool,
+    /// Slack's token form is open.
+    slack_form: bool,
+    /// Jira's email and token form is open.
+    jira_form: bool,
+    /// The account whose Disconnect is asking first.
+    confirm: Option<&'static str>,
     gh_token: Input,
     bb_email: Input,
     bb_token: Input,
     az_org: Input,
     az_token: Input,
     slack_token: Input,
+    jira_email: Input,
+    jira_token: Input,
     /// The sign-in code already copied (so a poll doesn't copy it again).
     opened_code: Option<String>,
     /// GitHub's device page was opened for this code.
@@ -156,18 +240,37 @@ pub struct SettingsWindow {
     history: Option<Value>,
     history_busy: bool,
     history_note: Option<(String, bool)>,
+    /// A retention change that removes history, waiting for the owner's yes: the change and what it removes.
+    history_confirm: Option<(Value, String)>,
     /// `GET /usage`'s `daily` block, a call in flight, and the line under its card.
     daily: Option<Value>,
     daily_busy: bool,
     daily_note: Option<(String, bool)>,
     /// `GET /qa`, a call in flight, and the line under its card.
+    /// Work hours: the board's (`GET /state`'s `work_hours`, or a save's answer), the page's
+    /// edits, whether the board's hours are newer than the edits, and Midna's keep-awake.
+    pub(crate) work_hours: Option<Value>,
+    pub(crate) hours: crate::ui::hours::State,
+    pub(crate) hours_fresh: bool,
+    pub(crate) keep_awake: Option<Value>,
     qa: Option<Value>,
     qa_busy: bool,
     qa_note: Option<(String, bool)>,
+    /// `GET /buried-questions`, a call in flight, and the line under its card.
+    questions: Option<Value>,
+    questions_busy: bool,
+    questions_note: Option<(String, bool)>,
     /// `GET /reviewers?project=all`.
     reviewers: Option<Value>,
     /// `GET /slots`: every project's slots and pool settings.
     slots: Option<Value>,
+    /// A pool setting being saved, and the line under a project's settings: (project, text, failed).
+    pool_busy: bool,
+    pool_note: Option<(String, String, bool)>,
+    /// The open slot-count menu (project, key), and the one a click outside just shut, so the
+    /// click that shut it doesn't open it again from its own button.
+    pool_menu: Option<(String, &'static str)>,
+    pool_menu_shut: Option<(String, &'static str, Instant)>,
     /// `GET /info`: the daemon's version, uptime and pid.
     info: Option<Value>,
     /// The daemon is restarting, and the line under the System card.
@@ -194,33 +297,61 @@ impl SettingsWindow {
             gh_form: false,
             bb_form: false,
             az_form: false,
+            slack_form: false,
+            jira_form: false,
+            confirm: None,
             gh_token: Input::secret(cx, "ghp_… or github_pat_…"),
             bb_email: Input::new(cx, "you@company.com", false),
             bb_token: Input::secret(cx, "ATATT…"),
             az_org: Input::new(cx, "your-org or dev.azure.com/your-org", false),
             az_token: Input::secret(cx, "Personal access token"),
             slack_token: Input::secret(cx, "xoxp-… or xoxb-…"),
+            jira_email: Input::new(cx, "you@company.com", false),
+            jira_token: Input::secret(cx, "ATATT…"),
             opened_code: None,
             browser_opened: false,
             history: None,
             history_busy: false,
             history_note: None,
+            history_confirm: None,
             daily: None,
             daily_busy: false,
             daily_note: None,
+            work_hours: None,
+            hours: Default::default(),
+            hours_fresh: false,
+            keep_awake: None,
             qa: None,
             qa_busy: false,
             qa_note: None,
+            questions: None,
+            questions_busy: false,
+            questions_note: None,
             reviewers: None,
             slots: None,
+            pool_busy: false,
+            pool_note: None,
+            pool_menu: None,
+            pool_menu_shut: None,
             info: None,
             sys_busy: false,
             sys_note: None,
         };
+        // coming back to the window shows what changed while it was behind others
+        cx.observe_window_activation(window, |s, window, cx| {
+            if window.is_window_active() {
+                s.load(false, cx);
+                if s.view != Sec::Accounts {
+                    s.reload_page(cx);
+                }
+            }
+        })
+        .detach();
         s.load(false, cx);
         s.load_history(cx);
         s.load_daily(cx);
         s.load_qa(cx);
+        s.load_questions(cx);
         s.load_reviewers(cx);
         s.load_info(cx);
         cx.spawn(async move |this, cx| {
@@ -234,15 +365,13 @@ impl SettingsWindow {
                         break;
                     }
                 }
-                // the updater runs on its own thread: redraw System as its state moves
                 let _ = this.update(cx, |s, cx| {
-                    if s.view == Sec::Worktrees && tick % IDLE_TICKS == 0 {
-                        s.load_slots(cx);
+                    // a window left open keeps its page current
+                    if tick % IDLE_TICKS == 0 && s.view != Sec::Accounts {
+                        s.reload_page(cx);
                     }
+                    // the updater runs on its own thread: redraw System as its state moves
                     if s.view == Sec::System {
-                        if tick % IDLE_TICKS == 0 {
-                            s.load_info(cx);
-                        }
                         cx.notify();
                     }
                 });
@@ -250,6 +379,21 @@ impl SettingsWindow {
         })
         .detach();
         s
+    }
+
+    /// Asks the board again for what the shown page reads.
+    fn reload_page(&self, cx: &mut Context<Self>) {
+        match self.view {
+            Sec::Accounts => self.load(false, cx),
+            Sec::History => self.load_history(cx),
+            Sec::Usage => self.load_daily(cx),
+            Sec::Hours => self.load_hours(cx),
+            Sec::Qa => self.load_qa(cx),
+            Sec::Questions => self.load_questions(cx),
+            Sec::Reviewers => self.load_reviewers(cx),
+            Sec::Worktrees => self.load_slots(cx),
+            Sec::System => self.load_info(cx),
+        }
     }
 
     fn load_history(&self, cx: &mut Context<Self>) {
@@ -269,7 +413,10 @@ impl SettingsWindow {
     fn load_info(&self, cx: &mut Context<Self>) {
         let backend = self.backend.clone();
         cx.spawn(async move |this, cx| {
+            let b = backend.clone();
             let r = cx.background_executor().spawn(async move { backend.get("info", &[]) }).await;
+            let restart = cx.background_executor().spawn(async move { b.get("restart", &[]) }).await;
+            crate::updater::learn_restart(restart.ok().as_ref());
             let _ = this.update(cx, |s, cx| {
                 s.info = r.ok();
                 cx.notify();
@@ -286,6 +433,35 @@ impl SettingsWindow {
             let _ = this.update(cx, |s, cx| {
                 if let Ok(v) = r {
                     s.slots = Some(v);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `POST projects/<name>` with one pool setting; the answer's `worktrees` is the pool's new settings.
+    fn post_pool(&mut self, project: String, key: &'static str, n: i64, cx: &mut Context<Self>) {
+        self.pool_menu = None;
+        if self.pool_busy {
+            return;
+        }
+        self.pool_busy = true;
+        self.pool_note = None;
+        cx.notify();
+        let value = if n == 0 && key.starts_with("idle_") { json!("never") } else { json!(n) };
+        let (backend, path) = (self.backend.clone(), format!("projects/{project}"));
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { backend.post(&path, json!({ key: value })) }).await;
+            let _ = this.update(cx, |s, cx| {
+                s.pool_busy = false;
+                match r {
+                    Ok(v) => {
+                        if let Some(slots) = s.slots.as_mut().filter(|_| v["worktrees"].is_object()) {
+                            slots["pools"][&project] = v["worktrees"].clone();
+                        }
+                    }
+                    Err(e) => s.pool_note = Some((project, e.message, true)),
                 }
                 cx.notify();
             });
@@ -344,6 +520,49 @@ impl SettingsWindow {
         .detach();
     }
 
+    /// Work hours and Midna's keep-awake, as the main window reads them (`GET /state`).
+    fn load_hours(&self, cx: &mut Context<Self>) {
+        let backend = self.backend.clone();
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { backend.get("state", &[]) }).await;
+            let _ = this.update(cx, |s, cx| {
+                if let Some(v) = r.as_ref().ok().filter(|v| v["work_hours"].is_object()) {
+                    s.work_hours = Some(v["work_hours"].clone());
+                    s.keep_awake = Some(v["keep_awake"].clone()).filter(|k| k.is_object());
+                    s.hours_fresh = true;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `POST hours`: answers with the hours. A refusal puts the saved hours back, with why and
+    /// what was sent, for Try again.
+    pub(crate) fn post_hours(&mut self, body: Value, cx: &mut Context<Self>) {
+        self.hours.err = None;
+        self.hours.retry = None;
+        cx.notify();
+        let backend = self.backend.clone();
+        cx.spawn(async move |this, cx| {
+            let sent = body.clone();
+            let r = cx.background_executor().spawn(async move { backend.post("hours", body) }).await;
+            let _ = this.update(cx, |s, cx| {
+                match r {
+                    Ok(v) if v.is_object() => s.work_hours = Some(v),
+                    Ok(_) => {}
+                    Err(e) => {
+                        s.hours.err = Some(e.message);
+                        s.hours.retry = Some(sent);
+                    }
+                }
+                s.hours_fresh = true;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn load_qa(&self, cx: &mut Context<Self>) {
         let backend = self.backend.clone();
         cx.spawn(async move |this, cx| {
@@ -351,6 +570,43 @@ impl SettingsWindow {
             let _ = this.update(cx, |s, cx| {
                 if let Ok(v) = r {
                     s.qa = Some(v);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn load_questions(&self, cx: &mut Context<Self>) {
+        let backend = self.backend.clone();
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { backend.get("buried-questions", &[]) }).await;
+            let _ = this.update(cx, |s, cx| {
+                if let Ok(v) = r {
+                    s.questions = Some(v);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// `POST buried-questions {on}`: answers with its state.
+    fn post_questions(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.questions_busy {
+            return;
+        }
+        self.questions_busy = true;
+        self.questions_note = None;
+        cx.notify();
+        let backend = self.backend.clone();
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { backend.post("buried-questions", json!({"on": on})) }).await;
+            let _ = this.update(cx, |s, cx| {
+                s.questions_busy = false;
+                match r {
+                    Ok(v) => s.questions = Some(v),
+                    Err(e) => s.questions_note = Some((e.message, true)),
                 }
                 cx.notify();
             });
@@ -381,6 +637,34 @@ impl SettingsWindow {
         .detach();
     }
 
+    /// A retention choice: the board says first what the next cleanup would remove under it. Nothing
+    /// to remove saves it; otherwise the page asks.
+    fn preview_history(&mut self, key: &'static str, n: i64, cx: &mut Context<Self>) {
+        if self.history_busy {
+            return;
+        }
+        self.history_busy = true;
+        self.history_note = None;
+        self.history_confirm = None;
+        cx.notify();
+        let backend = self.backend.clone();
+        cx.spawn(async move |this, cx| {
+            let r = cx.background_executor().spawn(async move { backend.post("history", json!({key: n, "preview": true})) }).await;
+            let _ = this.update(cx, |s, cx| {
+                s.history_busy = false;
+                match r {
+                    Ok(v) => match removal_line(&v["removes"]) {
+                        None => s.post_history("history", json!({key: n}), cx),
+                        Some(line) => s.history_confirm = Some((json!({key: n}), line)),
+                    },
+                    Err(e) => s.history_note = Some((e.message, true)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// `POST history` (a setting) or `history/cleanup`; both answer with the History state.
     fn post_history(&mut self, path: &'static str, body: Value, cx: &mut Context<Self>) {
         if self.history_busy {
@@ -388,6 +672,7 @@ impl SettingsWindow {
         }
         self.history_busy = true;
         self.history_note = None;
+        self.history_confirm = None;
         cx.notify();
         let backend = self.backend.clone();
         cx.spawn(async move |this, cx| {
@@ -449,6 +734,9 @@ impl SettingsWindow {
         self.loaded = true;
         self.error = None;
         let gh = self.account("github");
+        if !before && gh["connected"] == true {
+            self.gh_form = false;
+        }
         if !before && gh["connected"] == true && self.opened_code.take().is_some() {
             self.notes.insert("github", (format!("Signed in as @{}.", gh["user"].as_str().unwrap_or("")), false));
         }
@@ -498,6 +786,7 @@ impl SettingsWindow {
     /// Copies the token `gh` already uses; gh's own sign-in isn't changed.
     fn import_gh(&mut self, cx: &mut Context<Self>) {
         self.post("github", "accounts/github/import".into(), json!({}), cx, |s, _| {
+            s.gh_form = false;
             let a = s.account("github");
             s.notes.insert("github", (format!("Using gh's sign-in: {}.", a["detail"].as_str().unwrap_or("connected")), false));
         });
@@ -508,6 +797,7 @@ impl SettingsWindow {
             "github" => json!({"token": self.gh_token.text(cx)}),
             "bitbucket" => json!({"email": self.bb_email.text(cx), "token": self.bb_token.text(cx)}),
             "azure" => json!({"organization": self.az_org.text(cx), "token": self.az_token.text(cx)}),
+            "jira" => json!({"email": self.jira_email.text(cx), "token": self.jira_token.text(cx)}),
             _ => json!({"token": self.slack_token.text(cx)}),
         };
         self.post(id, format!("accounts/{id}"), body, cx, move |s, cx| {
@@ -515,14 +805,18 @@ impl SettingsWindow {
                 "github" => &s.gh_token,
                 "bitbucket" => &s.bb_token,
                 "azure" => &s.az_token,
+                "jira" => &s.jira_token,
                 _ => &s.slack_token,
             };
             field.clear(cx);
             s.gh_form = false;
             s.bb_form = false;
             s.az_form = false;
+            s.slack_form = false;
+            s.jira_form = false;
             let a = s.account(id);
-            s.notes.insert(id, (format!("Connected as {}.", a["detail"].as_str().or(a["user"].as_str()).unwrap_or("you")), false));
+            let who = if id == "jira" { a["user"].as_str() } else { a["detail"].as_str().or(a["user"].as_str()) };
+            s.notes.insert(id, (format!("Connected as {}.", who.unwrap_or("you")), false));
         });
     }
 
@@ -584,9 +878,11 @@ impl Render for SettingsWindow {
             Sec::Accounts => self.accounts_page(&t, window, cx).into_any_element(),
             Sec::History => self.history_page(&t, cx).into_any_element(),
             Sec::Usage => self.usage_page(&t, cx).into_any_element(),
+            Sec::Hours => crate::ui::hours::page(self, &t, window, cx),
             Sec::Qa => self.qa_page(&t, cx).into_any_element(),
+            Sec::Questions => self.questions_page(&t, cx).into_any_element(),
             Sec::Reviewers => self.reviewers_page(&t).into_any_element(),
-            Sec::Worktrees => self.worktrees_page(&t).into_any_element(),
+            Sec::Worktrees => self.worktrees_page(&t, cx).into_any_element(),
             Sec::System => self.system_page(&t, cx).into_any_element(),
         };
         div()
@@ -609,8 +905,9 @@ impl Render for SettingsWindow {
                     .flex()
                     .flex_col()
                     .child(self.page_header(&t, cx))
-                    .when_some(self.error.clone(), |d, e| {
-                        d.child(div().mx(px(28.)).mb(px(10.)).px(px(12.)).py(px(8.)).rounded(px(8.)).bg(t.warn_soft).text_color(t.warn_fg).text_size(px(12.)).child(format!("taskboardd: {e}")))
+                    // Accounts with nothing loaded says it in place of its rows
+                    .when_some(self.error.clone().filter(|_| self.view != Sec::Accounts || self.loaded), |d, e| {
+                        d.child(div().mx(px(28.)).mb(px(10.)).px(px(12.)).py(px(8.)).rounded(px(8.)).bg(t.warn_soft).text_color(t.warn_fg).text_size(px(12.)).child(format!("The board didn't answer: {e}")))
                     })
                     .child(body),
             )
@@ -631,8 +928,7 @@ impl SettingsWindow {
             };
             let hover = t.panel_2;
             list = list.child(
-                div()
-                    .id(SharedString::from(format!("sec-{}", sec.label().to_lowercase())))
+                crate::ui::focus::stop(t, div().id(SharedString::from(format!("sec-{}", sec.label().to_lowercase()))))
                     .flex()
                     .flex_none()
                     .items_center()
@@ -647,20 +943,13 @@ impl SettingsWindow {
                     .child(div().flex_1().min_w_0().truncate().child(sec.label()))
                     .when(n > 0, |d| {
                         d.child(
-                            div().min_w(px(18.)).h(px(18.)).px(px(5.)).rounded(px(9.)).flex().items_center().justify_center().text_size(px(11.)).font_weight(FontWeight::BOLD).bg(t.warn).text_color(t.on_accent).child(n.to_string()),
+                            div().min_w(px(18.)).h(px(18.)).px(px(5.)).rounded(px(9.)).flex().items_center().justify_center().text_size(px(11.)).font_weight(FontWeight::BOLD).bg(t.warn).text_color(t.on_status).child(n.to_string()),
                         )
                     })
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.view = sec;
-                        if sec == Sec::System {
-                            s.load_info(cx);
-                        }
-                        if sec == Sec::Worktrees {
-                            s.load_slots(cx);
-                        }
-                        if sec == Sec::Usage {
-                            s.load_daily(cx);
-                        }
+                        s.confirm = None;
+                        s.reload_page(cx);
                         cx.notify();
                     })),
             );
@@ -689,7 +978,7 @@ impl SettingsWindow {
                     .text_size(px(12.))
                     .text_color(t.muted)
                     .child(kit::dot(if live { t.up } else { t.warn }, 7.))
-                    .child(div().flex_1().child(if live { "Live" } else if self.loaded { "Not connected" } else { "Connecting…" }))
+                    .child(div().flex_1().child(if live { "The board · Running" } else if self.loaded || self.error.is_some() { "The board · Not answering" } else { "The board · Connecting…" }))
                     .when(self.backend.label() == "fake", |d| d.child(kit::tone_pill(t, "goal", "Sample"))),
             )
     }
@@ -718,8 +1007,7 @@ impl SettingsWindow {
                     .child(div().text_size(px(12.5)).line_height(px(17.)).text_color(t.muted).child(self.view.about())),
             )
             .when(self.view == Sec::Accounts, |d| d.child(
-                div()
-                    .id("agent-commands")
+                crate::ui::focus::stop(t, div().id("agent-commands"))
                     .flex()
                     .flex_none()
                     .items_center()
@@ -743,19 +1031,48 @@ impl SettingsWindow {
     }
 
     fn accounts_page(&self, t: &Theme, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut list = div().id("settings-rows").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.scroll).flex().flex_col().gap(px(20.)).px(px(28.)).pt(px(4.)).pb(px(28.));
-        if !self.loaded && self.error.is_none() {
-            return list.child(kit::empty(t, "Asking the board…"));
+        let list = div().id("settings-rows").flex_1().min_h_0().overflow_y_scroll().track_scroll(&self.scroll).flex().flex_col().gap(px(10.)).px(px(28.)).pt(px(4.)).pb(px(28.));
+        match accounts_wait(self.loaded, self.error.as_deref()) {
+            Some((title, line)) if line.is_empty() => return list.child(kit::empty(t, title)),
+            Some((title, line)) => {
+                return list.child(
+                    div()
+                        .id("accounts-down")
+                        .px(px(16.))
+                        .py(px(12.))
+                        .rounded(px(10.))
+                        .bg(t.down_soft)
+                        .border_1()
+                        .border_color(t.down_line)
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(t.down).child(title))
+                                .child(div().text_size(px(12.5)).text_color(t.down).child(line)),
+                        )
+                        .child(kit::btn_small(t, "accounts-retry", "Try again").on_click(cx.listener(|s, _, _, cx| s.load(false, cx)))),
+                );
+            }
+            None => {}
         }
-        for (id, mark, color, about) in CARDS {
+        let mut card = kit::card(t).overflow_hidden();
+        for (i, (id, mark)) in CARDS.into_iter().enumerate() {
             let a = self.account(id);
+            card = card.child(self.status_row(t, id, mark, &a, i == 0, cx));
             let rows: Vec<AnyElement> = match id {
                 "github" => self.github_rows(t, &a, window, cx),
                 "bitbucket" => self.bitbucket_rows(t, &a, window, cx),
                 "azure" => self.azure_rows(t, &a, window, cx),
+                "jira" => self.jira_rows(t, &a, window, cx),
                 _ => self.slack_rows(t, &a, window, cx),
             };
-            let mut card = kit::card(t).overflow_hidden();
             for r in rows {
                 card = card.child(r);
             }
@@ -765,129 +1082,218 @@ impl SettingsWindow {
             if self.cli {
                 card = card.child(self.cli_line(t, id, "tb accounts", cx)).child(self.cli_line(t, &format!("{id}-use"), agent_cli(id), cx));
             }
-            let label = a["label"].as_str().unwrap_or(id).to_string();
-            let heading = div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .px(px(4.))
-                .text_size(px(12.))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(t.muted)
-                .child(
-                    div()
-                        .size(px(18.))
-                        .flex()
-                        .flex_none()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(5.))
-                        .bg(rgb(color))
-                        .text_color(t.on_accent)
-                        .text_size(px(9.))
-                        .font_weight(FontWeight::BOLD)
-                        .child(mark),
-                )
-                .child(div().text_color(t.text).child(label))
-                .child(div().font_weight(FontWeight::NORMAL).text_size(px(11.5)).truncate().child(format!("· {about}")));
-            list = list.child(div().flex().flex_col().gap(px(8.)).child(heading).child(card));
         }
-        list.child(
-            div()
-                .px(px(4.))
-                .text_size(px(11.5))
-                .line_height(px(16.))
-                .text_color(t.muted)
-                .child("Tokens are checked with the service, then kept in your login Keychain as Taskboard's own. Your gh and git sign-ins aren't changed. The board never shows tokens again; agents get them with tb token, and push with them while on a task."),
-        )
+        list.child(card).child(div().px(px(4.)).text_size(px(11.5)).line_height(px(16.)).text_color(t.muted).child("Tokens stay in your login Keychain."))
     }
 
     // -------------------------------------------------------------- accounts
 
+    /// An account's one row: its mark, name and status, and what can be done with it. Disconnect asks
+    /// first, in the row; a refused sign-in turns the row amber with "Sign in again".
+    fn status_row(&self, t: &Theme, id: &'static str, mark: &str, a: &Value, first: bool, cx: &mut Context<Self>) -> AnyElement {
+        let busy = self.busy == Some(id);
+        let label = a["label"].as_str().unwrap_or(id).to_string();
+        let connected = a["connected"] == true;
+        let (status, refused) = account_line(id, a);
+        let asking = self.confirm == Some(id) && connected;
+        let tile = div()
+            .size(px(30.))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .rounded(px(7.))
+            .bg(t.panel_2)
+            .text_color(t.muted)
+            .text_size(px(11.))
+            .font_weight(FontWeight::BOLD)
+            .child(mark.to_string());
+        let (name, note) = if asking { (format!("Forget the {label} sign-in?"), forget_means(id).to_string()) } else { (label, status) };
+        let warn = refused && !asking;
+        let words = div()
+            .id(SharedString::from(format!("{id}-status")))
+            .flex_1()
+            .min_w(px(150.))
+            .flex()
+            .flex_col()
+            .child(div().font_weight(FontWeight::SEMIBOLD).when(warn, |d| d.text_color(t.warn_fg)).child(name))
+            .child(div().text_size(px(12.)).line_height(px(16.)).text_color(if warn { t.warn_fg } else { t.muted }).child(note))
+            .when_some(a["error"].as_str().filter(|_| warn).map(str::to_string), |d, e| d.tooltip(kit::tip(e)));
+        let small = |b: Stateful<Div>| b.h(px(26.)).text_size(px(12.));
+        let mut ctl = controls().flex_wrap();
+        if asking {
+            ctl = ctl
+                .child(kit::btn_small(t, SharedString::from(format!("{id}-keep")), "Cancel").on_click(cx.listener(|s, _, _, cx| {
+                    s.confirm = None;
+                    cx.notify();
+                })))
+                .child(small(kit::btn_danger(t, SharedString::from(format!("{id}-forget")), "Disconnect")).on_click(cx.listener(move |s, _, _, cx| s.disconnect(id, cx))));
+        } else if connected {
+            let first = if refused {
+                let b = small(kit::btn_primary(t, SharedString::from(format!("{id}-again")), if busy { "Starting…" } else { "Sign in again" }));
+                if busy { kit::disabled(b) } else { b.on_click(cx.listener(move |s, _, window, cx| s.sign_in_again(id, window, cx))) }
+            } else {
+                let b = kit::btn_small(t, SharedString::from(format!("{id}-check")), if busy { "Checking…" } else { "Check" });
+                if busy { kit::disabled(b) } else { b.tooltip(kit::tip("Ask the service whether the token still works")).on_click(cx.listener(move |s, _, _, cx| s.post(id, format!("accounts/{id}/check"), json!({}), cx, |_, _| {}))) }
+            };
+            let out = small(kit::btn_danger(t, SharedString::from(format!("{id}-out")), "Disconnect"));
+            let out = if busy { kit::disabled(out) } else { out.tooltip(kit::tip("Forgets the board's token. gh and git on this Mac aren't touched.")).on_click(cx.listener(move |s, _, _, cx| s.ask_disconnect(id, cx))) };
+            ctl = ctl.child(first).child(div().w(px(1.)).h(px(18.)).mx(px(2.)).bg(t.border)).child(out);
+        } else if self.login().is_none() || id != "github" {
+            let open = self.form_open(id);
+            ctl = ctl.child(kit::btn_small(t, SharedString::from(format!("{id}-connect-open")), if open { "Cancel" } else { "Connect…" }).on_click(cx.listener(move |s, _, window, cx| {
+                if s.form_open(id) { s.close_form(id, cx) } else { s.open_form(id, window, cx) }
+            })));
+        }
+        row(t, &format!("{id}-row"), first)
+            .min_h(px(56.))
+            .when(warn, |d| d.bg(t.warn_soft))
+            .when(asking, |d| d.bg(t.down_soft))
+            .child(tile)
+            .child(words)
+            .child(ctl)
+            .into_any_element()
+    }
+
+    fn form_open(&self, id: &str) -> bool {
+        match id {
+            "github" => self.gh_form,
+            "bitbucket" => self.bb_form,
+            "azure" => self.az_form,
+            "jira" => self.jira_form,
+            _ => self.slack_form,
+        }
+    }
+
+    /// Connect… opens an account's form, its first field ready to type in.
+    fn open_form(&mut self, id: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        let focus = match id {
+            "github" => {
+                self.gh_form = true;
+                &self.gh_token.focus
+            }
+            "bitbucket" => {
+                self.bb_form = true;
+                &self.bb_email.focus
+            }
+            "azure" => {
+                self.az_form = true;
+                &self.az_org.focus
+            }
+            "jira" => {
+                self.jira_form = true;
+                &self.jira_email.focus
+            }
+            _ => {
+                self.slack_form = true;
+                &self.slack_token.focus
+            }
+        };
+        window.focus(focus, cx);
+        cx.notify();
+    }
+
+    fn close_form(&mut self, id: &str, cx: &mut Context<Self>) {
+        match id {
+            "github" => self.gh_form = false,
+            "bitbucket" => self.bb_form = false,
+            "azure" => self.az_form = false,
+            "jira" => self.jira_form = false,
+            _ => self.slack_form = false,
+        }
+        cx.notify();
+    }
+
+    /// A refused sign-in: GitHub signs in with the browser again when gh is here; the rest (and
+    /// GitHub without gh) open their form for a new token.
+    fn sign_in_again(&mut self, id: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        if id == "github" && self.account("github")["gh"] != false {
+            self.sign_in(cx);
+        } else {
+            self.open_form(id, window, cx);
+        }
+    }
+
+    /// Disconnect only asks; the row says what forgetting the sign-in stops.
+    fn ask_disconnect(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        self.confirm = Some(id);
+        cx.notify();
+    }
+
+    fn disconnect(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        self.confirm = None;
+        self.post(id, format!("accounts/{id}/disconnect"), json!({}), cx, |_, _| {});
+    }
+
+    /// GitHub's rows under its status: the sign-in code while the browser sign-in waits, a sign-in
+    /// missing scopes, and the form Connect… opens.
     fn github_rows(&self, t: &Theme, a: &Value, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let busy = self.busy == Some("github");
         let has_gh = a["gh"] != false;
+        let connected = a["connected"] == true;
         let mut rows = vec![];
         if let Some((code, url)) = self.login() {
             rows.push(self.github_code(t, code, url, cx));
             return rows;
         }
-        if a["connected"] == true {
-            rows.push(self.signed_in_row(t, "github", a, "Taskboard's own token", "Disconnect", cx));
-            if a["reauth"] == true {
-                let btn = if !has_gh {
-                    kit::btn_primary(t, "gh-reauth", "Use a new token").h(px(26.)).text_size(px(12.)).on_click(cx.listener(|s, _, window, cx| {
-                        s.gh_form = true;
-                        window.focus(&s.gh_token.focus, cx);
-                        cx.notify();
-                    }))
-                } else if busy {
-                    kit::disabled(kit::btn_primary(t, "gh-reauth", "Starting…").h(px(26.)).text_size(px(12.)))
-                } else {
-                    kit::btn_primary(t, "gh-reauth", "Sign in again").h(px(26.)).text_size(px(12.)).on_click(cx.listener(|s, _, _, cx| s.sign_in(cx)))
-                };
-                rows.push(reauth_row(t, "github", a, "Sign in again (or use a token that has them).", btn.into_any_element()));
-            }
-            rows.push(push_row(t, "github", "github.com"));
-        } else {
+        if connected && a["reauth"] == true {
+            let btn = if !has_gh {
+                kit::btn_primary(t, "gh-reauth", "Use a new token").h(px(26.)).text_size(px(12.)).on_click(cx.listener(|s, _, window, cx| s.open_form("github", window, cx)))
+            } else if busy {
+                kit::disabled(kit::btn_primary(t, "gh-reauth", "Starting…").h(px(26.)).text_size(px(12.)))
+            } else {
+                kit::btn_primary(t, "gh-reauth", "Sign in again").h(px(26.)).text_size(px(12.)).on_click(cx.listener(|s, _, _, cx| s.sign_in(cx)))
+            };
+            rows.push(reauth_row(t, "github", a, "Sign in again (or use a token that has them).", btn.into_any_element()));
+        }
+        if !self.gh_form {
+            rows.extend(error_row(t, "github", a));
+            return rows;
+        }
+        if !connected {
             let sign_in = if busy { kit::disabled(kit::btn_primary(t, "gh-sign-in", "Starting…").h(px(26.)).text_size(px(12.))) } else {
                 kit::btn_primary(t, "gh-sign-in", "Sign in with GitHub").h(px(26.)).text_size(px(12.)).on_click(cx.listener(|s, _, _, cx| s.sign_in(cx)))
             };
             let note = if has_gh {
-                "Opens GitHub in your browser with a one-time code. Taskboard keeps its own token; gh's sign-in isn't changed."
+                "Opens GitHub in your browser with a one-time code. The board keeps its own token; gh's sign-in isn't changed."
             } else {
-                "Paste a token, or install the GitHub CLI (brew install gh) to sign in with the browser."
+                "Paste a token below, or install the GitHub CLI (brew install gh) to sign in with the browser."
             };
             rows.push(
-                line(t, "gh-out", true, false, "Not signed in", note, None)
-                    .child(
-                        controls()
-                            .when(has_gh, |d| {
-                                d.child(
+                line(t, "gh-out", false, false, "Sign in with the browser", note, None)
+                    .when(has_gh, |d| {
+                        d.child(
+                            controls()
+                                .flex_wrap()
+                                .child(
                                     kit::btn_small(t, "gh-import", "Use my gh sign-in")
-                                        .tooltip(kit::tip("Copies the token gh already uses into Taskboard. gh isn't changed."))
+                                        .tooltip(kit::tip("Copies the token gh already uses to the board. gh isn't changed."))
                                         .on_click(cx.listener(|s, _, _, cx| s.import_gh(cx))),
                                 )
-                            })
-                            .when(!self.gh_form, |d| {
-                                d.child(kit::btn_small(t, "gh-use-token", "Use a token").on_click(cx.listener(|s, _, window, cx| {
-                                    s.gh_form = true;
-                                    window.focus(&s.gh_token.focus, cx);
-                                    cx.notify();
-                                })))
-                            })
-                            .when(has_gh, |d| d.child(sign_in)),
-                    )
+                                .child(sign_in),
+                        )
+                    })
                     .into_any_element(),
             );
         }
-        if self.gh_form {
-            rows.push(self.token_row(t, "github", "Token", "A classic token with repo, read:org and workflow, or a fine-grained one with Contents, Pull requests and Workflows (read and write).", &self.gh_token, window, cx, a["connected"] != true));
-        }
+        rows.push(self.token_row(t, "github", "Token", "A classic token with repo, read:org and workflow, or a fine-grained one with Contents, Pull requests and Workflows (read and write).", &self.gh_token, window, cx, false));
         rows.extend(error_row(t, "github", a));
         rows
     }
 
     fn bitbucket_rows(&self, t: &Theme, a: &Value, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut rows = vec![];
-        let connected = a["connected"] == true;
-        if connected {
-            rows.push(self.signed_in_row(t, "bitbucket", a, "API token in the Keychain (taskboard-bitbucket)", "Disconnect", cx));
+        if a["connected"] == true {
             if a["reauth"] == true && !self.bb_form {
-                let btn = kit::btn_primary(t, "bb-reauth", "Use a new token").h(px(26.)).text_size(px(12.)).on_click(cx.listener(|s, _, window, cx| {
-                    s.bb_form = true;
-                    window.focus(&s.bb_email.focus, cx);
-                    cx.notify();
-                }));
+                let btn = kit::btn_primary(t, "bb-reauth", "Use a new token").h(px(26.)).text_size(px(12.)).on_click(cx.listener(|s, _, window, cx| s.open_form("bitbucket", window, cx)));
                 rows.push(reauth_row(t, "bitbucket", a, "Make a new API token with them and connect it.", btn.into_any_element()));
             } else if let Some(note) = a["note"].as_str() {
                 rows.push(off_row(t, "bitbucket", a, note));
             }
-            rows.push(push_row(t, "bitbucket", "bitbucket.org"));
         }
-        if !connected || self.bb_form {
-            let email = self.bb_email.render(t, "bb-email", window).w(px(260.)).on_key_down(self.field_keys("bitbucket", &self.bb_email, cx));
-            rows.push(line(t, "bb-email-row", !connected, false, "Atlassian email", "The email you sign in to Bitbucket with.", None).child(email).into_any_element());
+        if self.bb_form {
+            let email = self.bb_email.render(t, "bb-email", window).flex_1().min_w(px(140.)).max_w(px(260.)).on_key_down(self.field_keys("bitbucket", &self.bb_email, cx));
+            rows.push(line(t, "bb-email-row", false, false, "Atlassian email", "The email you sign in to Bitbucket with.", None).child(field_box().child(email)).into_any_element());
             rows.push(self.token_row(
                 t,
                 "bitbucket",
@@ -906,23 +1312,17 @@ impl SettingsWindow {
 
     fn azure_rows(&self, t: &Theme, a: &Value, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut rows = vec![];
-        let connected = a["connected"] == true;
-        if connected {
-            rows.push(self.signed_in_row(t, "azure", a, "Personal access token in the Keychain (taskboard-azure-devops)", "Disconnect", cx));
+        if a["connected"] == true {
             if a["reauth"] == true && !self.az_form {
-                let btn = kit::btn_primary(t, "az-reauth", "Use a new token").h(px(26.)).text_size(px(12.)).on_click(cx.listener(|s, _, window, cx| {
-                    s.az_form = true;
-                    window.focus(&s.az_token.focus, cx);
-                    cx.notify();
-                }));
+                let btn = kit::btn_primary(t, "az-reauth", "Use a new token").h(px(26.)).text_size(px(12.)).on_click(cx.listener(|s, _, window, cx| s.open_form("azure", window, cx)));
                 rows.push(reauth_row(t, "azure", a, "Edit the token in Azure DevOps (or make a new one) to add them, and connect it.", btn.into_any_element()));
             } else if let Some(note) = a["note"].as_str() {
                 rows.push(off_row(t, "azure", a, note));
             }
         }
-        if !connected || self.az_form {
-            let org = self.az_org.render(t, "az-org", window).w(px(260.)).on_key_down(self.field_keys("azure", &self.az_org, cx));
-            rows.push(line(t, "az-org-row", !connected, false, "Organization", "The organization your pipelines run in.", None).child(org).into_any_element());
+        if self.az_form {
+            let org = self.az_org.render(t, "az-org", window).flex_1().min_w(px(140.)).max_w(px(260.)).on_key_down(self.field_keys("azure", &self.az_org, cx));
+            rows.push(line(t, "az-org-row", false, false, "Organization", "The organization your pipelines run in.", None).child(field_box().child(org)).into_any_element());
             rows.push(self.token_row(t, "azure", "Personal access token", "A token with Build (Read) and Test Management (Read).", &self.az_token, window, cx, false));
             rows.push(link_row(t, "az-create", "How to make a personal access token", taskboardd::accounts::AZURE_TOKEN_URL, cx));
         }
@@ -930,21 +1330,32 @@ impl SettingsWindow {
         rows
     }
 
+    /// Jira's form: the Atlassian email and API token for the site in `[jira] site`, which the board
+    /// needs before it can check a token.
+    fn jira_rows(&self, t: &Theme, a: &Value, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut rows = vec![];
+        if let Some(note) = a["note"].as_str().filter(|_| a["connected"] == true) {
+            rows.push(off_row(t, "jira", a, note));
+        }
+        if self.jira_form {
+            if a["site"].as_str().unwrap_or("").is_empty() {
+                rows.push(line(t, "jira-site-row", false, false, "Site", "Set [jira] site in config.toml (acme.atlassian.net), then connect.", None).into_any_element());
+            } else {
+                let email = self.jira_email.render(t, "jira-email", window).flex_1().min_w(px(140.)).max_w(px(260.)).on_key_down(self.field_keys("jira", &self.jira_email, cx));
+                let about = format!("The email you sign in to {} with.", a["site"].as_str().unwrap_or("Jira"));
+                rows.push(line(t, "jira-email-row", false, false, "Atlassian email", &about, None).child(field_box().child(email)).into_any_element());
+                rows.push(self.token_row(t, "jira", "API token", "An Atlassian API token made by the same account.", &self.jira_token, window, cx, false));
+                rows.push(link_row(t, "jira-create", "Create an API token", taskboardd::accounts::BITBUCKET_TOKEN_URL, cx));
+            }
+        }
+        rows.extend(error_row(t, "jira", a));
+        rows
+    }
+
     fn slack_rows(&self, t: &Theme, a: &Value, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut rows = vec![];
-        if a["connected"] == true {
-            rows.push(self.signed_in_row(t, "slack", a, "Token in the Keychain (taskboard-slack)", "Disconnect", cx));
-        } else {
-            rows.push(self.token_row(
-                t,
-                "slack",
-                "Token",
-                "A user (xoxp-) or bot (xoxb-) token from your Slack app's OAuth & Permissions page.",
-                &self.slack_token,
-                window,
-                cx,
-                true,
-            ));
+        if self.slack_form {
+            rows.push(self.token_row(t, "slack", "Token", "A user (xoxp-) or bot (xoxb-) token from your Slack app's OAuth & Permissions page.", &self.slack_token, window, cx, false));
             rows.push(link_row(t, "slack-apps", "Open your Slack apps", taskboardd::accounts::SLACK_APPS_URL, cx));
         }
         rows.extend(error_row(t, "slack", a));
@@ -985,8 +1396,7 @@ impl SettingsWindow {
         }
         let flashed = self.copied.as_ref().is_some_and(|(c, _)| *c == code);
         let c = code.clone();
-        let chip = div()
-            .id("gh-code-chip")
+        let chip = crate::ui::focus::stop(t, div().id("gh-code-chip"))
             .px(px(14.))
             .py(px(6.))
             .rounded(px(9.))
@@ -1027,32 +1437,14 @@ impl SettingsWindow {
         panel.child(line1).child(line2).child(div().text_size(px(11.5)).line_height(px(15.)).text_color(t.muted).child(after)).into_any_element()
     }
 
-    /// "Name · detail · scopes" with Check and Sign out / Disconnect.
-    fn signed_in_row(&self, t: &Theme, id: &'static str, a: &Value, how: &str, out: &str, cx: &mut Context<Self>) -> AnyElement {
-        let busy = self.busy == Some(id);
-        let name = a["name"].as_str().or(a["user"].as_str()).unwrap_or("Connected").to_string();
-        let scopes: Vec<&str> = a["scopes"].as_array().map(|s| s.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
-        let detail = a["detail"].as_str().unwrap_or("");
-        let note = [detail, how].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" · ");
-        let check = kit::btn_small(t, SharedString::from(format!("{id}-check")), if busy { "Checking…" } else { "Check" });
-        let check = if busy { kit::disabled(check) } else { check.tooltip(kit::tip("Ask the service whether the token still works")).on_click(cx.listener(move |s, _, _, cx| s.post(id, format!("accounts/{id}/check"), json!({}), cx, |_, _| {}))) };
-        let out_btn = kit::btn_small(t, SharedString::from(format!("{id}-out")), out.to_string()).text_color(t.down);
-        let out_btn = if busy { kit::disabled(out_btn) } else { out_btn.on_click(cx.listener(move |s, _, _, cx| s.post(id, format!("accounts/{id}/disconnect"), json!({}), cx, |_, _| {}))) };
-        let tip = "Forgets Taskboard's token. gh and git on this Mac aren't touched.";
-        line(t, &format!("{id}-in"), true, false, "", &note, Some((&name, true)))
-            .when(!scopes.is_empty(), |d| d.child(div().flex().flex_wrap().gap(px(4.)).max_w(px(260.)).justify_end().children(scopes.into_iter().take(6).map(|s| kit::chip(t, s.to_string())))))
-            .child(controls().child(check).child(out_btn.tooltip(kit::tip(tip))))
-            .into_any_element()
-    }
-
     /// A secret field with Connect (↩).
     #[allow(clippy::too_many_arguments)]
     fn token_row(&self, t: &Theme, id: &'static str, label: &str, note: &str, field: &Input, window: &Window, cx: &mut Context<Self>, first: bool) -> AnyElement {
         let busy = self.busy == Some(id);
-        let input = field.render(t, SharedString::from(format!("{id}-token")), window).w(px(260.)).on_key_down(self.field_keys(id, field, cx));
+        let input = field.render(t, SharedString::from(format!("{id}-token")), window).flex_1().min_w(px(140.)).max_w(px(260.)).on_key_down(self.field_keys(id, field, cx));
         let btn = kit::btn_primary(t, SharedString::from(format!("{id}-connect")), if busy { "Checking…" } else { "Connect" }).h(px(32.)).text_size(px(12.5));
         let btn = if busy { kit::disabled(btn) } else { btn.on_click(cx.listener(move |s, _, _, cx| s.connect(id, cx))) };
-        line(t, &format!("{id}-token-row"), first, false, label, note, None).child(controls().child(input).child(btn)).into_any_element()
+        line(t, &format!("{id}-token-row"), first, false, label, note, None).child(field_box().child(input).child(btn)).into_any_element()
     }
 
     fn cli_line(&self, t: &Theme, id: &str, cli: &str, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1074,8 +1466,7 @@ impl SettingsWindow {
                 .child(div().flex_none().text_color(t.accent).child("$"))
                 .child(div().flex_1().min_w_0().truncate().child(cli.to_string()))
                 .child(
-                    div()
-                        .id(SharedString::from(format!("copy-{id}")))
+                    crate::ui::focus::stop(t, div().id(SharedString::from(format!("copy-{id}"))))
                         .flex_none()
                         .h(px(20.))
                         .px(px(6.))
@@ -1107,6 +1498,33 @@ fn days_label(n: i64) -> String {
     }
 }
 
+/// A retention control from `GET /history`: its choices, and which one the board keeps now. The
+/// board names them `detail_choices` and `summary_choices` beside `detail_days` and `summary_days`.
+fn retention(h: &Value, key: &str) -> (Vec<i64>, Option<usize>) {
+    let choices: Vec<i64> = h[format!("{}_choices", key.trim_end_matches("_days"))].as_array().map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default();
+    let on = h[key].as_i64().and_then(|cur| choices.iter().position(|n| *n == cur));
+    (choices, on)
+}
+
+/// What a retention change would remove (the board's preview), or None when it removes nothing.
+fn removal_line(removes: &Value) -> Option<String> {
+    let n = |k: &str| removes[k].as_i64().unwrap_or(0);
+    let (events, days) = (n("events_total"), n("days"));
+    let mut parts = vec![];
+    if events > 0 {
+        parts.push(crate::fmt::plural(events, "event", "events"));
+    }
+    if days > 0 {
+        parts.push(format!("the summaries of {}", crate::fmt::plural(days, "day", "days")));
+    } else if n("day_rows") > 0 {
+        parts.push(crate::fmt::plural(n("day_rows"), "day summary", "day summaries"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("The next cleanup, after 3 AM, removes {}. They can't be brought back.", parts.join(" and ")))
+}
+
 /// "4.2 MB", "820 KB".
 fn bytes_label(b: i64) -> String {
     if b >= 1_000_000 { format!("{:.1} MB", b as f64 / 1_000_000.0) } else { format!("{} KB", (b as f64 / 1000.0).ceil() as i64) }
@@ -1118,15 +1536,15 @@ impl SettingsWindow {
         let Some(h) = self.history.clone() else {
             return list.child(kit::empty(t, "Asking the board…"));
         };
+        let busy = self.history_busy;
         let pick = |key: &'static str, label: &str, note: &str, first: bool, cx: &mut Context<Self>| {
-            let choices: Vec<i64> = h[format!("{key}_choices")].as_array().map(|a| a.iter().filter_map(|x| x.as_i64()).collect()).unwrap_or_default();
-            let cur = h[key].as_i64().unwrap_or(0);
+            let (choices, on) = retention(&h, key);
             let labels: Vec<String> = choices.iter().map(|n| days_label(*n)).collect();
             let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
-            let on = choices.iter().position(|n| *n == cur).unwrap_or(usize::MAX);
+            let on = on.unwrap_or(usize::MAX);
             let control = kit::seg(t, &format!("hist-{key}"), &refs, on, |i, item| {
                 let n = choices[i];
-                item.on_click(cx.listener(move |s, _, _, cx| s.post_history("history", json!({key: n}), cx)))
+                if busy || i == on { item } else { item.on_click(cx.listener(move |s, _, _, cx| s.preview_history(key, n, cx))) }
             });
             line(t, &format!("hist-{key}-row"), first, false, label, note, None).child(controls().child(control))
         };
@@ -1149,7 +1567,19 @@ impl SettingsWindow {
             kit::btn_small(t, "hist-clean", "Clean up now").on_click(cx.listener(|s, _, _, cx| s.post_history("history/cleanup", json!({}), cx)))
         };
         let clean = line(t, "hist-clean-row", false, false, "Cleanup", &format!("Runs every night after 3 AM. Last run: {last}."), None).child(controls().child(button));
-        let mut card = kit::card(t).overflow_hidden().child(detail).child(summary).child(used).child(clean);
+        let mut card = kit::card(t).overflow_hidden().child(detail).child(summary);
+        if let Some((body, text)) = self.history_confirm.clone() {
+            let ask = line(t, "hist-confirm", false, true, "Remove this history?", &text, None).child(
+                controls()
+                    .child(kit::btn_small(t, "hist-keep", "Cancel").on_click(cx.listener(|s, _, _, cx| {
+                        s.history_confirm = None;
+                        cx.notify();
+                    })))
+                    .child(kit::btn_danger(t, "hist-apply", "Change and remove").h(px(26.)).text_size(px(12.)).on_click(cx.listener(move |s, _, _, cx| s.post_history("history", body.clone(), cx)))),
+            );
+            card = card.child(ask);
+        }
+        card = card.child(used).child(clean);
         if let Some((text, bad)) = &self.history_note {
             card = card.child(row(t, "hist-note", false).bg(if *bad { t.down_soft } else { t.up_soft }).text_color(if *bad { t.down } else { t.up_fg }).text_size(px(12.)).child(text.clone()));
         }
@@ -1205,7 +1635,7 @@ impl SettingsWindow {
                 item.on_click(cx.listener(move |s, _, _, cx| s.post_daily("usage/daily", json!({"base": b}), cx)))
             }
         });
-        let note = "Even splits what's left of the week over the days to its reset; a percent gives each day that share of the week.";
+        let note = "Even splits what's left of the week over the days to its reset; a percent gives each day that share of the week. A change keeps what today already used.";
         let mut card = kit::card(t).overflow_hidden().child(line(t, "daily-base-row", true, false, "Daily limit", note, None).child(controls().child(base)));
         if d["on"] == true {
             let spread = d["carry"] == "spread";
@@ -1281,6 +1711,32 @@ impl SettingsWindow {
     }
 }
 
+// ------------------------------------------------------------------ questions
+
+impl SettingsWindow {
+    fn questions_page(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let list = div().id("questions-rows").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().gap(px(20.)).px(px(28.)).pt(px(4.)).pb(px(28.));
+        let Some(q) = self.questions.clone() else {
+            return list.child(kit::empty(t, "Asking the board…"));
+        };
+        let on = q["on"] != false;
+        let note = "A task's reply that asks you something above its last paragraph is sent back once, to ask it with tb question or in a final Questions block, so it reaches you as a Question card.";
+        let control = kit::seg(t, "buried-on", &["Off", "On"], if on { 1 } else { 0 }, |i, item| {
+            if self.questions_busy {
+                item
+            } else {
+                item.on_click(cx.listener(move |s, _, _, cx| s.post_questions(i == 1, cx)))
+            }
+        });
+        let switch = line(t, "buried-on-row", true, false, "Send back buried questions", note, None).child(controls().child(control));
+        let mut card = kit::card(t).overflow_hidden().child(switch);
+        if let Some((text, bad)) = &self.questions_note {
+            card = card.child(row(t, "buried-note", false).bg(if *bad { t.down_soft } else { t.up_soft }).text_color(if *bad { t.down } else { t.up_fg }).text_size(px(12.)).child(text.clone()));
+        }
+        list.child(card)
+    }
+}
+
 // ------------------------------------------------------------------ system
 
 impl SettingsWindow {
@@ -1294,21 +1750,25 @@ impl SettingsWindow {
                 cx.notify();
             }))
         };
-        let channel = if updater::VERSION.contains("-beta.") { "Gets every release, betas included." } else { "Gets public releases." };
+        let channel = match updater::updated() {
+            Some((v, at)) => format!("Updated to {v} today at {at}."),
+            None if updater::VERSION.contains("-beta.") => "Gets every release, betas included.".into(),
+            None => "Gets public releases.".into(),
+        };
         let (dot, status, note, button): (Hsla, String, String, Option<Stateful<Div>>) = match updater::state() {
             State::Off(why) => (t.faint, "Off".into(), why, None),
-            State::Idle => (t.faint, "Not checked yet".into(), channel.into(), Some(check("Check now", cx))),
-            State::Checking => (t.faint, "Checking…".into(), channel.into(), Some(kit::disabled(small(kit::btn_small(t, "sys-check", "Checking…"))))),
-            State::UpToDate { at } => (t.up, format!("Up to date · checked at {at}"), channel.into(), Some(check("Check now", cx))),
+            State::Idle => (t.faint, "Not checked yet".into(), channel, Some(check("Check now", cx))),
+            State::Checking => (t.faint, "Checking…".into(), channel, Some(kit::disabled(small(kit::btn_small(t, "sys-check", "Checking…"))))),
+            State::UpToDate { at } => (t.up, format!("Up to date · checked at {at}"), channel, Some(check("Check now", cx))),
             State::Downloading { version } => (t.accent, format!("Downloading {version}…"), "Checked before it's offered.".into(), None),
             State::Ready { version, .. } => (
                 t.accent,
                 format!("{version} ready"),
-                "Downloaded and checked. The board and its agents keep running through the restart.".into(),
+                updater::restart_note(updater::restart_reviews()),
                 Some(small(kit::btn_primary(t, "sys-apply", "Restart to update")).on_click(cx.listener(|s, _, _, cx| s.apply_update(cx)))),
             ),
-            State::Applying { version } => (t.accent, format!("Installing {version}…"), "Taskboard reopens in a moment.".into(), None),
-            State::Failed { error, at } => (t.down, format!("Check failed at {at}"), error, Some(check("Retry", cx))),
+            State::Applying { version } => (t.accent, format!("Installing {version}…"), "The app reopens in a moment.".into(), None),
+            State::Failed { stage, error, at } => (t.down, format!("{} at {at}", State::failure_title(&stage)), format!("{stage}: {error}"), Some(check("Try again", cx))),
         };
         let update = line(t, "sys-update", true, false, "Update", &note, None).child(
             controls()
@@ -1340,11 +1800,11 @@ impl SettingsWindow {
                 kit::disabled(small(kit::btn_small(t, "sys-restart", "Restarting…")))
             } else {
                 // the call to action when it's behind; otherwise there for a daemon that's stuck
-                let b = if behind { kit::btn_primary(t, "sys-restart", "Restart daemon") } else { kit::btn_small(t, "sys-restart", "Restart daemon") };
+                let b = if behind { kit::btn_primary(t, "sys-restart", "Restart the board") } else { kit::btn_small(t, "sys-restart", "Restart the board") };
                 small(b).on_click(cx.listener(|s, _, _, cx| s.restart_daemon(cx)))
             }
         });
-        let daemon = line(t, "sys-daemon", false, behind, "Daemon version", &daemon_note, None).child(
+        let daemon = line(t, "sys-daemon", false, behind, "Board version", &daemon_note, None).child(
             controls()
                 .child(kit::dot(if self.info.is_none() { t.faint } else if behind { t.warn } else { t.up }, 7.))
                 .child(div().text_size(px(12.)).text_color(if daemon_v.is_some() { t.text } else { t.muted }).child(daemon_v.unwrap_or_else(|| "not running".into())))
@@ -1361,6 +1821,20 @@ impl SettingsWindow {
     pub fn show_system(&mut self, cx: &mut Context<Self>) {
         self.view = Sec::System;
         self.load_info(cx);
+        cx.notify();
+    }
+
+    /// Open on Usage (the sidebar's usage block).
+    pub fn show_usage(&mut self, cx: &mut Context<Self>) {
+        self.view = Sec::Usage;
+        self.load_daily(cx);
+        cx.notify();
+    }
+
+    /// Open on Work hours (the sidebar's work hours).
+    pub fn show_hours(&mut self, cx: &mut Context<Self>) {
+        self.view = Sec::Hours;
+        self.load_hours(cx);
         cx.notify();
     }
 
@@ -1393,7 +1867,7 @@ impl SettingsWindow {
             let _ = this.update(cx, |s, cx| {
                 s.sys_busy = false;
                 if let Err(e) = r {
-                    s.sys_note = Some((format!("Couldn't restart the daemon: {e}"), true));
+                    s.sys_note = Some((format!("Couldn't restart the board: {e}"), true));
                 }
                 s.load_info(cx);
                 cx.notify();
@@ -1470,7 +1944,7 @@ impl SettingsWindow {
 }
 
 impl SettingsWindow {
-    fn worktrees_page(&self, t: &Theme) -> impl IntoElement {
+    fn worktrees_page(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let mut list = div().id("worktree-rows").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().gap(px(20.)).px(px(28.)).pt(px(4.)).pb(px(28.));
         let Some(v) = self.slots.as_ref() else {
             return list.child(kit::empty(t, "Asking the board…"));
@@ -1479,22 +1953,126 @@ impl SettingsWindow {
         if pools.is_empty() {
             return list.child(kit::empty(t, "No worktree slots"));
         }
+        let several = pools.len() > 1;
         for p in pools {
-            let mut card = kit::card(t).overflow_hidden().child(line(t, &format!("pool-{}", p.project), true, false, "Pool", &p.settings, None));
-            for r in &p.slots {
+            let section = |what: &str| div().px(px(4.)).child(kit::h3(t, if several { format!("{} · {what}", p.project) } else { what.to_string() }));
+            if let Some(c) = p.pool {
+                list = list.child(div().flex().flex_col().gap(px(8.)).child(section("Settings")).child(self.pool_card(t, &p.project, c, cx)));
+            }
+            let mut card = kit::card(t).overflow_hidden();
+            for (i, r) in p.slots.iter().enumerate() {
                 let pill = match &r.held_by {
                     Some(task) => kit::tone_pill(t, "working", task.clone()).id(SharedString::from(format!("slot-tip-{}", r.key))).when_some(r.tip.clone(), |d, tip| d.tooltip(kit::tip(tip))).into_any_element(),
                     None => kit::tone_pill(t, "neutral", "Free").into_any_element(),
                 };
-                card = card.child(line(t, &format!("slot-{}", r.key), false, false, &r.name, &r.note, None).child(controls().child(pill)));
+                card = card.child(line(t, &format!("slot-{}", r.key), i == 0, false, &r.name, &r.note, None).child(controls().child(pill)));
             }
             if !p.waiting.is_empty() {
                 card = card.child(line(t, &format!("waiting-{}", p.project), false, true, &format!("{} waiting", p.waiting.len()), &p.waiting.join(", "), None));
             }
-            let heading = div().px(px(4.)).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text).child(format!("{} · {}", p.project, p.count));
-            list = list.child(div().flex().flex_col().gap(px(8.)).child(heading).child(card));
+            list = list.child(div().flex().flex_col().gap(px(8.)).child(section("Slots")).child(card));
         }
         list
+    }
+
+    /// A project's pool settings: how many slots, and when an idle one is cleared and removed.
+    fn pool_card(&self, t: &Theme, project: &str, c: PoolLimits, cx: &mut Context<Self>) -> Div {
+        let count = line(t, &format!("pool-count-{project}"), true, false, &format!("Slots for {project}"), "Taskboard keeps at least the first and makes up to the second.", None).child(
+            controls()
+                .child(self.pool_select(t, project, "min_slots", c.min, &min_choices(c), cx))
+                .child(div().text_color(t.muted).child("to"))
+                .child(self.pool_select(t, project, "max_slots", c.max, &max_choices(c), cx)),
+        );
+        let mut card = kit::card(t)
+            .overflow_hidden()
+            .child(count)
+            .child(self.pool_days(t, project, "idle_trim_days", "Clear build output after", &[1, 3, 7, 0], c, cx))
+            .child(self.pool_days(t, project, "idle_remove_days", "Remove an idle slot after", &[1, 7, 30, 0], c, cx));
+        if let Some((_, text, bad)) = self.pool_note.as_ref().filter(|(p, ..)| p == project) {
+            card = card.child(row(t, &format!("pool-note-{project}"), false).bg(if *bad { t.down_soft } else { t.up_soft }).text_color(if *bad { t.down } else { t.up_fg }).text_size(px(12.)).child(text.clone()));
+        }
+        card
+    }
+
+    /// A day timer's row: its choices as a segmented control; the ones the board would refuse are
+    /// dimmed with why.
+    fn pool_days(&self, t: &Theme, project: &str, key: &'static str, label: &str, base: &[i64], c: PoolLimits, cx: &mut Context<Self>) -> Stateful<Div> {
+        let cur = if key == "idle_trim_days" { c.trim } else { c.remove };
+        let choices = day_choices(base, cur);
+        let labels: Vec<String> = choices.iter().map(|n| day_label(*n)).collect();
+        let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+        let on = choices.iter().position(|n| *n == cur).unwrap_or(usize::MAX);
+        let busy = self.pool_busy;
+        let control = kit::seg(t, &format!("pool-{key}-{project}"), &refs, on, |i, item| {
+            let n = choices[i];
+            if let Some(why) = refused(key, n, c) {
+                return kit::disabled(item).tooltip(kit::tip(why));
+            }
+            if busy || i == on {
+                return item;
+            }
+            let project = project.to_string();
+            item.on_click(cx.listener(move |s, _, _, cx| s.post_pool(project.clone(), key, n, cx)))
+        });
+        line(t, &format!("pool-{key}-row-{project}"), false, false, label, "", None).child(controls().child(control))
+    }
+
+    /// A slot count's dropdown: the number and a chevron; its menu lists `choices`.
+    fn pool_select(&self, t: &Theme, project: &str, key: &'static str, cur: i64, choices: &[i64], cx: &mut Context<Self>) -> Stateful<Div> {
+        let anchor = format!("pool-menu-{key}-{project}");
+        let open = self.pool_menu.as_ref().is_some_and(|(p, k)| p == project && *k == key);
+        let (line_c, hover) = (if open { t.text } else { t.border_2 }, t.text);
+        let mut b = div()
+            .id(SharedString::from(format!("pool-{key}-{project}")))
+            .relative()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_between()
+            .gap(px(8.))
+            .w(px(128.))
+            .h(px(32.))
+            .pl(px(12.))
+            .pr(px(8.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(line_c)
+            .bg(t.card)
+            .text_color(t.text)
+            .child(cur.to_string())
+            .child(kit::icon(kit::Icon::Chev, 14., t.muted))
+            .child(kit::anchor(anchor.clone()));
+        if self.pool_busy {
+            return kit::disabled(b);
+        }
+        let p = project.to_string();
+        b = crate::ui::focus::stop(t, b).cursor_pointer().hover(move |d| d.border_color(hover)).on_click(cx.listener(move |s, _, _, cx| {
+            let just_shut = s.pool_menu_shut.as_ref().is_some_and(|(sp, sk, at)| *sp == p && *sk == key && at.elapsed() < Duration::from_millis(300));
+            s.pool_menu = if open || just_shut { None } else { Some((p.clone(), key)) };
+            cx.notify();
+        }));
+        if !open {
+            return b;
+        }
+        let mut menu = kit::menu_box(t, 128.).id(SharedString::from(format!("pool-menu-{key}-{project}"))).max_h(px(280.)).overflow_y_scroll().occlude();
+        for n in choices.iter().copied() {
+            let p = project.to_string();
+            menu = menu.child(kit::menu_item(t, SharedString::from(format!("pool-{key}-{project}-{n}")), n.to_string(), n == cur).on_click(cx.listener(move |s, _, _, cx| {
+                if n == cur {
+                    s.pool_menu = None;
+                    cx.notify();
+                } else {
+                    s.post_pool(p.clone(), key, n, cx);
+                }
+            })));
+        }
+        let p = project.to_string();
+        let menu = menu.on_mouse_down_out(cx.listener(move |s, _, _, cx| {
+            s.pool_menu = None;
+            s.pool_menu_shut = Some((p.clone(), key, Instant::now()));
+            cx.notify();
+        }));
+        b.child(kit::menu_under(&anchor, kit::Align::Left, point(px(0.), px(0.)), menu))
     }
 }
 
@@ -1502,13 +2080,21 @@ impl SettingsWindow {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PoolVm {
     pub project: String,
-    /// "6 slots".
-    pub count: String,
-    /// "Keeps 2 to 10 slots. Build output is cleared after 2 idle days, the slot removed after 7."
-    pub settings: String,
+    /// Its settings; None when the board didn't send them.
+    pub pool: Option<PoolLimits>,
     pub slots: Vec<SlotVm>,
     /// The tasks waiting for a slot of this project.
     pub waiting: Vec<String>,
+}
+
+/// A pool's settings: slots kept and made, and the idle days before a slot's build output is
+/// cleared and before it's removed (0: never).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PoolLimits {
+    pub min: i64,
+    pub max: i64,
+    pub trim: i64,
+    pub remove: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1531,7 +2117,7 @@ pub(crate) fn pools_vm(v: &Value) -> Vec<PoolVm> {
         let i = match out.iter().position(|p| p.project == project) {
             Some(i) => i,
             None => {
-                out.push(PoolVm { project: project.clone(), count: String::new(), settings: pool_settings(&v["pools"][&project]), slots: vec![], waiting: vec![] });
+                out.push(PoolVm { project: project.clone(), pool: pool_limits(&v["pools"][&project]), slots: vec![], waiting: vec![] });
                 out.len() - 1
             }
         };
@@ -1553,18 +2139,53 @@ pub(crate) fn pools_vm(v: &Value) -> Vec<PoolVm> {
             }
         }
     }
-    for p in &mut out {
-        p.count = crate::fmt::plural(p.slots.len() as i64, "slot", "slots");
+    out
+}
+
+fn pool_limits(c: &Value) -> Option<PoolLimits> {
+    let n = |k: &str| c[k].as_i64();
+    Some(PoolLimits { min: n("min_slots")?, max: n("max_slots")?, trim: n("idle_trim_days")?, remove: n("idle_remove_days")? })
+}
+
+/// The slots a pool may keep: none up to what it makes (the board refuses more), at most 12 shown.
+fn min_choices(c: PoolLimits) -> Vec<i64> {
+    let mut out: Vec<i64> = (0..=c.max.min(12)).collect();
+    if !out.contains(&c.min) {
+        out.push(c.min);
     }
     out
 }
 
-/// "Keeps 2 to 10 slots. Build output is cleared after 2 idle days, the slot removed after 7."
-fn pool_settings(c: &Value) -> String {
-    let (Some(min), Some(max), Some(trim), Some(remove)) = (c["min_slots"].as_i64(), c["max_slots"].as_i64(), c["idle_trim_days"].as_i64(), c["idle_remove_days"].as_i64()) else {
-        return String::new();
-    };
-    format!("Keeps {min} to {max} slots. Build output is cleared after {}, the slot removed after {remove}.", crate::fmt::plural(trim, "idle day", "idle days"))
+/// The slots a pool may make: from what it keeps (at least 1) up to 12, or more when it's set higher.
+fn max_choices(c: PoolLimits) -> Vec<i64> {
+    let lo = c.min.max(1);
+    (lo..=c.max.max(12).max(lo)).collect()
+}
+
+/// An idle timer's choices: the usual ones, with a value set elsewhere (`tb project set`) in its
+/// place among them; 0 (never) last.
+fn day_choices(base: &[i64], cur: i64) -> Vec<i64> {
+    let mut days: Vec<i64> = base.iter().copied().filter(|n| *n > 0).collect();
+    if cur > 0 && !days.contains(&cur) {
+        days.push(cur);
+        days.sort();
+    }
+    days.push(0);
+    days
+}
+
+/// "1 day", "3 days", "Never".
+fn day_label(n: i64) -> String {
+    if n == 0 { "Never".into() } else { crate::fmt::plural(n, "day", "days") }
+}
+
+/// Why the board would refuse this timer: build output is cleared before a slot is removed.
+fn refused(key: &str, n: i64, c: PoolLimits) -> Option<String> {
+    match key {
+        "idle_trim_days" if n > 0 && c.remove > 0 && n > c.remove => Some(format!("An idle slot is removed after {}, before this.", day_label(c.remove))),
+        "idle_remove_days" if n > 0 && c.trim > 0 && n < c.trim => Some(format!("Build output is cleared after {} first.", day_label(c.trim))),
+        _ => None,
+    }
 }
 
 /// "512 KB", "840 MB", "2.3 GB".
@@ -1586,12 +2207,12 @@ fn used_at(iso: &str) -> String {
 // ------------------------------------------------------------------ rows
 
 /// A row's shell: padding and the line above every row but the first.
-fn row(t: &Theme, id: &str, first: bool) -> Stateful<Div> {
-    div().id(SharedString::from(id.to_string())).flex().items_center().gap(px(16.)).px(px(16.)).py(px(9.)).min_h(px(46.)).when(!first, |d| d.border_t_1().border_color(t.border))
+pub(crate) fn row(t: &Theme, id: &str, first: bool) -> Stateful<Div> {
+    div().id(SharedString::from(id.to_string())).flex().flex_wrap().items_center().gap_x(px(16.)).gap_y(px(8.)).px(px(16.)).py(px(9.)).min_h(px(46.)).when(!first, |d| d.border_t_1().border_color(t.border))
 }
 
 /// A row with a name (or `title`, bold) and what it means; the caller adds its controls.
-fn line(t: &Theme, id: &str, first: bool, warn: bool, label: &str, note: &str, title: Option<(&str, bool)>) -> Stateful<Div> {
+pub(crate) fn line(t: &Theme, id: &str, first: bool, warn: bool, label: &str, note: &str, title: Option<(&str, bool)>) -> Stateful<Div> {
     let label = title.map_or(label.to_string(), |(s, _)| s.to_string());
     row(t, id, first).when(warn, |d| d.bg(t.warn_soft)).child(
         div()
@@ -1604,8 +2225,13 @@ fn line(t: &Theme, id: &str, first: bool, warn: bool, label: &str, note: &str, t
     )
 }
 
-fn controls() -> Div {
+pub(crate) fn controls() -> Div {
     div().flex().flex_none().items_center().gap(px(8.))
+}
+
+/// Controls holding a text field: they shrink with the window, down to a usable field.
+fn field_box() -> Div {
+    div().flex().flex_1().min_w(px(220.)).justify_end().items_center().gap(px(8.))
 }
 
 /// Whether an account needs the owner: its sign-in stopped working or lacks scopes Taskboard needs.
@@ -1616,7 +2242,7 @@ fn needs_owner(a: &Value) -> bool {
 /// Amber: the scopes Taskboard now needs that this sign-in lacks, and how to give them.
 fn reauth_row(t: &Theme, id: &str, a: &Value, how: &str, button: AnyElement) -> AnyElement {
     let missing: Vec<&str> = a["missing"].as_array().map(|m| m.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
-    line(t, &format!("{id}-reauth"), false, true, "Needs a new sign-in", &format!("Taskboard now needs {}. {how}", missing.join(", ")), None)
+    line(t, &format!("{id}-reauth"), false, true, "Needs a new sign-in", &format!("The board now needs {}. {how}", missing.join(", ")), None)
         .child(div().flex().flex_wrap().gap(px(4.)).max_w(px(200.)).justify_end().children(missing.iter().map(|s| kit::chip(t, s.to_string()))))
         .child(controls().child(button))
         .into_any_element()
@@ -1631,16 +2257,9 @@ fn off_row(t: &Theme, id: &str, a: &Value, note: &str) -> AnyElement {
         .into_any_element()
 }
 
-/// How agents push: only in the board's sessions, only while on a task.
-fn push_row(t: &Theme, id: &str, host: &str) -> AnyElement {
-    row(t, &format!("{id}-git"), false)
-        .child(kit::dot(t.up, 7.))
-        .child(div().flex_1().min_w_0().text_size(px(12.)).text_color(t.muted).child(format!("Agents on a task git push to {host} with this account. Other terminals keep their own git sign-in.")))
-        .into_any_element()
-}
-
+/// Why a sign-in that isn't connected failed (a connected one's refusal is its status row).
 fn error_row(t: &Theme, id: &str, a: &Value) -> Option<AnyElement> {
-    let e = a["error"].as_str()?;
+    let e = a["error"].as_str().filter(|_| a["connected"] != true)?;
     Some(row(t, &format!("{id}-error"), false).bg(t.warn_soft).child(kit::dot(t.warn, 7.)).child(div().flex_1().min_w_0().text_size(px(12.)).text_color(t.warn_fg).child(e.to_string())).into_any_element())
 }
 
@@ -1718,6 +2337,41 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn a_pool_setting_saves_in_place_and_a_refusal_says_why(cx: &mut gpui_kit::TestAppContext) {
+        let (w, rec) = window(cx);
+        let pool = json!({"min_slots": 2, "max_slots": 10, "idle_trim_days": 2, "idle_remove_days": 7, "low_disk_gb": 50});
+        w.update(cx, |s, window, cx| {
+            s.slots = Some(json!({"slots": [{"name": "slot-1", "project": "webapp", "path": "/webapp/slot-1"}], "pools": {"webapp": pool}}));
+            s.view = super::Sec::Worktrees;
+            s.pool_menu = Some(("webapp".into(), "max_slots"));
+            cx.notify();
+            window.refresh();
+        })
+        .unwrap();
+        settle(cx);
+        w.update(cx, |s, _, cx| s.post_pool("webapp".into(), "idle_remove_days", 0, cx)).unwrap();
+        settle(cx);
+        w.update(cx, |s, _, cx| {
+            assert_eq!(s.pool_menu, None, "choosing closes the menu");
+            assert_eq!(s.slots.as_ref().unwrap()["pools"]["webapp"]["idle_remove_days"], 0, "the answer's settings show");
+            s.post_pool("webapp".into(), "min_slots", 40, cx);
+        })
+        .unwrap();
+        settle(cx);
+        w.update(cx, |s, window, cx| {
+            assert_eq!(s.slots.as_ref().unwrap()["pools"]["webapp"]["min_slots"], 2, "refused and kept");
+            assert!(s.pool_note.as_ref().is_some_and(|(p, m, bad)| p == "webapp" && *bad && m.contains("can't be more than max_slots")), "{:?}", s.pool_note);
+            cx.notify();
+            window.refresh();
+        })
+        .unwrap();
+        settle(cx);
+        let posts: Vec<_> = rec.posts().into_iter().filter(|(p, _)| p == "projects/webapp").collect();
+        assert_eq!(posts[0].1, json!({"idle_remove_days": "never"}));
+        assert_eq!(posts[1].1, json!({"min_slots": 40}));
+    }
+
+    #[gpui_kit::test]
     fn system_shows_the_daemon_s_version_beside_the_app_s(cx: &mut gpui_kit::TestAppContext) {
         let (w, _rec) = window(cx);
         w.update(cx, |s, window, cx| {
@@ -1731,11 +2385,49 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn accounts_say_the_board_is_down_instead_of_not_connected(cx: &mut gpui_kit::TestAppContext) {
+        let (w, rec) = window(cx);
+        rec.fail("accounts", 0, "Can’t reach the board.");
+        w.update(cx, |s, window, cx| {
+            // a window opened while the board is down: nothing has loaded yet
+            s.loaded = false;
+            s.accounts.clear();
+            s.view = super::Sec::Accounts;
+            s.load(false, cx);
+            window.refresh();
+        })
+        .unwrap();
+        settle(cx);
+        w.update(cx, |s, window, cx| {
+            assert_eq!(s.error.as_deref(), Some("Can’t reach the board."));
+            let (title, line) = super::accounts_wait(s.loaded, s.error.as_deref()).expect("the rows wait for the board");
+            assert_eq!(title, "The board isn’t answering");
+            assert!(line.starts_with("Can’t reach the board. ") && line.contains("every 30 seconds"), "{line}");
+            assert!(!line.contains("Not connected") && !line.contains("Sign in"), "{line}");
+            cx.notify();
+            window.refresh();
+        })
+        .unwrap();
+        settle(cx);
+        rec.heal();
+        w.update(cx, |s, _, cx| s.load(false, cx)).unwrap();
+        settle(cx);
+        w.update(cx, |s, _, _| {
+            assert!(s.loaded && s.error.is_none());
+            assert_eq!(super::accounts_wait(s.loaded, s.error.as_deref()), None, "the rows show once it answers");
+            assert_eq!(s.accounts.len(), 5);
+        })
+        .unwrap();
+        assert_eq!(super::accounts_wait(false, None), Some(("Asking the board…", String::new())));
+        assert_eq!(super::accounts_wait(true, Some("Can’t reach the board.")), None, "rows already shown stay, with the banner above");
+    }
+
+    #[gpui_kit::test]
     fn connects_with_a_token_and_clears_the_field(cx: &mut gpui_kit::TestAppContext) {
         let (w, rec) = window(cx);
         w.update(cx, |s, _, cx| {
             assert!(s.loaded);
-            assert_eq!(s.accounts.len(), 4);
+            assert_eq!(s.accounts.len(), 5);
             s.bb_email.set_text("sam@acme.com", cx);
             s.bb_token.set_text("ATATT-x", cx);
             s.connect("bitbucket", cx);
@@ -1758,6 +2450,45 @@ mod tests {
             assert_eq!(s.slack_token.text(cx), "bad", "a refused token stays to fix");
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn jira_connects_with_an_email_and_token_and_says_where_the_site_is_set(cx: &mut gpui_kit::TestAppContext) {
+        let (w, rec) = window(cx);
+        w.update(cx, |s, window, cx| {
+            assert!(super::CARDS.contains(&("jira", "JI")));
+            assert_eq!(super::account_line("jira", &s.account("jira")), ("Not connected".into(), false));
+            s.view = super::Sec::Accounts;
+            s.open_form("jira", window, cx);
+            assert!(s.jira_form);
+            s.jira_email.set_text("sam@acme.com", cx);
+            s.jira_token.set_text("ATATT-x", cx);
+            s.connect("jira", cx);
+            window.refresh();
+        })
+        .unwrap();
+        settle(cx);
+        assert_eq!(rec.last("accounts/jira"), Some(json!({"email": "sam@acme.com", "token": "ATATT-x"})));
+        w.update(cx, |s, _, cx| {
+            assert_eq!(s.account("jira")["connected"], false, "the sample board has no [jira] site");
+            assert!(s.notes.get("jira").is_some_and(|(m, bad)| *bad && m.contains("[jira] site")), "{:?}", s.notes.get("jira"));
+            assert_eq!(s.jira_token.text(cx), "ATATT-x", "a refused token stays to fix");
+        })
+        .unwrap();
+    }
+
+    #[::core::prelude::v1::test]
+    fn a_connected_jira_line_shows_its_site_and_qa_comments() {
+        let a = json!({"connected": true, "label": "Jira", "user": "sam@acme.com", "detail": "acme.atlassian.net", "site": "acme.atlassian.net", "qa": true, "checked_at": "2026-11-19T15:05:00"});
+        let (line, refused) = super::account_line("jira", &a);
+        assert!(!refused);
+        assert!(line.starts_with("acme.atlassian.net · QA comments on · checked "), "{line}");
+        assert!(line.ends_with(", works"), "{line}");
+        let off = json!({"connected": true, "label": "Jira", "user": "sam@acme.com", "detail": "acme.atlassian.net", "qa": false});
+        assert_eq!(super::account_line("jira", &off).0, "acme.atlassian.net · QA comments off");
+        let refused = json!({"connected": true, "label": "Jira", "error": "Jira didn't accept that email and token.", "checked_at": "2026-11-19T14:51:00"});
+        let (line, bad) = super::account_line("jira", &refused);
+        assert!(bad && line.starts_with("Jira refused the sign-in at ") && line.ends_with(" · tickets and QA comments wait"), "{line}");
     }
 
     #[gpui_kit::test]
@@ -1855,13 +2586,98 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn disconnect_asks_in_the_row_before_forgetting_the_sign_in(cx: &mut gpui_kit::TestAppContext) {
+        let (w, rec) = window(cx);
+        w.update(cx, |s, window, cx| {
+            assert!(!s.slack_form, "no form until Connect…");
+            s.open_form("slack", window, cx);
+            assert!(s.slack_form);
+            s.slack_token.set_text("xoxb-1", cx);
+            s.connect("slack", cx);
+        })
+        .unwrap();
+        settle(cx);
+        w.update(cx, |s, window, cx| {
+            assert_eq!(s.account("slack")["connected"], true);
+            assert!(!s.slack_form, "the form closes once connected");
+            s.ask_disconnect("slack", cx);
+            window.refresh();
+        })
+        .unwrap();
+        settle(cx);
+        assert!(!rec.posts().iter().any(|(p, _)| p == "accounts/slack/disconnect"), "Disconnect only asks");
+        w.update(cx, |s, _, cx| {
+            assert_eq!(s.confirm, Some("slack"));
+            assert_eq!(s.account("slack")["connected"], true);
+            s.disconnect("slack", cx);
+        })
+        .unwrap();
+        settle(cx);
+        assert!(rec.posts().iter().any(|(p, _)| p == "accounts/slack/disconnect"));
+        w.update(cx, |s, _, _| {
+            assert_eq!(s.confirm, None);
+            assert_eq!(s.account("slack")["connected"], false);
+        })
+        .unwrap();
+    }
+
+    #[::core::prelude::v1::test]
+    fn each_account_says_its_status_in_one_line() {
+        let line = |id, a| super::account_line(id, &a);
+        assert_eq!(line("github", json!({"connected": false})), ("Not connected".into(), false));
+        assert_eq!(line("github", json!({"connected": true, "user": "sam", "checked_at": crate::fmt::now().format("%Y-%m-%dT15:05:00Z").to_string()})), ("Signed in as sam · checked 3:05 PM, works".into(), false));
+        assert_eq!(line("azure", json!({"connected": true, "user": "s@acme.com", "detail": "s@acme.com · dev.azure.com/acme"})), ("Signed in to acme".into(), false));
+        let refused = json!({"connected": true, "label": "GitHub", "user": "sam", "error": "Bad credentials", "checked_at": crate::fmt::now().format("%Y-%m-%dT14:51:00Z").to_string()});
+        assert_eq!(line("github", refused.clone()), ("GitHub refused the sign-in at 2:51 PM · agents can't push".into(), true));
+        assert!(super::needs_owner(&refused), "the sidebar counts it");
+        assert_eq!(line("slack", json!({"connected": true, "label": "Slack", "error": "token_expired"})).0, "Slack refused the sign-in · no Slack messages");
+    }
+
+    #[gpui_kit::test]
+    fn history_retention_shows_the_values_the_board_keeps(cx: &mut gpui_kit::TestAppContext) {
+        let (w, _rec) = window(cx);
+        w.update(cx, |s, _, _| {
+            let h = s.history.clone().expect("GET /history read on open");
+            for key in ["detail_days", "summary_days"] {
+                let (choices, on) = super::retention(&h, key);
+                assert_eq!(choices.len(), 4, "{key}: {h}");
+                assert!(on.is_some(), "{key} shows the board's value as chosen: {h}");
+            }
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_retention_change_asks_the_board_what_it_removes_first(cx: &mut gpui_kit::TestAppContext) {
+        let (w, rec) = window(cx);
+        w.update(cx, |s, _, cx| s.preview_history("summary_days", 0, cx)).unwrap();
+        settle(cx);
+        let posts: Vec<_> = rec.posts().into_iter().filter(|(p, _)| p == "history").collect();
+        assert_eq!(posts[0].1, json!({"summary_days": 0, "preview": true}), "previewed first");
+        assert_eq!(posts.get(1).map(|p| p.1.clone()), Some(json!({"summary_days": 0})), "keeping more removes nothing, so it saves");
+        w.update(cx, |s, _, _| assert_eq!(s.history.as_ref().unwrap()["summary_days"], 0)).unwrap();
+    }
+
+    #[::core::prelude::v1::test]
+    fn the_removal_warning_counts_events_and_days() {
+        assert_eq!(super::removal_line(&json!({"events_total": 0, "days": 0, "day_rows": 0})), None);
+        assert_eq!(
+            super::removal_line(&json!({"events_total": 9, "days": 2, "day_rows": 3})).as_deref(),
+            Some("The next cleanup, after 3 AM, removes 9 events and the summaries of 2 days. They can't be brought back.")
+        );
+        assert_eq!(super::removal_line(&json!({"events_total": 1, "days": 0, "day_rows": 0})).as_deref(), Some("The next cleanup, after 3 AM, removes 1 event. They can't be brought back."));
+    }
+
+    #[gpui_kit::test]
     fn uses_gh_sign_in_without_changing_it(cx: &mut gpui_kit::TestAppContext) {
         let (w, rec) = window(cx);
+        w.update(cx, |s, _, _| s.gh_form = true).unwrap();
         w.update(cx, |s, _, cx| s.import_gh(cx)).unwrap();
         settle(cx);
         assert!(rec.posts().iter().any(|(p, _)| p == "accounts/github/import"));
         w.update(cx, |s, _, _| {
             assert_eq!(s.account("github")["connected"], true);
+            assert!(!s.gh_form, "the form closes once signed in");
             assert!(s.notes.get("github").is_some_and(|(n, bad)| !bad && n.starts_with("Using gh's sign-in")));
         })
         .unwrap();
@@ -1894,9 +2710,9 @@ mod worktree_tests {
     #[test]
     fn slots_group_by_project_with_their_pool_and_waiting_tasks() {
         let pools = super::pools_vm(&pool());
-        assert_eq!(pools.iter().map(|p| (p.project.as_str(), p.count.as_str())).collect::<Vec<_>>(), [("board", "2 slots"), ("lens", "1 slot")]);
+        assert_eq!(pools.iter().map(|p| (p.project.as_str(), p.slots.len())).collect::<Vec<_>>(), [("board", 2), ("lens", 1)]);
         let board = &pools[0];
-        assert_eq!(board.settings, "Keeps 2 to 10 slots. Build output is cleared after 1 idle day, the slot removed after 7.");
+        assert_eq!(board.pool, Some(super::PoolLimits { min: 2, max: 10, trim: 1, remove: 7 }));
         assert_eq!(board.waiting, ["T13", "T14"], "each waiting task once");
         assert_eq!(board.slots[0].note, "2.3 GB · last used 2:30 PM");
         assert_eq!((board.slots[0].held_by.as_deref(), board.slots[0].tip.as_deref()), (Some("T12"), Some("Slot pool view")));
@@ -1905,6 +2721,25 @@ mod worktree_tests {
         assert_eq!((lens.slots[0].name.as_str(), lens.slots[0].note.as_str()), ("slot-2", ""), "not measured or used yet");
         assert!(lens.waiting.is_empty());
         assert!(super::pools_vm(&json!({"slots": []})).is_empty());
+    }
+
+    #[test]
+    fn pool_choices_offer_only_what_the_board_takes_and_keep_a_value_set_elsewhere() {
+        use super::{PoolLimits, day_choices, day_label, max_choices, min_choices, refused};
+        let c = PoolLimits { min: 1, max: 4, trim: 3, remove: 7 };
+        assert_eq!(min_choices(c), [0, 1, 2, 3, 4], "never more than it makes");
+        assert_eq!(max_choices(c), (1..=12).collect::<Vec<_>>());
+        assert_eq!(max_choices(PoolLimits { min: 0, max: 20, ..c }), (1..=20).collect::<Vec<_>>(), "a bigger pool set with tb shows");
+        assert_eq!(min_choices(PoolLimits { min: 30, max: 40, ..c }).last(), Some(&30));
+        let labels = |base: &[i64], cur| day_choices(base, cur).into_iter().map(day_label).collect::<Vec<_>>();
+        assert_eq!(labels(&[1, 3, 7, 0], 3), ["1 day", "3 days", "7 days", "Never"]);
+        assert_eq!(labels(&[1, 7, 30, 0], 14), ["1 day", "7 days", "14 days", "30 days", "Never"]);
+        assert_eq!(labels(&[1, 7, 30, 0], 0), ["1 day", "7 days", "30 days", "Never"]);
+        assert_eq!(refused("idle_remove_days", 1, c).as_deref(), Some("Build output is cleared after 3 days first."));
+        assert_eq!(refused("idle_trim_days", 30, c).as_deref(), Some("An idle slot is removed after 7 days, before this."));
+        assert_eq!(refused("idle_remove_days", 0, c), None, "never is always fine");
+        assert_eq!(refused("idle_trim_days", 30, PoolLimits { remove: 0, ..c }), None, "nothing to come before");
+        assert_eq!(refused("idle_remove_days", 1, PoolLimits { trim: 0, ..c }), None);
     }
 }
 

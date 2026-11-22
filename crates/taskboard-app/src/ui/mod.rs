@@ -1,20 +1,25 @@
 //! The pages, panels and dialogs of the main window. See `app.rs` for how they fit together.
 pub mod backlog;
+pub mod backlog_closed;
 pub mod board;
 pub mod days;
 pub mod goal;
 pub mod goals;
 pub mod goals_page;
+pub mod health;
 pub mod home;
 pub mod hours;
 pub mod idea;
 pub mod ideas;
 pub mod issue_panel;
+pub mod focus;
 pub mod kit;
 pub mod md;
 pub mod paged;
 pub mod modals;
+pub mod motion;
 pub mod projects;
+pub mod recap;
 pub mod prwatch;
 pub mod releases;
 pub mod review;
@@ -22,6 +27,7 @@ pub mod search;
 pub mod select;
 pub mod sidebar;
 pub mod status;
+pub mod stop;
 pub mod task_panel;
 pub mod text_input;
 

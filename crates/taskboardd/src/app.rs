@@ -16,6 +16,9 @@ pub type Deferred = Box<dyn FnOnce(&App) + Send>;
 
 #[derive(Default)]
 pub struct Shared {
+    /// Backlog acts the app's toast can still take back, oldest first, and the last number given (`undo.rs`).
+    pub undo: Vec<(i64, Instant, Value)>,
+    pub undo_next: i64,
     pub midna_seen_at: Option<String>,
     pub midna_down: bool,
     pub midna_opened: Option<Instant>,
@@ -45,6 +48,8 @@ pub struct Shared {
     pub midna_panels: VecDeque<i64>,
     /// The panel last sent for each terminal, so one that hasn't changed isn't sent again.
     pub midna_panels_sent: HashMap<String, Value>,
+    /// Terminals Midna said it doesn't have (closed and gone from its Summary): no panel goes to them again.
+    pub midna_panels_gone: HashSet<String>,
     pub recent_reports: VecDeque<String>,
     pub recent_set: HashSet<String>,
     pub prs_checked_at: Option<String>,
@@ -68,6 +73,8 @@ pub struct Shared {
     pub tidying: bool,
     /// The ideas Claude is digging into now (`dig.rs`).
     pub digging: HashSet<i64>,
+    /// The dig rounds stopped from the app while Claude was still reading (`dig::stop`).
+    pub dig_stop: HashSet<i64>,
     /// The ideas Claude is planning into goals now (`idea_plan.rs`).
     pub idea_planning: HashSet<i64>,
     /// The goals whose plans Claude is reviewing now, and those changed since (`plan_review.rs`).
@@ -84,6 +91,8 @@ pub struct Shared {
     pub pr_hosts: std::collections::HashMap<String, Arc<dyn crate::prhost::PrHost>>,
     /// Default-branch CI readers used in place of the real ones (`breaks::install`, tests).
     pub branch_ci: std::collections::HashMap<String, Arc<dyn crate::breaks::BranchCi>>,
+    /// The Azure DevOps reader used in place of the real one (`azure_checks::install`, tests).
+    pub azure_http: Option<Arc<dyn crate::prhost::bitbucket::Http>>,
     /// Alerts' notification responses Midna reported (alert id, `notify.response`), for the next tick.
     pub notify_inbox: Arc<Mutex<Vec<(String, Value)>>>,
     /// Alerts with a thread waiting on their notification's response: alert id -> the `notified_at` of its

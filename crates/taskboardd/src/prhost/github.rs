@@ -20,9 +20,25 @@ pub trait Gh: Send + Sync {
 pub struct GhCli {
     pub bin: PathBuf,
     pub env: Vec<(String, String)>,
+    /// The account its calls are limited under (`prhost::account_key`).
+    pub account: String,
 }
 
 impl GhCli {
+    /// `gh` signed in as the board's GitHub account. A sandboxed board (the tests) is an account of its
+    /// own: the limits are process-wide, and the tests sharing the process mustn't share write slots,
+    /// collapsed writes or kept reads.
+    pub fn for_board(app: &crate::app::App, bin: PathBuf) -> GhCli {
+        let env = crate::accounts::gh_env(&app.cfg);
+        let data = app.cfg.data.to_string_lossy();
+        let mut parts: Vec<&str> = env.iter().map(|(_, v)| v.as_str()).collect();
+        if app.cfg.accounts_sandbox {
+            parts.push(&data);
+        }
+        let account = super::account_key("github", &parts);
+        GhCli { bin, env, account }
+    }
+
     fn gh(&self, args: &[String]) -> HostResult<crate::proc::Output> {
         crate::proc::run_with(&self.bin, args, None, 30.0, &self.env, None).map_err(|_| "gh didn't answer in 30 seconds".to_string())
     }
@@ -38,7 +54,7 @@ impl GhCli {
 
 impl Gh for GhCli {
     fn limit_key(&self) -> Option<String> {
-        Some(super::account_key("github", &self.env.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>()))
+        Some(self.account.clone())
     }
     fn run(&self, args: &[String]) -> HostResult<String> {
         let key = self.limit_key().unwrap_or_default();
@@ -88,7 +104,7 @@ pub struct GithubHost {
     account: String,
 }
 
-const VIEW_FIELDS: &str = "number,state,title,author,headRefOid,headRefName,baseRefName,baseRefOid,reviewDecision,statusCheckRollup,comments,reviews,latestReviews,reviewRequests,mergeable";
+const VIEW_FIELDS: &str = "number,state,title,author,headRefOid,headRefName,baseRefName,baseRefOid,reviewDecision,statusCheckRollup,comments,reviews,latestReviews,reviewRequests,mergeable,createdAt";
 
 const THREADS_QUERY: &str = "query($owner:String!,$name:String!,$num:Int!){repository(owner:$owner,name:$name){pullRequest(number:$num){reviewThreads(first:100){nodes{id isResolved isOutdated path line first:comments(first:1){nodes{id author{login} body createdAt url}} last:comments(last:1){nodes{id author{login} body createdAt url}} replies:comments(first:30){nodes{id author{login} body createdAt}}}}}}}";
 const RECENT_COMMENTS_QUERY: &str = "query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){pullRequests(first:$n,orderBy:{field:UPDATED_AT,direction:DESC}){nodes{number comments(last:50){nodes{id author{login} body createdAt}} reviews(last:50){nodes{id author{login} body submittedAt comments(first:30){nodes{id author{login} body createdAt}}}}}}}}";
@@ -281,6 +297,9 @@ impl PrHost for GithubHost {
         let mut args = s(&["pr", "merge", &pr.num.to_string(), "-R", &pr.repo, flag]);
         if opts.close_source_branch {
             args.push("--delete-branch".into());
+        }
+        if let Some(head) = opts.head.as_deref().filter(|h| !h.is_empty()) {
+            args.extend(s(&["--match-head-commit", head]));
         }
         self.gh(args).map(|_| ())
     }
@@ -560,12 +579,20 @@ pub fn summarize(d: &Value, threads: &Value) -> Record {
             })
         });
         let mine = mine.flatten();
+        // When they left that comment-only review: this review's time, else their latest among every review.
+        let commented = (state == "commented").then(|| {
+            r["submittedAt"].as_str().map(|s| s.to_string()).or_else(|| {
+                reviews.iter().filter(|x| x["state"] == "COMMENTED" && login(x) == user).filter_map(|x| x["submittedAt"].as_str()).max().map(|s| s.to_string())
+            })
+        });
+        let commented = commented.flatten();
         match reviewers.iter_mut().find(|x| x.user == user) {
             Some(x) => {
                 x.state = state.into();
                 x.changes_at = mine;
+                x.commented_at = commented;
             }
-            None => reviewers.push(Reviewer { name: user.clone(), user, state: state.into(), requested: false, changes_at: mine, ..Default::default() }),
+            None => reviewers.push(Reviewer { name: user.clone(), user, state: state.into(), requested: false, changes_at: mine, commented_at: commented, ..Default::default() }),
         }
     }
     for u in &requested {
@@ -658,6 +685,7 @@ pub fn summarize(d: &Value, threads: &Value) -> Record {
         tasks_error: None,
         viewer: String::new(),
         mergeable: d["mergeable"].clone(),
+        created_at: d["createdAt"].as_str().unwrap_or("").to_string(),
     }
 }
 
@@ -750,7 +778,7 @@ pub(crate) mod tests {
     fn view() -> Value {
         json!({
             "state": "OPEN", "title": "Add x", "author": {"login": "me"}, "headRefOid": "abc", "headRefName": "feat",
-            "baseRefName": "main", "baseRefOid": "b1", "reviewDecision": "CHANGES_REQUESTED",
+            "baseRefName": "main", "baseRefOid": "b1", "reviewDecision": "CHANGES_REQUESTED", "createdAt": "2026-10-01T08:00:00Z",
             "statusCheckRollup": [
                 {"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"},
                 {"name": "test", "status": "COMPLETED", "conclusion": "FAILURE", "detailsUrl": "https://github.com/acme/webapp/actions/runs/77/job/1", "startedAt": "2026-10-01T09:00:00Z", "completedAt": "2026-10-01T09:05:00Z"},
@@ -785,6 +813,7 @@ pub(crate) mod tests {
         assert_eq!(v["comments"], 2);
         assert_eq!(r.approvals, 1);
         assert_eq!(r.base_head, "b1");
+        assert_eq!(r.created_at, "2026-10-01T08:00:00Z");
         assert_eq!(r.checks[1].url.as_deref(), Some("https://github.com/acme/webapp/actions/runs/77/job/1"));
         let at: Vec<Option<&str>> = r.checks.iter().map(|c| c.at.as_deref()).collect();
         assert_eq!(at, vec![None, Some("2026-10-01T09:05:00Z"), Some("2026-10-01T09:01:00Z")], "finished, else started; gh's year-1 completedAt is no time");
@@ -800,6 +829,19 @@ pub(crate) mod tests {
         assert_eq!(r.threads.iter().find(|t| t.id == "IC_2").unwrap().text, "Why?");
         let t1 = r.threads.iter().find(|t| t.id == "PRRT_1").unwrap();
         assert_eq!(t1.replies, vec![Reply { author: "me".into(), author_name: "me".into(), text: "Done in a.rs".into(), body: "Done\nin a.rs".into(), at: "t2".into() }]);
+    }
+
+    #[test]
+    fn a_comment_only_review_keeps_when_it_was_made() {
+        let mut v = view();
+        v["reviews"] = json!([{"id": "PRR_1", "author": {"login": "rev"}, "state": "COMMENTED", "body": "a note", "submittedAt": "2026-10-01T10:00:00Z"},
+                              {"id": "PRR_2", "author": {"login": "rev"}, "state": "COMMENTED", "body": "and another", "submittedAt": "2026-10-02T10:00:00Z"}]);
+        v["latestReviews"] = json!([{"author": {"login": "rev"}, "state": "COMMENTED"}, {"author": {"login": "ok"}, "state": "APPROVED", "submittedAt": "2026-10-03T10:00:00Z"}]);
+        let r = summarize(&v, &threads());
+        let at: Vec<(&str, Option<&str>)> = r.reviewers.iter().map(|x| (x.state.as_str(), x.commented_at.as_deref())).collect();
+        assert_eq!(at[..2], [("commented", Some("2026-10-02T10:00:00Z")), ("approved", None)], "their latest comment-only review; none for an approval");
+        v["latestReviews"][0]["submittedAt"] = json!("2026-10-04T10:00:00Z");
+        assert_eq!(summarize(&v, &threads()).reviewers[0].commented_at.as_deref(), Some("2026-10-04T10:00:00Z"), "the latest review's own time first");
     }
 
     #[test]
@@ -831,7 +873,7 @@ pub(crate) mod tests {
         let c = rec.threads.iter().find(|t| t.id == "IC_2").unwrap();
         assert!(!h.resolve(&pr(), c).unwrap(), "a plain comment can't be resolved on GitHub");
         h.reply(&pr(), c, "Because.").unwrap();
-        h.merge(&pr(), &MergeOpts { strategy: None, close_source_branch: true }).unwrap();
+        h.merge(&pr(), &MergeOpts { strategy: None, close_source_branch: true, head: Some("abc".into()) }).unwrap();
         h.re_request_reviews(&pr(), &["rev".into()]).unwrap();
         assert_eq!(h.cancel_builds(&pr(), "abc").unwrap(), Cancelled::Stopped(vec!["CI #12".into()]));
         assert_eq!(
@@ -844,6 +886,7 @@ pub(crate) mod tests {
         let calls = calls.lock().clone();
         let has = |want: &[&str]| calls.iter().any(|c| want.iter().all(|w| c.iter().any(|a| a.contains(w))));
         assert!(has(&["pr", "merge", "--squash", "--delete-branch"]), "merges with the repo's default and closes the branch");
+        assert!(calls.iter().any(|c| c.windows(2).any(|w| w == ["--match-head-commit", "abc"])), "only the head it judged");
         assert!(has(&["comment", "> @rev: Why?\n\nBecause."]));
         assert!(has(&["POST", "repos/acme/webapp/pulls/9/requested_reviewers", "reviewers[]=rev"]));
         assert!(has(&["run", "cancel", "5"]));
@@ -869,7 +912,7 @@ pub(crate) mod tests {
         h.retarget(&pr(), "develop").unwrap();
         h.set_description(&pr(), "## Summary").unwrap();
         h.request_reviews(&pr(), &["rev".into()]).unwrap();
-        h.merge(&pr(), &MergeOpts { strategy: Some("squash".into()), close_source_branch: false }).unwrap();
+        h.merge(&pr(), &MergeOpts { strategy: Some("squash".into()), close_source_branch: false, head: None }).unwrap();
         let marks = marks.lock().clone();
         let mark = |want: &str| marks.iter().find(|(c, _)| c.contains(want)).map(|(_, k)| k.clone()).unwrap_or_else(|| panic!("no call with {want}: {marks:?}"));
         assert_eq!(mark("--base develop"), Some("acme/webapp#9 base".into()));

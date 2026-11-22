@@ -72,13 +72,16 @@ screen = true
 model = "claude-haiku-5-5"
 budget_usd = "0.30"
 timeout_secs = 75
+no_task = true                       # also screen tb question from a terminal with no task; false: straight to the owner
 # Rule files the screener reads: a file, a folder (its MEMORY.md, then every other .md in it, so a
 # new memory note counts at once) or a glob (`*`, `?`, `[…]`, `**` for any depth of folders).
 rules = []                           # example: ["~/.claude/CLAUDE.md", "~/.claude/projects/-Users-alex-code-web/memory", "~/.claude/projects/*/memory/*.md"]
 
 # Check-ins on long turns: once a task's terminal has been working `after_mins` (and every
 # `every_mins` after), a headless `claude -p` reads its last lines and the processes under it and says
-# whether it's still getting somewhere. A stuck verdict shows amber on the task; nobody is notified.
+# whether the time fits the work, the turn is far slower than its work warrants (and what it waits on),
+# or it's stuck. A slow or stuck verdict shows amber on the task and raises an alert; with `nudge` it
+# also leaves the agent a message for its next prompt or stop, once per turn.
 [checkin]
 on = true
 after_mins = 20
@@ -87,6 +90,7 @@ model = "claude-haiku-5-5"
 budget_usd = "0.10"
 timeout_secs = 90
 lines = 60
+nudge = true
 
 # Started work with no update in `after_hours`: a task that's working, back in the queue after it
 # started, or done with its PR still open reaches Needs you as "Gone quiet". It comes down when the task
@@ -104,6 +108,17 @@ cadence = "weekly"
 day = "friday"
 at = "5:00 PM"
 suggest = true
+
+# Weekly and monthly recaps of what shipped, the highlights and where the time went, under Days in the
+# app. The week's is made on weekly_day at `at` for the Monday to Sunday before; the month's on
+# monthly_day (1 to 28) at `at` for the calendar month before. Each is made once, however late the
+# board wakes, and skipped when no task finished in it. Once its page is written (or its writing
+# failed), a notification opens it; there's no Needs you item.
+[recap]
+on = true
+weekly_day = "monday"
+monthly_day = 1
+at = "9:00 AM"
 
 # Planning from the backlog (the app's Backlog page). A headless `claude -p` sorts new issues (area,
 # impact, priority, and which are the same kind of work) and splits the issues picked for a goal into
@@ -129,10 +144,12 @@ wake = true                          # bring a done task back when its PR has fa
 gh = "gh"
 no_checks_after_mins = 15.0
 comment_settle_secs = 90.0           # read a PR once more this long after a stream review or comment hint (0: never)
+merge_retry_secs = [3.0, 8.0, 15.0]  # tb pr merge tries again after these waits when the host refuses for a passing reason (base moved, 502); [] = never
 pace_polls = true                    # read a PR every 3 minutes while it moves, then 10, 30, 60 the longer it stays the same; off hours, hourly unless it can merge or a reviewer's bot is due (false: every PR on every poll)
 bitbucket_api = "https://api.bitbucket.org/2.0"
 azure_token_env = "AZURE_DEVOPS_EXT_PAT"  # env var with an Azure DevOps token, to read failed steps and tests, when none is stored with `tb ci-token set`
 # owner_review = true                # a green PR waits for your review before it moves on (false: the board marks it reviewed for you; tb project owner-review sets it on the board)
+# review = true                      # the Review step (false: PRs go to merge without reviewers or approvals, when their project doesn't say; tb project review sets it on the board)
 # rebase = "conflicts"               # when tb pr status asks for a rebase onto the base: "conflicts" (only when the PR conflicts with it), "moved" (whenever the base moved since the push) or "never"
 approvals = 2                        # approvals a PR needs before it's ready to merge, when its project doesn't say (0: the host's decision, or any approval)
 
@@ -142,16 +159,26 @@ approvals = 2                        # approvals a PR needs before it's ready to
 # approvals = 2                       # approvals needed before it's ready to merge (unset: pr.approvals; 0: the host's decision)
 # expected = ["build", "test"]        # checks that must post on every push ([] = don't wait; unset = the no_checks_after_mins grace)
 # expected_wait_mins = 90             # how long to wait for them (for expected_cmd's checks too)
+# required = ["Lint", "Unit tests"]   # the checks, or stages inside a check's build, that must pass to merge; another
+#                                     # failed one doesn't hold an approved PR (unset = every failed check holds;
+#                                     # tb project set --required-check)
 # expected_cmd = "~/bin/push-checks"  # says per push which checks it starts, for pipelines with path filters: run with
 #                                     # /bin/sh -c once per new head with TB_PR_URL, TB_PR_REPO, TB_PR_NUM, TB_HEAD,
 #                                     # TB_BASE, TB_BRANCH and TB_WORKTREE (when there is one). It prints a JSON list
 #                                     # of check names, which takes the place of `expected` for that push ([] = none);
 #                                     # null, nothing or a non-zero exit = can't tell (as if `expected` were unset)
-# failures_cmd = "~/bin/ci-failures"  # prints a failed check's steps and tests for CI the board can't read (see docs/API.md)
+# azure_project = "org/project"       # Azure DevOps project its Azure Pipelines checks build in (or a dev.azure.com link)
+# azure_pipelines = { mobile = 16 }   # checks that are Azure builds, with their pipeline's definition id. The board asks
+#                                     # Azure (the CI token) for a check the host hasn't shown on the PR's head: a queued
+#                                     # or running build holds the merge until it finishes, past expected_wait_mins; a
+#                                     # finished one counts as passed or failed. No build in Azure: the wait runs out as before
+# azure_stacked_wait_mins = 5         # a PR into a branch other than the default whose checks Azure has no build for
+#                                     # waits only this long (unset: expected_wait_mins)
+# failures_cmd = "~/bin/ci-failures"  # prints a failed check's steps and tests (and stages) for CI the board can't read (see docs/API.md)
 # merge_strategy = "squash"           # how tb pr merge merges (unset: the repository's default)
 # ask_stage = true                    # the ask stage for this project (unset: [reviewers] ask_stage; tb project set --ask-stage)
 # swap = true                         # swap slow reviewers on this project (unset: [reviewers] swap; tb project set --swap)
-# review = false                      # no Review step: its PRs go to merge without reviewers (unset: on; tb project set --review)
+# review = false                      # no Review step: its PRs go to merge without reviewers (unset: pr.review; tb project set --review)
 # agents_merge = true                 # agents merge its approved, green PRs (unset: pr.agents_merge; tb project set --agents-merge)
 # rebase = "moved"                   # when to rebase its PRs onto their base (unset: pr.rebase)
 # owner_review = false                # its green PRs don't wait for your review (unset: pr.owner_review; tb project set --owner-review)
@@ -281,6 +308,7 @@ refuse_message = "The board doesn't take {ext} files as attachments: publish it 
 background = ["jira_desk", "slots", "reopen", "pr:rebase", "pr:steps", "pr:merge", "pr:follow", "pr:note"]
 project_max = 5                      # a queued task opens its terminal while fewer of its project's terminals are busy (tb project set --max-terminals)
 global_max = 8                       # a task opens its terminal while fewer task terminals run across every project (tb terminals --max)
+deny = ["mcp__midna"]                # tools every board terminal starts without (--disallowedTools): mcp__<server> drops an MCP server, Agent(<type>) a subagent; [] keeps all
 
 # The model each task's terminal starts with (`--model`, unless its flags name one). A task picks
 # small or large at planning (tb task new --model small), or names a model outright.
@@ -318,6 +346,7 @@ max_slots = 10                       # slots the pool grows to before a task wai
 idle_trim_days = 2                   # days idle before a slot's build output is cleared
 idle_remove_days = 7                 # days idle before a slot is removed (never below min_slots)
 low_disk_gb = 50                     # free disk (GB) below which idle slots are cleared sooner
+stale_build_days = 3                 # nightly: build units in any slot or main checkout unused this many days are removed (0 never)
 
 # The comment guard: agents may not add code comments. A PreToolUse hook refuses an Edit, Write,
 # MultiEdit or NotebookEdit that adds one, and the board refuses the PR, `tb pr wait` and `tb submit`
@@ -426,6 +455,14 @@ goal_pool_only = true                # a goal with devices of its own (tb goal d
 tool = ""                            # its name, as the app says it ("Create in Flagsmith"); empty = "the flag tool"
 create_url = ""                      # example: "https://flags.example.com/new?key={name}&project={project}"
 local_hint = ""                      # how to turn a local bit on while testing, for the handoff; example: "a BitOverride in DebugSettings"
+
+# Starts from a terminal (`tb start T4`, `tb start G2`). With `ask` an agent starts a task or runs a goal
+# only on your word typed in its terminal. `own_project` lets it start work in its own terminal's project
+# by itself (work in other projects still needs your word); `free` lets it start any work. A project can
+# set its own mode under [agent_starts.projects]; a goal runs only when every project it holds allows it.
+[agent_starts]
+mode = "ask"
+# projects = { webapp = "free", client-work = "ask" }   # example
 
 # Releases (`tb release cut`): each one holds the tasks done since the one before. Off unless a
 # project turns them on (`tb project set <name> --releases on`); `on` here turns them on for every

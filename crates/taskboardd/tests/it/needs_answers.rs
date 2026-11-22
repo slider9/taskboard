@@ -374,6 +374,38 @@ fn finish_the_goal_without_it_moves_the_miss_to_the_backlog_and_the_goal_finishe
 }
 
 #[test]
+fn finishing_without_a_miss_or_closing_it_can_be_undone_and_the_goal_waits_again() {
+    let b = new_board();
+    b.session("s1");
+    let g = b.goal("Login", json!({}));
+    let t = b.task("Form", json!({"goal_id": g}));
+    b.from_app(&format!("goals/G{g}/run"), json!({}));
+    b.set(t, vec![("status", json!("working")), ("session_id", json!("s1"))]);
+    let found = b.report("tb.found", "s1", json!({"title": "Sign-in fails on Android", "kind": "gap", "misses_goal": true}));
+    let issue = found["issue"].as_str().unwrap().to_string();
+    let key = format!("miss:{}", id_of(&issue));
+    let alert_up = |b: &Board| b.home()["needs"].as_array().unwrap().iter().any(|i| i["key"] == key);
+    b.set(t, vec![("status", json!("done"))]);
+
+    let v = b.post(&format!("backlog/{issue}/without-goal"), json!({})).unwrap();
+    let undo = v["undo"].as_str().expect("an undo path").to_string();
+    assert!(board::goal_finished(&b.app, g).unwrap());
+    let back = b.post(&undo, json!({})).unwrap();
+    assert_eq!((&back["issue"]["misses_goal"], &back["issue"]["state"]), (&json!(true), &json!("open")), "{back}");
+    assert!(!board::goal_finished(&b.app, g).unwrap(), "the goal waits for the miss again");
+    assert!(alert_up(&b), "its alert is back");
+    assert_eq!(b.post(&undo, json!({})).unwrap_err().0, 410, "an undo is used once");
+
+    // Won't do on the miss, undone: open again, holding the goal, alert back.
+    let v = b.post(&format!("backlog/{issue}/drop"), json!({})).unwrap();
+    assert!(board::goal_finished(&b.app, g).unwrap());
+    assert!(!alert_up(&b));
+    b.post(v["undo"].as_str().unwrap(), json!({})).unwrap();
+    assert!(!board::goal_finished(&b.app, g).unwrap());
+    assert!(alert_up(&b));
+}
+
+#[test]
 fn a_goal_says_when_its_set_aside() {
     let b = new_board();
     let g = b.goal("Login", json!({}));
@@ -449,6 +481,36 @@ fn an_alert_can_be_talked_over_in_a_terminal() {
 }
 
 #[test]
+fn the_needs_you_list_can_be_talked_over_in_a_terminal() {
+    let b = new_board();
+    let g = b.goal("Release", json!({"project": "webapp"}));
+    dispatch::add_alert(&b.app, "Release 11.05.26 was dropped", None, Some(g), None, None).unwrap();
+    let t = b.task("Form", json!({"project": "api"}));
+    b.set(t, vec![("status", json!("needs")), ("needs_reason", json!("question")), ("question", json!("Which form?"))]);
+
+    b.app.shared.lock().midna_seen_at = None;
+    assert_eq!(b.post("home/talk", json!({})).unwrap_err().0, 409);
+    b.app.shared.lock().midna_seen_at = Some(taskboardd::util::now_iso());
+
+    let args = |out: Value| -> (String, Value) {
+        let job: i64 = out["job"].as_str().unwrap()[1..].parse().unwrap();
+        let j = b.app.db.q1("SELECT purpose, args FROM jobs WHERE id = ?", p![job]).unwrap().unwrap();
+        (j.st("purpose"), serde_json::from_str(&j.st("args")).unwrap())
+    };
+    let (purpose, all) = args(b.post("home/talk", json!({})).unwrap());
+    assert_eq!(purpose, "needs_talk");
+    let c = all["context"].as_str().unwrap();
+    assert!(c.contains("Release 11.05.26 was dropped") && c.contains(&format!("T{t}: Form — Which form?")), "{c}");
+    assert_eq!(all["cwd"], json!(dirs::home_dir().unwrap()), "every project's list talks in the home folder");
+
+    let (_, api) = args(b.post("home/talk", json!({"project": "api"})).unwrap());
+    assert_eq!(api["cwd"], json!(dirs::home_dir().unwrap()), "api has no checkout here");
+    let c = api["context"].as_str().unwrap();
+    assert!(c.contains("Which form?") && !c.contains("Release 11.05.26 was dropped"), "only the project's: {c}");
+    assert_eq!(dispatch::alerts(&b.app).len(), 1, "talking it over settles nothing");
+}
+
+#[test]
 fn a_wave_that_stops_holds_the_next_once_nothing_in_it_is_left_to_start() {
     let b = new_board();
     let g = b.goal("Login", json!({}));
@@ -459,4 +521,22 @@ fn a_wave_that_stops_holds_the_next_once_nothing_in_it_is_left_to_start() {
     assert_eq!(b.item("needs", &format!("T{one}")).unwrap()["holds"]["tasks"], json!([]), "its wave mate could still start");
     b.set(also, vec![("status", json!("done"))]);
     assert_eq!(b.item("needs", &format!("T{one}")).unwrap()["holds"], json!({"tasks": [format!("T{two}")], "goal": format!("G{g}")}));
+}
+
+#[test]
+fn undoing_dont_wait_holds_what_waits_again() {
+    let b = new_board();
+    let (two, h) = b.parked();
+    let t = format!("T{}", id_of(&h));
+    let q: Query = [(FROM.to_string(), "app".to_string())].into_iter().collect();
+    let wait = |q: &Query| api::dispatch(&b.app, "POST", &format!("tasks/{h}/owner-wait"), q, &json!({})).map_err(|e| e.status);
+    assert_eq!(wait(&q).unwrap_err(), 409, "nothing to undo before Don't wait for me");
+
+    b.answer(&h, json!({"answer": "dont_wait"})).unwrap();
+    assert_eq!(wait(&Query::new()).unwrap_err(), 403, "only the app undoes it");
+    let card = wait(&q).unwrap();
+    assert_eq!((&card["status"], &card["owner_answer"]), (&json!("needs"), &Value::Null));
+    assert!(runner::start_queued(&b.app).unwrap().is_empty(), "T{two} waits for it again");
+    assert_eq!(b.item("needs", &t).unwrap()["holds"]["tasks"], json!([format!("T{two}")]));
+    assert_eq!(wait(&q).unwrap_err(), 409, "once");
 }

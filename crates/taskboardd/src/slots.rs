@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::app::App;
+use crate::config::MAX_PARALLEL;
 use crate::util::*;
 use crate::worktrees::{git, last_line, Git, GIT_SECS};
 use crate::{board, p};
@@ -48,17 +49,19 @@ pub struct WorktreesConfig {
     pub min_slots: i64,
     /// The most slots a repo's pool grows to; past that a task waits for one to free up.
     pub max_slots: i64,
-    /// Days a slot sits idle before its build output is cleared.
+    /// Days a slot sits idle before its build output is cleared; 0 never clears it.
     pub idle_trim_days: i64,
-    /// Days a slot sits idle before it's removed (never below min_slots).
+    /// Days a slot sits idle before it's removed (never below min_slots); 0 never removes it.
     pub idle_remove_days: i64,
     /// Free disk in GB below which idle slots are cleared sooner.
     pub low_disk_gb: i64,
+    /// Days a build unit in any slot or main checkout goes unused before the nightly sweep removes it; 0 never does.
+    pub stale_build_days: i64,
 }
 
 impl Default for WorktreesConfig {
     fn default() -> Self {
-        WorktreesConfig { min_slots: 2, max_slots: 10, idle_trim_days: 2, idle_remove_days: 7, low_disk_gb: 50 }
+        WorktreesConfig { min_slots: 2, max_slots: 10, idle_trim_days: 2, idle_remove_days: 7, low_disk_gb: 50, stale_build_days: 3 }
     }
 }
 
@@ -82,13 +85,22 @@ pub fn config(app: &App, project: Option<&str>) -> WorktreesConfig {
     serde_json::from_value(c).unwrap_or_else(|_| app.cfg.worktrees.clone())
 }
 
-fn range(key: &str) -> (i64, i64, &'static str) {
+fn range(key: &str) -> (i64, i64, String) {
     match key {
-        "min_slots" => (0, 50, "a count from 0 to 50"),
-        "max_slots" => (1, 50, "a count from 1 to 50"),
-        "low_disk_gb" => (0, 100_000, "a number of GB"),
-        _ => (1, 365, "a number of days from 1 to 365"),
+        "min_slots" => (0, MAX_PARALLEL, format!("a count from 0 to {MAX_PARALLEL}")),
+        "max_slots" => (1, MAX_PARALLEL, format!("a count from 1 to {MAX_PARALLEL}")),
+        "low_disk_gb" => (0, 100_000, "a number of GB".into()),
+        _ => (0, 365, "a number of days from 1 to 365, or never".into()),
     }
+}
+
+/// An idle timer's value from a body: "never" is 0, the timer that doesn't run out.
+fn number(key: &str, v: &Value) -> Option<i64> {
+    let never = key.starts_with("idle_") && v.as_str().is_some_and(|s| s.trim().eq_ignore_ascii_case("never"));
+    if never {
+        return Some(0);
+    }
+    v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
 /// Sets a project's pool settings from a body's `KEYS` (null or "default": back to config.toml's).
@@ -105,7 +117,7 @@ pub fn set(app: &App, name: &str, body: &Value) -> Result<bool> {
             continue;
         }
         let (lo, hi, what) = range(k);
-        match v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())) {
+        match number(k, v) {
             Some(n) if (lo..=hi).contains(&n) => mine.insert(k.into(), json!(n)),
             _ => return err(400, format!("{k} is {what}, or default.")),
         };
@@ -121,7 +133,7 @@ pub fn set(app: &App, name: &str, body: &Value) -> Result<bool> {
     if c.min_slots > c.max_slots {
         return err(400, format!("min_slots ({}) can't be more than max_slots ({}).", c.min_slots, c.max_slots));
     }
-    if c.idle_trim_days > c.idle_remove_days {
+    if c.idle_remove_days > 0 && c.idle_trim_days > c.idle_remove_days {
         return err(400, format!("idle_trim_days ({}) can't be more than idle_remove_days ({}).", c.idle_trim_days, c.idle_remove_days));
     }
     Ok(true)
@@ -187,6 +199,160 @@ fn link(path: &str) -> Option<Link> {
     let gitdir = text.trim().strip_prefix("gitdir:").map(str::trim).unwrap_or(text.trim()).to_string();
     let there = Path::new(path).join(&gitdir).join("HEAD").exists();
     Some(Link::Worktree { gitdir, there })
+}
+
+/// The folder git keeps a worktree's own state in (its `HEAD`, `rebase-merge`, `MERGE_HEAD`…), read
+/// from its `.git` without running git.
+fn git_dir(path: &str) -> Option<std::path::PathBuf> {
+    match link(path)? {
+        Link::Repo => Some(Path::new(path).join(".git")),
+        Link::Worktree { gitdir, .. } => Some(Path::new(path).join(gitdir)),
+    }
+}
+
+/// A git operation left going in a worktree: a rebase, am, merge, cherry-pick, revert or bisect. git
+/// refuses to switch a worktree while one is, so a slot holding one can't be checked out for a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GitOp {
+    /// What's going on, for people: "a rebase".
+    pub what: &'static str,
+    /// The git command that stops it where it is, leaving HEAD and the files alone.
+    pub quit: &'static [&'static str],
+    /// The git command that undoes it, for an agent told to clear it.
+    pub abort: &'static str,
+}
+
+/// The operation going on in the worktree at `path`, by the files git keeps for it (the ones git's own
+/// switch checks before it refuses).
+pub(crate) fn git_op(path: &str) -> Option<GitOp> {
+    let dir = git_dir(path)?;
+    let has = |name: &str| dir.join(name).exists();
+    if has("rebase-apply/applying") {
+        return Some(GitOp { what: "an am", quit: &["am", "--quit"], abort: "git am --abort" });
+    }
+    let ops: [(&str, GitOp); 6] = [
+        ("rebase-merge", GitOp { what: "a rebase", quit: &["rebase", "--quit"], abort: "git rebase --abort" }),
+        ("rebase-apply", GitOp { what: "a rebase", quit: &["rebase", "--quit"], abort: "git rebase --abort" }),
+        ("MERGE_HEAD", GitOp { what: "a merge", quit: &["merge", "--quit"], abort: "git merge --abort" }),
+        ("CHERRY_PICK_HEAD", GitOp { what: "a cherry-pick", quit: &["cherry-pick", "--quit"], abort: "git cherry-pick --abort" }),
+        ("REVERT_HEAD", GitOp { what: "a revert", quit: &["revert", "--quit"], abort: "git revert --abort" }),
+        ("BISECT_LOG", GitOp { what: "a bisect", quit: &["bisect", "reset", "HEAD"], abort: "git bisect reset" }),
+    ];
+    ops.into_iter().find(|(f, _)| has(f)).map(|(_, op)| op)
+}
+
+/// What `settle` made of a slot's git state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Settled {
+    /// No git operation is left going there (or now isn't).
+    Clear,
+    /// Another git process is at work there now: passed over for now, and nothing for the owner.
+    Busy(String),
+    /// An operation is left going that can't be quit safely: why, for the owner.
+    Stuck(String),
+}
+
+/// A lock older than this is a crashed git's, left behind, not a git at work.
+const LOCK_SECS: u64 = 600;
+
+/// Whether a git process is at work in the worktree at `path` now: its own index is locked, and not
+/// by a lock left behind long ago.
+fn git_busy(path: &str) -> bool {
+    let Some(dir) = git_dir(path) else { return false };
+    let Ok(at) = std::fs::metadata(dir.join("index.lock")).and_then(|m| m.modified()) else { return false };
+    at.elapsed().map_or(true, |a| a.as_secs() < LOCK_SECS)
+}
+
+/// git's refusal when another git process holds the lock.
+fn lock_refusal(err: &str) -> bool {
+    err.contains("index.lock") || err.contains("Another git process")
+}
+
+/// Stops a git operation left going in a slot, when that loses nothing: no uncommitted changes and
+/// HEAD already pushed. Never while another git works there: that operation may be its, mid-way.
+fn settle(app: &App, s: &Row, path: &str) -> Result<Settled> {
+    let Some(op) = git_op(path) else {
+        clear_stuck(app, path)?;
+        return Ok(Settled::Clear);
+    };
+    let busy = || Settled::Busy(format!("{} is going on there while another git process works in it", op.what));
+    if git_busy(path) {
+        return Ok(busy());
+    }
+    let n = s.i0("n");
+    let cmd = format!("git {}", op.quit.join(" "));
+    let stuck = if dirty(path) {
+        Some("it has uncommitted changes".to_string())
+    } else if unpushed(path) > 0 {
+        Some("HEAD has commits that aren't pushed".to_string())
+    } else {
+        // Gone afterwards is quit, whatever git's exit says. A rebase left with both of its state
+        // folders quits one at a time, so a few goes.
+        let mut r = git(path, op.quit, GIT_SECS);
+        for _ in 0..2 {
+            match git_op(path) {
+                Some(next) if r.code == 0 => r = git(path, next.quit, GIT_SECS),
+                _ => break,
+            }
+        }
+        match git_op(path) {
+            None => None,
+            Some(_) if lock_refusal(&r.err) || git_busy(path) => return Ok(busy()),
+            Some(_) if r.code == 0 => Some(format!("{cmd} left it in progress")),
+            Some(_) => Some(format!("{cmd} failed: {}", last_line(&r.err))),
+        }
+    };
+    let Some(why) = stuck else {
+        clear_stuck(app, path)?;
+        let text = format!("Quit {} left going in worktree slot-{n} ({cmd}): its HEAD was pushed and nothing was uncommitted", op.what);
+        app.info(format!("worktrees: {text}"));
+        if let Some(t) = board::find_task(app, s.i("task_id"))? {
+            board::log_event(app, t.id(), board::BOARD, "midna", &text)?;
+        }
+        return Ok(Settled::Clear);
+    };
+    Ok(Settled::Stuck(format!("{} is in progress there and {why}", op.what)))
+}
+
+const STUCK_KEY: &str = "slot-git-op:";
+
+fn stuck_key(path: &str) -> String {
+    format!("{STUCK_KEY}{path}")
+}
+
+/// Clears the slot's stuck alert, when it has one.
+fn clear_stuck(app: &App, path: &str) -> Result<()> {
+    let key = stuck_key(path);
+    if crate::dispatch::alerts(app).iter().any(|a| a["key"] == key.as_str()) {
+        crate::dispatch::clear_alert_key(app, &key)?;
+    }
+    Ok(())
+}
+
+/// A free slot with a git operation that can't be quit safely never frees up by itself, so it's the
+/// owner's to clear: one alert for the slot.
+fn stuck_alert(app: &App, s: &Row, why: &str) -> Result<()> {
+    let path = s.st("path");
+    let text = format!("Worktree slot-{} is free but {why}, so no task can take it: {path}", s.i0("n"));
+    crate::dispatch::add_alert_keyed(app, &text, None, None, &stuck_key(&path))
+}
+
+/// Clears each stuck slot's alert once its slot is clear of the operation, taken by a task, or gone
+/// from the pool. Nothing else comes back to a slot a claim passed over, so without this the alert
+/// would stay after the operation ended.
+pub fn sweep_stuck(app: &App) -> Result<()> {
+    for a in crate::dispatch::alerts(app) {
+        let Some(path) = a["key"].as_str().and_then(|k| k.strip_prefix(STUCK_KEY)) else { continue };
+        let over = match app.db.q1("SELECT * FROM worktree_slots WHERE path = ?", p![path])? {
+            None => true,
+            Some(s) => !live(path) || git_op(path).is_none() || holder(app, &s)?.is_some(),
+        };
+        if over {
+            crate::dispatch::clear_alert_key(app, &stuck_key(path))?;
+            app.info(format!("worktrees: cleared the alert for {path}: no git operation is left stuck there now"));
+        }
+    }
+    Ok(())
 }
 
 /// A slot folder holding nothing.
@@ -414,6 +580,8 @@ fn claim_on(app: &App, t: &Row, repo: &str, start: &str, branch: Option<&str>) -
     if let Some(text) = crate::default_sync::freshen(repo, start, !app.db.held_here()) {
         app.info(format!("worktrees: before {} took a slot: {text}", rf("task", t.id())));
     }
+    let start = live_start(app, t, repo, start);
+    let start = start.as_str();
     let mut slots = rows(app, repo)?;
     // A conversation resumes only in the folder it ran in.
     if let Some(before) = board::task_context(t).s("worktree_slot") {
@@ -426,6 +594,19 @@ fn claim_on(app: &App, t: &Row, repo: &str, start: &str, branch: Option<&str>) -
         let path = s.st("path");
         if !live(&path) && !repair(app, t, &s, repo, start)? {
             continue;
+        }
+        // Left mid-rebase (or merge…): git won't switch it, so it's quit when that's safe, else passed over.
+        match settle(app, &s, &path)? {
+            Settled::Clear => {}
+            Settled::Busy(why) => {
+                app.info(format!("worktrees: passed over {path} for {} for now: {why}", rf("task", t.id())));
+                continue;
+            }
+            Settled::Stuck(why) => {
+                app.info(format!("worktrees: passed over {path} for {}: {why}", rf("task", t.id())));
+                stuck_alert(app, &s, &why)?;
+                continue;
+            }
         }
         if dirty(&path) {
             if let Err(e) = save_leftovers(app, &s, &path) {
@@ -465,6 +646,12 @@ fn claim_on(app: &App, t: &Row, repo: &str, start: &str, branch: Option<&str>) -
         format!("Made worktree slot-{n} at {path}, on its branch {at}{}", caught_up_text(&note))
     };
     take(app, t, id, &path, &text, start)?;
+    // Into Midna's cleanup.keep now, before its terminal can close. Not while holding the database
+    // (Midna's answer can take seconds): the next Midna sync puts it there then.
+    drop(_one);
+    if !app.db.held_here() {
+        crate::slot_keep::sync(app);
+    }
     Ok(path)
 }
 
@@ -610,6 +797,22 @@ fn at_text(at: &str, start: &str) -> String {
     }
 }
 
+/// The ref a slot starts from: `start` while it names a commit, else origin's default branch, else
+/// the repo's HEAD. A goal's base branch is often merged and deleted while its tasks' PRs still get
+/// review fixes; starting from it would fail every claim, and every wake would try again. The slot
+/// records the one it used as the task's base, so later claims start there.
+fn live_start(app: &App, t: &Row, repo: &str, start: &str) -> String {
+    let names = |r: &str| git(repo, &["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")], GIT_SECS).code == 0;
+    if names(start) {
+        return start.to_string();
+    }
+    let default = git(repo, &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], GIT_SECS);
+    let default = (default.code == 0).then(|| default.out.trim().to_string()).filter(|d| !d.is_empty());
+    let Some(alt) = default.into_iter().chain(["HEAD".to_string()]).find(|r| r != start && names(r)) else { return start.to_string() };
+    app.info(format!("worktrees: {}'s base {start} is gone, so its slot starts from {alt}", rf("task", t.id())));
+    alt
+}
+
 /// Puts a slot on `branch` (a task's pushed branch, which every worktree of the repo shares), else
 /// detached at `start`. Where it is, and what bringing the branch up to its pushed head did. The local
 /// branch is fast-forwarded to origin's first: the branch may have been pushed from somewhere else (the
@@ -689,16 +892,18 @@ pub fn release_refusal(app: &App, t: &Row) -> Result<Option<String>> {
     }
     let me = rf("task", t.id());
     let n = s.i("n").unwrap_or(0);
+    // Finished or abandoned, it's quit on the way back once nothing would be lost; until then it's named.
+    let op = git_op(&path).map(|o| format!(" {} is in progress there too: finish it, or abort it ({}).", capital(o.what), o.abort)).unwrap_or_default();
     if dirty(&path) {
         return Ok(Some(format!(
-            "{me} can't give back its worktree slot-{n} ({path}): it has uncommitted changes. Commit and push them, or discard them, then run this again."
+            "{me} can't give back its worktree slot-{n} ({path}): it has uncommitted changes. Commit and push them, or discard them, then run this again.{op}"
         )));
     }
     let k = unpushed(&path);
     if k > 0 {
         let on = branch_of(&path).map(|b| format!(" on {b}")).unwrap_or_default();
         return Ok(Some(format!(
-            "{me} can't give back its worktree slot-{n} ({path}): {k} commit{}{on} {} pushed. Push {} (git push), then run this again.",
+            "{me} can't give back its worktree slot-{n} ({path}): {k} commit{}{on} {} pushed. Push {} (git push), then run this again.{op}",
             if k == 1 { "" } else { "s" },
             if k == 1 { "isn't" } else { "aren't" },
             if k == 1 { "it" } else { "them" }
@@ -707,20 +912,66 @@ pub fn release_refusal(app: &App, t: &Row) -> Result<Option<String>> {
     Ok(None)
 }
 
+fn capital(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default()
+}
+
 pub(crate) fn branch_of(path: &str) -> Option<String> {
     let r = git(path, &["symbolic-ref", "--quiet", "--short", "HEAD"], GIT_SECS);
     (r.code == 0).then(|| r.out.trim().to_string()).filter(|b| !b.is_empty())
 }
 
 /// Commits in a slot that only it has. Without a remote, a branch keeps its commits after the slot
-/// lets go of it; only a detached HEAD's would be lost.
+/// lets go of it; only a detached HEAD's would be lost. A rebase of the branch's pushed commits (a
+/// session-start hook's `git pull --rebase` onto a newer base) loses nothing, so its copies don't count.
 pub(crate) fn unpushed(path: &str) -> i64 {
     let remote = !git(path, &["remote"], GIT_SECS).out.trim().is_empty();
-    if !remote && branch_of(path).is_some() {
-        return 0;
+    if !remote {
+        if branch_of(path).is_some() {
+            return 0;
+        }
+        let r = git(path, &["rev-list", "--count", "HEAD", "--not", "--branches"], GIT_SECS);
+        return r.out.trim().parse().unwrap_or(0);
     }
-    let r = git(path, &["rev-list", "--count", "HEAD", "--not", if remote { "--remotes" } else { "--branches" }], GIT_SECS);
-    r.out.trim().parse().unwrap_or(0)
+    let mine = not_on_a_remote(path);
+    match pushed_copy(path) {
+        Some((_, copy)) if !mine.is_empty() => {
+            let new = git(path, &["rev-list", "--cherry-pick", "--right-only", &format!("{copy}...HEAD")], GIT_SECS);
+            if new.code != 0 {
+                return mine.len() as i64;
+            }
+            let new: std::collections::HashSet<&str> = new.out.split_whitespace().collect();
+            mine.iter().filter(|c| new.contains(c.as_str())).count() as i64
+        }
+        _ => mine.len() as i64,
+    }
+}
+
+/// HEAD's commits that no remote branch has.
+fn not_on_a_remote(path: &str) -> Vec<String> {
+    git(path, &["rev-list", "HEAD", "--not", "--remotes"], GIT_SECS).out.split_whitespace().map(str::to_string).collect()
+}
+
+/// The branch checked out in `path` and its pushed copy (`<remote>/<branch>`), when it has one.
+fn pushed_copy(path: &str) -> Option<(String, String)> {
+    let b = branch_of(path)?;
+    let remotes = git(path, &["remote"], GIT_SECS).out;
+    let copy = remotes
+        .lines()
+        .map(|r| format!("{}/{b}", r.trim()))
+        .find(|c| git(path, &["rev-parse", "--verify", "-q", &format!("refs/remotes/{c}")], GIT_SECS).code == 0)?;
+    Some((b, copy))
+}
+
+/// The branch in `path` and its pushed copy when the branch's only commits no remote has are a
+/// rebase of the pushed ones (`unpushed`), so pointing it back at the pushed copy loses nothing.
+fn rebased_copy(path: &str) -> Option<(String, String, usize)> {
+    let k = not_on_a_remote(path).len();
+    if k == 0 || unpushed(path) > 0 {
+        return None;
+    }
+    pushed_copy(path).map(|(b, c)| (b, c, k))
 }
 
 /// Gives back the slot `t` holds: detached at its base again and free for the next task, its branch
@@ -754,11 +1005,26 @@ pub(crate) fn give_back(app: &App, t: &Row) -> Result<bool> {
     let mut branch = None;
     // A dead slot's git commands would switch the shared checkout instead.
     if live(&path) {
+        if let Settled::Stuck(why) = settle(app, &s, &path)? {
+            board::log_event(app, t.id(), board::BOARD, "midna", &format!("Gives back worktree slot-{n} with {why}, so no task takes it until that's cleared"))?;
+            stuck_alert(app, &s, &why)?;
+        }
         branch = branch_of(&path);
+        let rebased = rebased_copy(&path);
         let base = ctx.s("worktree_base").unwrap_or("HEAD");
         // Off its branch either way, so a reclaimed slot elsewhere can check it out.
         if git(&path, &["switch", "--detach", base], GIT_SECS).code != 0 {
             git(&path, &["switch", "--detach"], GIT_SECS);
+        }
+        // Review fixes carry on from what's pushed, not a hook's rebase of it a push would be refused for.
+        if let Some((b, copy, k)) = rebased {
+            if branch_of(&path).is_none() && git(&path, &["branch", "-f", &b, &copy], GIT_SECS).code == 0 {
+                let text = format!(
+                    "Pointed {b} back at {copy}: its {} only it had were a rebase of the pushed ones, so nothing was lost",
+                    plural(k as i64, "commit")
+                );
+                board::log_event(app, t.id(), board::BOARD, "midna", &text)?;
+            }
         }
     }
     resized(&path);
@@ -814,9 +1080,14 @@ pub fn overview(app: &App, project: Option<&str>) -> Result<Value> {
             (None, Some(id)) if live(&s.st("path")) && dirty(&s.st("path")) => Some(rf("task", id)),
             _ => None,
         };
+        // Free by its holder, but left mid-rebase (or merge…) in a way that can't be quit safely yet.
+        let busy = match &held {
+            None if live(&s.st("path")) => git_op(&s.st("path")).map(|o| o.what),
+            _ => None,
+        };
         out.push(json!({
             "name": format!("slot-{}", s.i0("n")), "n": s.v("n"), "project": s.v("project"), "repo": repo, "path": s.v("path"),
-            "held_by": held.as_ref().map(|t| rf("task", t.id())), "title": held.as_ref().map(|t| t.v("title")), "kept_by": kept,
+            "held_by": held.as_ref().map(|t| rf("task", t.id())), "title": held.as_ref().map(|t| t.v("title")), "kept_by": kept, "busy": busy,
             "used_at": s.v("used_at"), "made_at": s.v("made_at"), "size_kb": size_kb,
             "waiting": waiting.iter().filter(|(r, _)| *r == repo).map(|(_, t)| t.clone()).collect::<Vec<_>>(),
         }));
@@ -908,6 +1179,8 @@ fn folder_bytes(p: &Path) -> Option<u64> {
 }
 
 fn take(app: &App, t: &Row, id: i64, path: &str, text: &str, start: &str) -> Result<()> {
+    // A task's slot is its own to sort out, whatever it was left with.
+    clear_stuck(app, path)?;
     app.db.tx(|| {
         app.db.x(
             "UPDATE worktree_slots SET task_id = ?, used_at = ?, seq = (SELECT COALESCE(MAX(seq), 0) + 1 FROM worktree_slots) WHERE id = ?",
@@ -1077,6 +1350,27 @@ mod tests {
     }
 
     #[test]
+    fn a_pr_claim_whose_base_branch_is_gone_starts_from_head_and_keeps_its_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::for_tests(Config::for_tests(dir.path()));
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo = repo.to_str().unwrap().to_string();
+        let run = |args: &[&str]| assert_eq!(git(&repo, args, GIT_SECS).code, 0, "git {args:?}");
+        run(&["init", "-q"]);
+        run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "one"]);
+        run(&["branch", "feat/a"]);
+        // It worked in slot-1, since removed, on a goal based on a branch that was merged and deleted.
+        let ctx = json!({"worktree_slot": slot_path(&repo, 1), "worktree_base": "origin/gone", "worktree_branch": "feat/a"}).to_string();
+        let t = board::get_task(&app, app.db.insert("tasks", crate::fields!["title" => "A", "status" => "done", "context" => ctx]).unwrap()).unwrap();
+        let path = reclaim(&app, &t).expect("the claim works from HEAD instead").unwrap();
+        assert_eq!(branch_of(&path).as_deref(), Some("feat/a"), "its PR branch is checked out");
+        let ctx = board::task_context(&board::get_task(&app, t.id()).unwrap());
+        assert_eq!(ctx.s("worktree_base"), Some("HEAD"), "later claims start from the base that worked");
+        assert_eq!(live_start(&app, &t, &repo, "HEAD"), "HEAD", "a base that names a commit stays");
+    }
+
+    #[test]
     fn a_pr_claim_on_a_full_pool_waits_for_a_slot() {
         let dir = tempfile::tempdir().unwrap();
         let (app, _, slot, a) = visiting(dir.path(), 1);
@@ -1141,6 +1435,62 @@ mod tests {
         let why = visit_end_refusal(&app, &t, &json!({"by_session": "s1"})).unwrap().expect("the agent is told");
         assert!(why.contains("uncommitted changes"), "{why}");
         assert!(visit_end_refusal(&app, &t, &json!({})).unwrap().is_none(), "the owner isn't held to it");
+    }
+
+    #[test]
+    fn a_pr_visit_ends_when_a_hook_only_rebased_its_pushed_branch_and_the_branch_goes_back_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::for_tests(Config::for_tests(dir.path()));
+        let (origin, repo, other) = (dir.path().join("origin.git"), dir.path().join("repo"), dir.path().join("other"));
+        let s = |p: &Path| p.to_str().unwrap().to_string();
+        let run = |at: &str, args: &[&str]| {
+            let g = git(at, args, 30.0);
+            assert_eq!(g.code, 0, "git {args:?}: {}", g.err);
+            g.out.trim().to_string()
+        };
+        // Each commit adds a file of its own, so no two are the same change.
+        let commit = |at: &str, m: &str| {
+            std::fs::write(Path::new(at).join(m.replace(' ', "-")), m).unwrap();
+            run(at, &["add", "-A"]);
+            run(at, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", m])
+        };
+        let top = s(dir.path());
+        run(&top, &["init", "-q", "--bare", "-b", "main", &s(&origin)]);
+        run(&top, &["clone", "-q", &s(&origin), &s(&repo)]);
+        let repo = s(&repo);
+        run(&repo, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        commit(&repo, "one");
+        run(&repo, &["push", "-q", "origin", "main"]);
+        let slot = slot_path(&repo, 1);
+        run(&repo, &["worktree", "add", "-q", "-b", "feat/a", &slot, "origin/main"]);
+        commit(&slot, "a's work");
+        commit(&slot, "a's fix");
+        run(&slot, &["push", "-q", "-u", "origin", "feat/a"]);
+        let pushed = run(&slot, &["rev-parse", "HEAD"]);
+        // main moves on, and a session-start hook's pull rebases the branch onto it.
+        run(&top, &["clone", "-q", &s(&origin), &s(&other)]);
+        commit(&s(&other), "main moves");
+        run(&s(&other), &["push", "-q", "origin", "main"]);
+        run(&slot, &["-c", "user.name=t", "-c", "user.email=t@t", "pull", "-q", "--rebase", "origin", "main"]);
+        assert_ne!(run(&slot, &["rev-parse", "HEAD"]), pushed, "rebased");
+        assert_eq!(not_on_a_remote(&slot).len(), 2);
+
+        let id = app.db.insert("tasks", crate::fields!["title" => "A", "status" => "done"]).unwrap();
+        app.db.insert("worktree_slots", crate::fields!["repo" => repo.clone(), "n" => 1, "path" => slot.clone(), "task_id" => id]).unwrap();
+        let t = board::get_task(&app, id).unwrap();
+        let agent = json!({"by_session": "s1"});
+        assert_eq!(visit_end_refusal(&app, &t, &agent).unwrap(), None, "a rebase of pushed commits loses nothing");
+
+        // A commit of its own on top still holds the visit.
+        commit(&slot, "not pushed");
+        let why = visit_end_refusal(&app, &t, &agent).unwrap().expect("its own commit isn't pushed");
+        assert!(why.contains("1 commit on feat/a isn't pushed"), "{why}");
+        run(&slot, &["reset", "-q", "--hard", "HEAD~1"]);
+
+        assert!(release(&app, &t).unwrap());
+        assert_eq!(run(&repo, &["rev-parse", "feat/a"]), pushed, "the branch is back on its pushed commits");
+        let logged: Vec<String> = app.db.q("SELECT text FROM events WHERE task_id = ?", p![id]).unwrap().iter().map(|e| e.st("text")).collect();
+        assert!(logged.iter().any(|l| l.contains("Pointed feat/a back at origin/feat/a: its 2 commits only it had were a rebase")), "{logged:?}");
     }
 
     /// Asks until the background measuring gives a size other than `not`.
@@ -1260,5 +1610,163 @@ mod tests {
         let logged: Vec<String> = app.db.q("SELECT text FROM events WHERE task_id = ?", p![t.id()]).unwrap().iter().map(|e| e.st("text")).collect();
         let why = logged.iter().find(|l| l.starts_with("Couldn't give")).unwrap_or_else(|| panic!("{logged:?}"));
         assert!(why.contains("git reset failed") && why.contains("index.lock"), "{why}");
+    }
+
+    /// `held_slot` with a second commit on `feat/a` and a rebase of it stopped on a failing `exec`,
+    /// HEAD still on that commit as the issue saw it.
+    fn mid_rebase(app: &App, dir: &Path) -> (String, String, Row) {
+        let (repo, slot, t) = held_slot(app, dir, "done");
+        std::fs::write(Path::new(&slot).join("app.rs"), "two").unwrap();
+        assert_eq!(git(&slot, &["commit", "-qam", "two"], GIT_SECS).code, 0);
+        assert_ne!(git(&slot, &["rebase", "-x", "false", "HEAD~1"], GIT_SECS).code, 0, "the rebase stops");
+        assert_eq!(git_op(&slot).map(|o| o.what), Some("a rebase"));
+        (repo, slot, t)
+    }
+
+    #[test]
+    fn a_slot_given_back_mid_rebase_with_nothing_to_lose_has_the_rebase_quit() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::for_tests(Config::for_tests(dir.path()));
+        let (_, slot, t) = mid_rebase(&app, dir.path());
+        let tip = git(&slot, &["rev-parse", "HEAD"], GIT_SECS).out;
+        assert!(release_if_clean(&app, &t).unwrap(), "given back");
+        assert_eq!(git_op(&slot), None, "the rebase is quit");
+        assert_eq!(git(&slot, &["rev-parse", "feat/a"], GIT_SECS).out, tip, "its branch is where it was");
+        assert!(crate::dispatch::alerts(&app).is_empty(), "nothing for the owner");
+        assert_eq!(overview(&app, None).unwrap()["slots"][0]["busy"], Value::Null, "listed free");
+    }
+
+    #[test]
+    fn a_free_slot_left_mid_rebase_with_nothing_to_lose_is_quit_and_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::for_tests(Config::for_tests(dir.path()));
+        let (repo, slot, a) = mid_rebase(&app, dir.path());
+        app.db.x("UPDATE worktree_slots SET task_id = NULL", p![]).unwrap();
+        let b = board::get_task(&app, app.db.insert("tasks", crate::fields!["title" => "B", "status" => "queued"]).unwrap()).unwrap();
+        assert_eq!(claim_on(&app, &b, &repo, "HEAD", None).unwrap(), slot, "taken, not passed over");
+        assert_eq!(git_op(&slot), None);
+        let logged: Vec<String> = app.db.q("SELECT text FROM events WHERE task_id = ?", p![b.id()]).unwrap().iter().map(|e| e.st("text")).collect();
+        assert!(logged.iter().any(|l| l.starts_with("Took worktree slot-1")), "{logged:?}");
+        assert!(held(&app, &a).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_slot_left_mid_rebase_with_unpushed_work_is_passed_over_and_never_listed_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::for_tests(Config::for_tests(dir.path()));
+        let (repo, slot, a) = mid_rebase(&app, dir.path());
+        assert_eq!(git(&slot, &["commit", "-q", "--allow-empty", "-m", "only here"], GIT_SECS).code, 0);
+        let why = release_refusal(&app, &a).unwrap().expect("its commit isn't pushed");
+        assert!(why.contains("A rebase is in progress there too") && why.contains("git rebase --abort"), "{why}");
+        // Its task is done with no terminal, so by its holder the slot is free.
+        let b = board::get_task(&app, app.db.insert("tasks", crate::fields!["title" => "B", "status" => "queued"]).unwrap()).unwrap();
+        let got = claim_on(&app, &b, &repo, "HEAD", None).unwrap();
+        assert_eq!(got, slot_path(&repo, 2), "B gets a new slot");
+        assert_eq!(git_op(&slot).map(|o| o.what), Some("a rebase"), "the rebase is left as it is");
+        let alerts = crate::dispatch::alerts(&app);
+        assert!(alerts.iter().any(|a| a["text"].as_str().is_some_and(|t| t.contains("slot-1 is free but a rebase is in progress"))), "{alerts:?}");
+        let listed = overview(&app, None).unwrap();
+        let one = listed["slots"].as_array().unwrap().iter().find(|s| s["name"] == "slot-1").cloned().unwrap();
+        assert_eq!((one["held_by"].clone(), one["busy"].clone()), (Value::Null, json!("a rebase")), "not listed free");
+    }
+
+    fn stuck_alerts(app: &App) -> Vec<Value> {
+        crate::dispatch::alerts(app).into_iter().filter(|a| a["key"].as_str().is_some_and(|k| k.starts_with(STUCK_KEY))).collect()
+    }
+
+    #[test]
+    fn a_free_slot_where_another_git_is_at_work_is_passed_over_without_an_alert() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::for_tests(Config::for_tests(dir.path()));
+        let (repo, slot, _) = mid_rebase(&app, dir.path());
+        app.db.x("UPDATE worktree_slots SET task_id = NULL", p![]).unwrap();
+        // The slot's own git dir, as a rebase at work there holds it.
+        std::fs::write(Path::new(&repo).join(".git/worktrees/slot-1/index.lock"), "").unwrap();
+        let b = board::get_task(&app, app.db.insert("tasks", crate::fields!["title" => "B", "status" => "queued"]).unwrap()).unwrap();
+        assert_eq!(claim_on(&app, &b, &repo, "HEAD", None).unwrap(), slot_path(&repo, 2), "B gets a new slot");
+        assert_eq!(git_op(&slot).map(|o| o.what), Some("a rebase"), "the rebase is left to the git at work");
+        assert!(stuck_alerts(&app).is_empty(), "nothing for the owner");
+    }
+
+    #[test]
+    fn a_lock_left_long_ago_doesnt_count_as_a_git_at_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::for_tests(Config::for_tests(dir.path()));
+        let (repo, slot, _) = mid_rebase(&app, dir.path());
+        let lock = Path::new(&repo).join(".git/worktrees/slot-1/index.lock");
+        std::fs::write(&lock, "").unwrap();
+        assert!(git_busy(&slot));
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(LOCK_SECS + 60);
+        std::fs::File::options().write(true).open(&lock).unwrap().set_modified(old).unwrap();
+        assert!(!git_busy(&slot));
+    }
+
+    #[test]
+    fn a_rebase_quit_that_fails_on_the_lock_is_a_git_at_work_not_stuck() {
+        assert!(lock_refusal("fatal: Unable to create '/r/.git/worktrees/slot-1/index.lock': File exists.\n\nAnother git process seems to be running"));
+        assert!(!lock_refusal("fatal: No rebase in progress?"));
+    }
+
+    #[test]
+    fn a_rebase_left_with_both_state_folders_is_quit_all_the_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::for_tests(Config::for_tests(dir.path()));
+        let (repo, slot, t) = mid_rebase(&app, dir.path());
+        std::fs::create_dir_all(Path::new(&repo).join(".git/worktrees/slot-1/rebase-apply")).unwrap();
+        assert!(release_if_clean(&app, &t).unwrap(), "given back");
+        assert_eq!(git_op(&slot), None, "both are quit");
+        assert!(stuck_alerts(&app).is_empty(), "nothing for the owner");
+    }
+
+    #[test]
+    fn a_stuck_slots_alert_clears_once_its_rebase_is_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::for_tests(Config::for_tests(dir.path()));
+        let (repo, slot, _) = mid_rebase(&app, dir.path());
+        assert_eq!(git(&slot, &["commit", "-q", "--allow-empty", "-m", "only here"], GIT_SECS).code, 0);
+        app.db.x("UPDATE worktree_slots SET task_id = NULL", p![]).unwrap();
+        let b = board::get_task(&app, app.db.insert("tasks", crate::fields!["title" => "B", "status" => "queued"]).unwrap()).unwrap();
+        claim_on(&app, &b, &repo, "HEAD", None).unwrap();
+        assert_eq!(stuck_alerts(&app).len(), 1, "raised while the rebase is left");
+        sweep_stuck(&app).unwrap();
+        assert_eq!(stuck_alerts(&app).len(), 1, "kept while it still is");
+        assert_eq!(git(&slot, &["rebase", "--abort"], GIT_SECS).code, 0);
+        sweep_stuck(&app).unwrap();
+        assert!(stuck_alerts(&app).is_empty(), "cleared once it's over");
+    }
+
+    #[test]
+    fn a_stuck_slots_alert_clears_when_a_task_takes_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::for_tests(Config::for_tests(dir.path()));
+        let (repo, slot, _) = mid_rebase(&app, dir.path());
+        assert_eq!(git(&slot, &["commit", "-q", "--allow-empty", "-m", "only here"], GIT_SECS).code, 0);
+        app.db.x("UPDATE worktree_slots SET task_id = NULL", p![]).unwrap();
+        let b = board::get_task(&app, app.db.insert("tasks", crate::fields!["title" => "B", "status" => "queued"]).unwrap()).unwrap();
+        claim_on(&app, &b, &repo, "HEAD", None).unwrap();
+        assert_eq!(stuck_alerts(&app).len(), 1);
+        // Sorted out by hand; the next claim finds it clear and takes it.
+        assert_eq!(git(&slot, &["rebase", "--abort"], GIT_SECS).code, 0);
+        let c = board::get_task(&app, app.db.insert("tasks", crate::fields!["title" => "C", "status" => "queued"]).unwrap()).unwrap();
+        assert_eq!(claim_on(&app, &c, &repo, "HEAD", None).unwrap(), slot);
+        assert!(stuck_alerts(&app).is_empty(), "cleared when taken");
+    }
+
+    #[test]
+    fn each_git_operation_is_found_by_the_file_git_keeps_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_str().unwrap();
+        assert_eq!(git(repo, &["init", "-q"], GIT_SECS).code, 0);
+        assert_eq!(git_op(repo), None);
+        let gd = dir.path().join(".git");
+        for (file, what) in [("MERGE_HEAD", "a merge"), ("CHERRY_PICK_HEAD", "a cherry-pick"), ("REVERT_HEAD", "a revert"), ("BISECT_LOG", "a bisect")] {
+            std::fs::write(gd.join(file), "").unwrap();
+            assert_eq!(git_op(repo).map(|o| o.what), Some(what), "{file}");
+            std::fs::remove_file(gd.join(file)).unwrap();
+        }
+        std::fs::create_dir_all(gd.join("rebase-apply")).unwrap();
+        assert_eq!(git_op(repo).map(|o| o.what), Some("a rebase"));
+        std::fs::write(gd.join("rebase-apply/applying"), "").unwrap();
+        assert_eq!(git_op(repo).map(|o| o.quit), Some(["am", "--quit"].as_slice()), "a mailbox apply is an am");
     }
 }

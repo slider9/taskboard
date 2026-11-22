@@ -94,7 +94,7 @@ pub fn new_task(app: &App, body: &Value, who: &str, log_text: Option<&str>) -> R
         Some(id) => Some(board::get_goal(app, id)?),
         None => None,
     };
-    let mut project = body_str(body, "project");
+    let mut project = projects::named(app, &body_str(body, "project"))?;
     if project.is_empty() {
         project = g.as_ref().map(|g| g.st("project")).unwrap_or_default();
     }
@@ -135,7 +135,8 @@ pub fn new_task(app: &App, body: &Value, who: &str, log_text: Option<&str>) -> R
         projects::refuse_without_prs(app, &project)?;
     }
     // A new ticket for a project whose work gets none is quietly dropped, as the old board did.
-    let quiet_none = jmode == "create" && !ships;
+    let no_pr = !ships || (body_has(body, "ships_pr") && projects::clean_ships_pr(&body["ships_pr"])? == Some(0));
+    let quiet_none = jmode == "create" && no_pr;
     if quiet_none {
         jmode = "none".into();
     }
@@ -307,7 +308,7 @@ pub fn new_goal(app: &App, body: &Value) -> Result<Value> {
     if name.is_empty() {
         return err(400, "The name can't be empty.");
     }
-    let project = body_str(body, "project");
+    let project = projects::named(app, &body_str(body, "project"))?;
     if project.is_empty() {
         return err(400, "The project can't be empty.");
     }
@@ -428,6 +429,7 @@ pub fn task_detail(app: &App, id: i64) -> Result<Value> {
         .iter()
         .map(board::job_dict)
         .collect();
+    let atts = board::attachments(app, Some(id), None)?;
     Ok(merge(
         d,
         json!({
@@ -442,8 +444,8 @@ pub fn task_detail(app: &App, id: i64) -> Result<Value> {
             "blocked_by": waitsfor::blocked_by(app, &t)?, "attachable": attachable, "found": found,
             "from_issue": fi.map(|b| json!({"id": b.id(), "ref": rf("issue", b.id()), "title": b.v("title")})).unwrap_or(Value::Null),
             "jobs": jobs_now,
-            "attachments": board::attachments(app, Some(id), None)?,
-            "goal_attachments": match &g { Some(g) => Value::Array(board::attachments(app, None, Some(g.id()))?), None => json!([]) },
+            "goal_attachments": match &g { Some(g) => Value::Array(board::goal_attachments(app, &atts, g.id())?), None => json!([]) },
+            "attachments": atts,
         }),
     ))
     .and_then(|d| with_step_results(app, &t, d))

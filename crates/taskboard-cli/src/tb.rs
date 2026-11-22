@@ -141,6 +141,10 @@ enum Cmd {
         /// How long the work would have taken a developer by hand: 3h, 90m, 1h30m, 2d. The Days page compares it with the agent's time
         #[arg(long)]
         human: Option<String>,
+        /// A backlog issue this work fixed (repeat for each): it closes as fixed when the PR merges, or as the task
+        /// finishes with no PR
+        #[arg(long = "fixes", value_name = "B<n>")]
+        fixes: Vec<String>,
         #[command(flatten)]
         t: TaskArg,
     },
@@ -174,9 +178,11 @@ enum Cmd {
     },
     /// Start a task, or run a goal (G<n>), only when the human told you to in this conversation (the board
     /// checks their prompts for a task). A goal runs its tasks in their waves; never start them one by one.
+    /// Several tasks (tb start T4 T5 T6) start together or not at all
     Start {
-        /// T<n>, G<n> for a goal, or B<n> for a backlog item (made into its task first)
-        task: String,
+        /// T<n>, G<n> for a goal, or B<n> for a backlog item (made into its task first); several T<n> start each
+        #[arg(required = true, num_args = 1..)]
+        task: Vec<String>,
         /// Queue the task to start once its project has a free terminal (tb project set --max-terminals), instead of now in a new terminal
         #[arg(long)]
         queue: bool,
@@ -382,6 +388,11 @@ enum Cmd {
         #[command(subcommand)]
         action: GoalCmd,
     },
+    /// Whether a task's turn that asks the owner something above its reply's last paragraph is sent back once to ask it properly (no action: whether it's on); on or off only on the owner's word
+    BuriedQuestions {
+        #[arg(value_parser = ["on", "off"])]
+        action: Option<String>,
+    },
     /// QA testers' Jira comments on board tickets: list, waiting, show Q3, settings, or on the owner's word task Q3 / ignore Q3 / on / off
     Qa {
         /// list (default), waiting, Q3, task, ignore, on, off or settings
@@ -415,8 +426,9 @@ enum Cmd {
         rest: Vec<String>,
     },
     /// A code review's triage: the round's findings and what's left (tb finding T5), or one finding's outcome:
-    /// tb finding T5 F2 fix|backlog|dismiss "<reason>". backlog files it in the task's backlog. The task's
-    /// own agent marks a fix finding it has fixed: tb finding T5 F2 fixed "<what it changed>"
+    /// tb finding T5 F2 fix|dismiss "<reason>", or tb finding T5 F2 backlog --blocks none|pr|goal "<reason>", which
+    /// files it in the task's backlog. The task's own agent marks a fix finding it has fixed: tb finding T5 F2
+    /// fixed "<what it changed>"
     Finding {
         /// T5, the task whose review is in triage or being fixed
         task: String,
@@ -476,6 +488,9 @@ enum Cmd {
         /// The kept reviews
         #[arg(long, conflicts_with_all = ["target", "since", "week", "save"])]
         list: bool,
+        /// File a kept review's suggested fixes as backlog issues again (after filing them failed)
+        #[arg(long, requires = "target", conflicts_with_all = ["since", "week", "save", "list"])]
+        file_again: bool,
     },
     /// Tasks, one line each: this terminal's project's (with --goal, every project's)
     Tasks {
@@ -533,6 +548,10 @@ enum Cmd {
         /// A line on what it is, shown under its title on the board
         #[arg(long)]
         summary: Option<String>,
+        /// A file with the link's text, for a link the board can't open (a claude.ai artifact: the page its
+        /// Artifact read saved). The board keeps the text so plan reviews can read it
+        #[arg(long, value_name = "FILE")]
+        copy: Option<String>,
         /// Attach it to this goal instead of the task
         #[arg(long)]
         goal: Option<String>,
@@ -604,7 +623,7 @@ enum Cmd {
     },
     /// Show or change how many task terminals run at once across the board; tasks over it wait for a free slot
     Terminals {
-        /// A count from 1 to 50, or default (config.toml's [terminals] global_max)
+        /// A count from 1 to 100, or default (config.toml's [terminals] global_max)
         #[arg(long)]
         max: Option<String>,
     },
@@ -702,26 +721,26 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: i64,
     },
-    /// Which accounts are connected (GitHub, Bitbucket, Slack); connect them in Taskboard ▸ Settings
+    /// Which accounts are connected (GitHub, Bitbucket, Azure DevOps, Slack, Jira); connect them in Taskboard ▸ Settings
     Accounts,
     /// The CI token the board reads failed steps and tests with (Azure DevOps): show, set or clear it
     CiToken {
         #[command(subcommand)]
         action: Option<CiTokenCmd>,
     },
-    /// Print an account's token for a script: github, bitbucket or slack
+    /// Print an account's token for a script: github, bitbucket, slack or jira
     Token {
-        #[arg(value_parser = ["github", "bitbucket", "slack"])]
+        #[arg(value_parser = ["github", "bitbucket", "slack", "jira"])]
         provider: String,
-        /// Print who the token belongs to instead (Bitbucket: the email for basic auth)
+        /// Print who the token belongs to instead (Bitbucket and Jira: the email for basic auth)
         #[arg(long)]
         user: bool,
     },
     /// Call an account's REST API with its token: `tb api bitbucket repositories/acme/web/pullrequests/9`
     Api {
-        #[arg(value_parser = ["github", "bitbucket", "slack"])]
+        #[arg(value_parser = ["github", "bitbucket", "slack", "jira"])]
         provider: String,
-        /// The path under https://api.github.com/, https://api.bitbucket.org/2.0/ or https://slack.com/api/ (or a full URL)
+        /// The path under https://api.github.com/, https://api.bitbucket.org/2.0/, https://slack.com/api/ or https://<jira site>/rest/api/3/ (or a full URL)
         path: String,
         /// GET, POST, PUT or DELETE (POST when there's --data)
         #[arg(short = 'X', long)]
@@ -752,6 +771,13 @@ enum Cmd {
     Hello,
     /// Claude Code hook (used by the plugin)
     Hook { event: Option<String> },
+    /// Install the board's Claude Code hooks for this tb, and the task-board plugin, as the app's
+    /// Install hooks does (install.sh runs it; with the app, use its button instead)
+    InstallHooks {
+        /// The plugin folder to install from: the repo's plugin/
+        #[arg(long)]
+        plugin: PathBuf,
+    },
     /// git credential helper for the board's sessions (set up by the plugin's SessionStart hook)
     #[command(hide = true)]
     GitCredential {
@@ -936,7 +962,8 @@ enum BitCmd {
 #[derive(Subcommand)]
 enum ReleaseCmd {
     /// Cut a release holding every done task in Unreleased (its PR merged, or done with no PR). A project
-    /// with a release script runs it first (from main or a release/* branch), with the name, and records the release only if it succeeds
+    /// with a release script has the board run it in the background (from main or a release/* branch), with the
+    /// name, and record the release only if it succeeds; this follows it for a minute or so, then tb release status does
     Cut {
         name: String,
         /// The project (this terminal's when left out)
@@ -951,6 +978,12 @@ enum ReleaseCmd {
         /// finished), then the board cuts it, release script included. Repeat for more. One per project
         #[arg(long, value_name = "T<n>|G<n>")]
         after: Vec<String>,
+    },
+    /// Where the project's cut stands: running (with its script's latest output), pending, dropped (and why), or the last release
+    Status {
+        /// The project (this terminal's when left out)
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Drop the project's pending cut (tb release cut --after)
     Cancel {
@@ -1108,8 +1141,17 @@ enum IdeaCmd {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Add a note to an idea
-    Note { idea: String, text: String },
+    /// Add a note to an idea; with --round and --question, the answer to one of a report's questions
+    Note {
+        idea: String,
+        text: String,
+        /// The report round the question is in
+        #[arg(long, requires = "question")]
+        round: Option<i64>,
+        /// The question's id in that round's report
+        #[arg(long, requires = "round")]
+        question: Option<String>,
+    },
     /// Drop an idea: it won't be built
     Drop {
         idea: String,
@@ -1135,6 +1177,10 @@ enum IdeaCmd {
     },
     /// Have Claude plan an idea into a goal and its tasks, from its notes and reports; planned only, not started
     Plan { idea: String },
+    /// Stop the dig running on an idea
+    Stop { idea: String },
+    /// Undo an idea's plan before its work starts: its goal and tasks are deleted
+    Unplan { idea: String },
 }
 
 #[derive(Subcommand)]
@@ -1567,9 +1613,10 @@ enum TaskCmd {
         /// Its title; with --issue, the item's title when left out
         #[arg(required_unless_present = "issue")]
         title: Option<String>,
-        /// The open backlog item it's made from (B12): linked to it, with its detail, and the item becomes this task
+        /// The open backlog item it's made from (B12): linked to it, with its detail, and the item becomes this task.
+        /// Repeat for each issue it fixes: the rest link to it too, and all close with it
         #[arg(long, value_name = "B12")]
-        issue: Option<String>,
+        issue: Vec<String>,
         #[arg(long)]
         detail: Option<String>,
         /// The goal it's in; with --here, this terminal does it and the goal's runner leaves it alone
@@ -1663,7 +1710,8 @@ enum TaskCmd {
         #[arg(long, value_name = "low|medium|high|xhigh|max")]
         effort: Option<String>,
         /// It's work only the owner can do (make an account, sign something): shown as H<n>, no terminal
-        /// starts on it, --detail holds the steps and links, and the owner presses Done in the app.
+        /// starts on it, --detail holds the steps and links, and the owner presses Done in the app (or tells
+        /// an agent to: tb needs done H<n>).
         /// Tasks that wait for it (--waits-for H<n>, or later in its goal) go on after that, with the
         /// owner's note in their prompt
         #[arg(long, conflicts_with_all = ["here", "pr", "stack_on", "same_pr", "model", "effort", "lock", "alone", "kind"], requires = "detail")]
@@ -1760,6 +1808,9 @@ enum TaskCmd {
         /// its merge follow that PR, even one another task owns
         #[arg(long = "pr-link", value_name = "LINK")]
         pr_link: Option<String>,
+        /// An open backlog issue it fixes (B12): linked to it, so it closes with it. Repeat for more
+        #[arg(long, value_name = "B12")]
+        issue: Vec<String>,
         /// One of its project's areas (`.taskboard.toml` at the repo's root), any case, or none
         #[arg(long, value_name = "NAME|none")]
         area: Option<String>,
@@ -1893,6 +1944,14 @@ enum BacklogCmd {
         #[arg(long)]
         reason: Option<String>,
     },
+    /// Close backlog issues as fixed by finished work, all or none: tb backlog fixed B3 --by T12
+    Fixed {
+        #[arg(required = true)]
+        issues: Vec<String>,
+        /// The done task (T12) or the PR link that fixed them
+        #[arg(long, required = true)]
+        by: String,
+    },
     /// Open closed backlog issues again, all or none
     Reopen {
         #[arg(required = true)]
@@ -1986,6 +2045,9 @@ enum ProjectCmd {
         /// A check that must post on every push (repeat for more; none: wait for none; default: config.toml's)
         #[arg(long = "expected-check")]
         expected_check: Vec<String>,
+        /// A check, or a stage or job inside a check's build, that must pass to merge: other failed or cancelled ones don't hold its PRs (repeat for more; none: every failed check holds; default: config.toml's)
+        #[arg(long = "required-check")]
+        required_check: Vec<String>,
         /// Minutes to wait for the expected checks before going on without them (default: config.toml's)
         #[arg(long = "expected-wait")]
         expected_wait: Option<String>,
@@ -1995,7 +2057,7 @@ enum ProjectCmd {
         /// Swap a reviewer who hasn't reviewed after [reviewers] swap_after_mins work minutes (default: config.toml's)
         #[arg(long, value_parser = ["on", "off", "default"])]
         swap: Option<String>,
-        /// The Review step: off, its PRs go to merge without reviewers (default: on)
+        /// The Review step: off, its PRs go to merge without reviewers (default: tb project review, else config.toml's pr.review)
         #[arg(long, value_parser = ["on", "off", "default"])]
         review: Option<String>,
         /// Agents merge its PRs once they're approved and green (tb pr merge) (default: config.toml's pr.agents_merge)
@@ -2013,10 +2075,10 @@ enum ProjectCmd {
         /// Worktree slots its pool grows to before a task waits for one (default: config.toml's [worktrees] max_slots)
         #[arg(long = "max-slots")]
         max_slots: Option<String>,
-        /// Days a slot sits idle before its build output is cleared (default: config.toml's [worktrees] idle_trim_days)
+        /// Days a slot sits idle before its build output is cleared, or never (default: config.toml's [worktrees] idle_trim_days)
         #[arg(long = "idle-trim-days")]
         idle_trim_days: Option<String>,
-        /// Days a slot sits idle before it's removed (default: config.toml's [worktrees] idle_remove_days)
+        /// Days a slot sits idle before it's removed, or never (default: config.toml's [worktrees] idle_remove_days)
         #[arg(long = "idle-remove-days")]
         idle_remove_days: Option<String>,
         /// Free disk in GB below which idle slots are cleared sooner (default: config.toml's [worktrees] low_disk_gb)
@@ -2028,6 +2090,9 @@ enum ProjectCmd {
         /// How its stacked tasks merge when tb task new|set --stack-on gives no --stack-merge (default: tail)
         #[arg(long = "stack-merge-default", value_parser = ["head", "tail", "default"])]
         stack_merge_default: Option<String>,
+        /// Devices from the one shared pool each of its tasks asks for when neither it nor its goal says: ios, android:2. Repeat for more, none for none
+        #[arg(long = "device", value_name = "TAG[:N]|none")]
+        devices: Vec<String>,
         /// Releases (tb release cut) for this project (default: config.toml's [releases] on)
         #[arg(long, value_parser = ["on", "off", "default"])]
         releases: Option<String>,
@@ -2048,6 +2113,11 @@ enum ProjectCmd {
     },
     /// Whether green PRs wait for your review on every project that doesn't say; off: the board marks them reviewed (default: config.toml's pr.owner_review)
     OwnerReview {
+        #[arg(value_parser = ["on", "off", "default"])]
+        value: Option<String>,
+    },
+    /// Whether every project that doesn't say has the Review step; off: its PRs go to merge without reviewers or approvals (default: config.toml's pr.review)
+    Review {
         #[arg(value_parser = ["on", "off", "default"])]
         value: Option<String>,
     },
@@ -2336,12 +2406,26 @@ fn approvals_words(a: &Value) -> String {
     a["need"].as_i64().map(|n| format!(" · {} of {n} approval{}", have.min(n), if n == 1 { "" } else { "s" })).unwrap_or_default()
 }
 
+/// The board watching the PR between visits: since the agent last handed it back, when known.
+fn watching_line(w: &Value) -> Option<String> {
+    if !w.is_object() {
+        return None;
+    }
+    Some(match w["since"].as_str() {
+        Some(at) => format!("Watching since {}: the board brings the agent back when the PR needs it", local_when(at)),
+        None => "Watching: the board brings the agent back when the PR needs it".to_string(),
+    })
+}
+
 fn print_pr_status(t: &str, v: &Value) {
     let pr = &v["pr"];
     let live = &v["live"];
     out(&format!("{t} · PR #{} · {}", pr["num"], pr["url"].as_str().unwrap_or("")));
     if let Some(stage) = pr["stage"]["label"].as_str() {
         out(&format!("Stage: {stage}"));
+    }
+    if let Some(w) = watching_line(&v["watching"]) {
+        out(&w);
     }
     out(&format!("State: {} · checks: {} · review: {}", pr["state"].as_str().unwrap_or("?"), pr["checks"].as_str().unwrap_or("unknown"), review_words(pr)));
     if let Some(e) = live["read_error"].as_str() {
@@ -2408,7 +2492,10 @@ fn print_pr_status(t: &str, v: &Value) {
                     out(&format!("      couldn't read its steps: {e}"));
                 }
                 if let Some(e) = f["tests_error"].as_str() {
-                    out(&format!("      couldn't read its tests: {e}"));
+                    out(&format!("      test results unreadable: {e}"));
+                }
+                for s in f["stages"].as_array().cloned().unwrap_or_default() {
+                    out(&format!("      {}", s.as_str().unwrap_or("")));
                 }
             }
         }
@@ -2541,6 +2628,14 @@ fn pr_check_line(v: &Value) -> String {
 }
 
 /// `tb qa on|off|settings`: whether QA comments are read, from `GET`/`POST /qa`.
+fn buried_questions_line(v: &Value) -> &'static str {
+    if v["on"] == false {
+        "Buried questions are let through: a reply that asks the owner something above its last paragraph ends its turn as it is."
+    } else {
+        "Buried questions are sent back: a task's reply that asks the owner something above its last paragraph is sent back once to ask it with tb question or a final Questions block."
+    }
+}
+
 fn qa_settings_line(v: &Value) -> String {
     if v["on"] != true {
         return if v["jira"] == true { "QA comments are off.".into() } else { "QA comments are off. They need Jira: set up [jira] in the board's config first.".into() };
@@ -2638,6 +2733,35 @@ fn question_unconfirmed(e: CallError, owner: &str) -> String {
         ),
         e => unanswered(e, ""),
     }
+}
+
+/// How an agent finds a task it asked for once the board has it: `tb search` by its title, in every
+/// project since a goal's task lands in the goal's.
+fn find_new_task(title: &str, human: bool) -> String {
+    let words = if title.trim().is_empty() { "<words from its title>" } else { title };
+    let kind = if human { " --kind human" } else { "" };
+    format!("tb search \"{words}\" --all{kind}")
+}
+
+/// A `tb task new` the board took but didn't confirm (#965). It goes on with the request after tb stops
+/// waiting, and skips a saved copy of one it already has, so saving it would only claim the board is down.
+fn new_task_unconfirmed(e: CallError, title: &str, human: bool) -> String {
+    match e {
+        CallError::TimedOut(e) => format!(
+            "the board went quiet for {TB_TIMEOUT}s before it confirmed the task ({e}). It has the request and may still add it, \
+             so don't run tb task new again yet: in a minute, look for it with {} and run it again only if it isn't there.",
+            find_new_task(title, human)
+        ),
+        e => unanswered(e, ""),
+    }
+}
+
+/// A human task saved while the board is down gets its H id only once the board is back.
+fn human_task_saved(title: &str) -> String {
+    format!(
+        "{SAVED} The human task gets its H id then: once tb status answers, find it with {} and tb wait-for H<n> on it.",
+        find_new_task(title, true)
+    )
 }
 
 fn out(line: &str) {
@@ -2742,6 +2866,65 @@ fn item_task(c: &Ctx, issue: &str) -> Result<String, String> {
     Ok(t)
 }
 
+/// The backlog refs (`B12`) a task's detail names, each once, in order: a `B` and digits standing as a word
+/// of their own, not inside a longer one (`AB12`, `B12x`).
+fn detail_issue_refs(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut refs: Vec<String> = vec![];
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == 'B' && (i == 0 || !word(chars[i - 1])) {
+            let end = (i + 1..chars.len()).find(|&j| !chars[j].is_ascii_digit()).unwrap_or(chars.len());
+            if end > i + 1 && (end == chars.len() || !word(chars[end])) {
+                let r: String = chars[i..end].iter().collect();
+                if !refs.contains(&r) {
+                    refs.push(r);
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    refs
+}
+
+/// The warning for open backlog issues a task's detail names but doesn't link (`open`, in order), with the
+/// command that links them; None when there are none.
+fn unlinked_text(task: &str, open: &[String]) -> Option<String> {
+    if open.is_empty() {
+        return None;
+    }
+    let them = if open.len() == 1 { "it" } else { "them" };
+    let flags: Vec<String> = open.iter().map(|r| format!("--issue {r}")).collect();
+    Some(format!(
+        "Note: the detail names {} without linking {them}, so finishing {task} won't close {them}. If {task} fixes {them}: tb task set {task} {}",
+        open.join(", "),
+        flags.join(" ")
+    ))
+}
+
+/// After `tb task new` or `tb task set --detail`: says which open backlog issues in the task's project its
+/// detail names without linking them, and how to link them. Quiet when the board can't say.
+fn unlinked_note(c: &Ctx, task: &str, detail: Option<&str>, linked: &[String]) {
+    let refs: Vec<String> = detail.map(detail_issue_refs).unwrap_or_default().into_iter().filter(|r| !linked.contains(r)).collect();
+    if refs.is_empty() || task.is_empty() {
+        return;
+    }
+    let Ok(t) = c.call("GET", &format!("/tasks/{task}"), None) else { return };
+    let open: Vec<String> = refs
+        .into_iter()
+        .filter(|r| {
+            c.call("GET", &format!("/backlog/{r}"), None)
+                .is_ok_and(|b| b["state"] == "open" && b["project"] == t["project"])
+        })
+        .collect();
+    if let Some(line) = unlinked_text(task, &open) {
+        out(&line);
+    }
+}
+
 fn issue_ref(v: &str) -> Result<String, String> {
     let s = v.trim();
     let digits = s.trim_start_matches(['B', 'b']);
@@ -2749,6 +2932,22 @@ fn issue_ref(v: &str) -> Result<String, String> {
         return Err(format!("expected B<number>, got {v:?}"));
     }
     Ok(format!("B{digits}"))
+}
+
+/// The Midna terminal tb runs in, whoever runs it: Midna's status bar runs `tb peek` there with no agent.
+fn midna_terminal() -> String {
+    std::env::var("MIDNA_SESSION").unwrap_or_default()
+}
+
+fn run_by_claude() -> bool {
+    ["CLAUDECODE", "CLAUDE_CODE_SESSION_ID"].iter().any(|k| std::env::var(k).is_ok_and(|v| !v.is_empty()))
+}
+
+/// The terminal tb reports and acts as: its Midna terminal, but only when Claude Code runs it there. A tb
+/// typed into a plain shell (one an agent opened and types into, or a human's) speaks for no terminal, so
+/// the board doesn't take that shell for a Claude terminal or give it a task.
+fn own_terminal(midna: String, by_claude: bool) -> String {
+    if by_claude { midna } else { String::new() }
 }
 
 struct Ctx {
@@ -2763,7 +2962,7 @@ struct Ctx {
 
 impl Ctx {
     fn new() -> Ctx {
-        let session = std::env::var("MIDNA_SESSION").unwrap_or_default();
+        let session = own_terminal(midna_terminal(), run_by_claude());
         Ctx {
             cfg: client::config(),
             midna: if session.is_empty() { None } else { client::midna_path() },
@@ -2816,16 +3015,17 @@ impl Ctx {
         b
     }
 
-    /// Posts a report; spools it when the board can't be reached. None = spooled.
+    /// Posts a report; spools it when the board can't be reached. None = spooled. One the board took but
+    /// didn't answer in time isn't spooled: it may have applied it, so a replay could do it twice.
     fn report(&self, event: &str, fields: Value, task: Option<&str>, timeout: f64) -> Result<Option<Value>, String> {
         let body = self.body(event, fields, task);
         match client::request(&self.cfg, "POST", "/report", Some(&body), timeout) {
             Ok(v) => Ok(Some(v)),
-            Err(CallError::Refused(m)) => Err(m),
-            Err(CallError::Unreachable(_) | CallError::TimedOut(_)) => {
+            Err(CallError::Unreachable(_)) => {
                 client::spool_write(&self.cfg, &body).map_err(|e| format!("the board isn't answering and the report couldn't be saved: {e}"))?;
                 Ok(None)
             }
+            Err(e) => Err(unanswered(e, &format!("didn't answer within {timeout}s"))),
         }
     }
 
@@ -2880,9 +3080,18 @@ impl Ctx {
     /// A long command on the board's progress stream: prints each stage as the board finishes it, and
     /// only gives up when the board goes quiet for `TB_TIMEOUT` (a stage that hangs).
     fn call_progress(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+        self.call_progress_with(method, path, body, |stage| out(&format!("· {stage}")))
+    }
+
+    /// `call_progress` for a relay's command (`tb stream send`, `tb feed event`): the relay parses its
+    /// stdout, so the stages go to stderr.
+    fn call_relay(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+        self.call_progress_with(method, path, body, |stage| eprintln!("· {stage}"))
+    }
+
+    fn call_progress_with(&self, method: &str, path: &str, body: Option<Value>, on_stage: impl FnMut(&str)) -> Result<Value, String> {
         let body = self.credited_here(method, body);
-        client::request_progress(&self.cfg, method, path, body.as_ref(), TB_TIMEOUT, |stage| out(&format!("· {stage}")))
-            .map_err(|e| unanswered(e, &format!("went quiet for {TB_TIMEOUT}s")))
+        client::request_progress(&self.cfg, method, path, body.as_ref(), TB_TIMEOUT, on_stage).map_err(|e| unanswered(e, &format!("went quiet for {TB_TIMEOUT}s")))
     }
 
     /// A change names this terminal (`by_session`), so the board credits it here rather than to the owner.
@@ -2930,8 +3139,12 @@ impl Ctx {
 fn reviewer_state(r: &Value) -> String {
     let again = &r["rereview"];
     let st = r["state"].as_str().unwrap_or("");
-    if again.is_object() && !matches!(st, "approved" | "commented") {
-        let was = if st == "changes" { "asked for changes, " } else { "" };
+    if again.is_object() && st != "approved" {
+        let was = match st {
+            "changes" => "asked for changes, ",
+            "commented" => "commented, ",
+            _ => "",
+        };
         return match again["at"].as_str() {
             _ if again["queued"] == true => format!("{was}re-review queued (the board asks once the rate limit is over)"),
             Some(at) => format!("{was}asked to look again {}", local_when(at)),
@@ -3091,6 +3304,32 @@ fn schedule_start(c: &Ctx, task: &str, at: &str) -> Result<i32, String> {
 /// After `tb submit` or `tb fail`: the next task in this terminal's line, which the agent carries on with.
 /// What `tb start T<n>` did, from the task the board sends back: a `task.starting` hook may have
 /// skipped it, so it's only "opening" when the board says it's starting.
+/// `tb start T4 T5 T6`: each task starts on the human's word, all or none (the board checks every one first).
+fn start_several(c: &Ctx, refs: &[String], queue: bool, now: bool, at: bool) -> Result<i32, String> {
+    if refs.iter().any(|r| !r.trim().starts_with(['T', 't'])) {
+        return Err("tb start takes several tasks (T<n>), not goals or backlog items: start a goal or an item on its own.".into());
+    }
+    if now {
+        return Err("--now only applies to a goal (tb start G<n> --now).".into());
+    }
+    if at {
+        return Err("--at schedules one at a time: run tb start T<n> --at <time> for each.".into());
+    }
+    let mut refs = refs.iter().map(|r| task_ref(r)).collect::<Result<Vec<_>, _>>()?;
+    let mut seen = std::collections::HashSet::new();
+    refs.retain(|r| seen.insert(r.clone()));
+    if c.session.is_empty() {
+        return Err(format!("tb start only works in a Midna terminal, on a human's word there. A human can press Start on {} on the board.", refs.join(", ")));
+    }
+    let mode = if queue { "queue" } else { "new" };
+    let v = c.call_progress("POST", "/tasks/start", Some(json!({"tasks": refs, "mode": mode, "via_session": c.session})))?;
+    for (r, t) in refs.iter().zip(v["tasks"].as_array().into_iter().flatten()) {
+        out(&start_said(r, queue, t));
+    }
+    print_wait_line(&v);
+    Ok(0)
+}
+
 fn start_said(r: &str, queue: bool, v: &Value) -> String {
     let status = v["status"].as_str().unwrap_or("");
     let why = v["summary"].as_str().or(v["latest"].as_str()).filter(|s| !s.is_empty());
@@ -3111,6 +3350,13 @@ fn start_said(r: &str, queue: bool, v: &Value) -> String {
 
 fn then_next(v: &Value) -> String {
     v["context"].as_str().filter(|c| !c.trim().is_empty()).map(|c| format!("\n\n{c}")).unwrap_or_default()
+}
+
+/// The `tb wait-for` line the board sends when the tasks this terminal made or started name its own task.
+fn print_wait_line(v: &Value) {
+    if let Some(l) = v["wait_line"].as_str().filter(|l| !l.trim().is_empty()) {
+        out(&format!("\n{l}"));
+    }
 }
 
 fn print_warnings(v: &Value) {
@@ -3338,6 +3584,38 @@ fn review_cmd(c: &Ctx, target: Option<String>, since: Option<String>, week: Opti
     Ok(0)
 }
 
+/// `tb review <n> --file-again`: file kept review n's suggested fixes as backlog issues again.
+fn review_file_again(c: &Ctx, target: &str) -> Result<i32, String> {
+    if target.is_empty() || !target.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("--file-again takes a kept review's number: tb review 12 --file-again (tb review --list shows them).".into());
+    }
+    let v = c.call("POST", &format!("/reviews/{target}/fixes"), Some(json!({})))?;
+    out(&file_again_line(target, &v));
+    Ok(0)
+}
+
+/// What filing again did: still going, filed, or why it failed.
+fn file_again_line(target: &str, v: &Value) -> String {
+    let f = &v["fixes"];
+    let refs = |k: &str| f[k].as_array().into_iter().flatten().filter_map(|x| x.as_str()).collect::<Vec<_>>();
+    match f["state"].as_str().unwrap_or("") {
+        "running" => format!("Filing review {target}'s fixes as backlog issues; the review page shows them when they're in."),
+        "failed" => format!("Couldn't file review {target}'s fixes: {}.", f["error"].as_str().unwrap_or("no reason given").trim_end_matches('.')),
+        _ => {
+            let (filed, linked) = (refs("filed"), refs("linked"));
+            if filed.is_empty() && linked.is_empty() {
+                format!("Review {target} has no fixes to file.")
+            } else {
+                let mut s = format!("Review {target}'s fixes are in the backlog: {}", if filed.is_empty() { "none filed".to_string() } else { filed.join(", ") });
+                if !linked.is_empty() {
+                    s += &format!("; linked {}", linked.join(", "));
+                }
+                s + "."
+            }
+        }
+    }
+}
+
 /// Seconds as "2.5 h", "14 min" or "40 s".
 fn took(secs: f64) -> String {
     let secs = secs.abs();
@@ -3483,12 +3761,12 @@ fn finding_cmd(c: &Ctx, task: String, finding: Option<String>, outcome: Option<S
         if left.is_empty() {
             out("Every finding has an outcome.");
         } else {
-            out(&format!("Left: {}. Mark each: tb finding {task} <id> fix|backlog|dismiss \"<reason>\"", left.join(", ")));
+            out(&format!("Left: {}. Mark each: tb finding {task} <id> fix|dismiss \"<reason>\", or backlog --blocks none|pr|goal \"<reason>\"", left.join(", ")));
         }
         return Ok(0);
     };
     let Some(outcome) = outcome else {
-        return Err(format!("Say what to do with it: tb finding {task} {finding} fix|backlog|dismiss \"<reason>\""));
+        return Err(format!("Say what to do with it: tb finding {task} {finding} fix|dismiss \"<reason>\", or backlog --blocks none|pr|goal \"<reason>\""));
     };
     let reason = reason.join(" ");
     if reason.trim().is_empty() && outcome == "fixed" {
@@ -3727,14 +4005,39 @@ fn slot_claim(c: &Ctx, t: &str, bring: Option<Vec<String>>, hunks: &[String]) ->
     if !hunks.is_empty() {
         body["bring_hunk"] = json!(hunks.iter().map(|h| if h == "none" { h.clone() } else { here.join(h).to_string_lossy().to_string() }).collect::<Vec<_>>());
     }
-    let v = c.call("POST", &format!("/tasks/{t}/slot/claim"), Some(body))?;
-    out(&slot_claimed(t, &v));
+    let bringing = body.get("bring").is_some() || body.get("bring_hunk").is_some();
+    let body = c.credited_here("POST", Some(body));
+    let claimed = client::request_progress(&c.cfg, "POST", &format!("/tasks/{t}/slot/claim"), body.as_ref(), TB_TIMEOUT, |stage| out(&format!("· {stage}")));
+    let quiet = format!("went quiet for {TB_TIMEOUT}s");
+    match claimed {
+        Ok(v) => out(&slot_claimed(t, &v)),
+        Err(e @ CallError::TimedOut(_)) => match c.call("GET", &format!("/tasks/{t}/slot"), None) {
+            Ok(v) if v["path"].is_string() => out(&claimed_quietly(t, &v, bringing)),
+            _ => return Err(unanswered(e, &quiet)),
+        },
+        Err(e) => return Err(unanswered(e, &quiet)),
+    }
     Ok(())
+}
+
+/// A claim the board went quiet on, though the task holds a slot now: that's where it works, so
+/// claiming again would only wait for the same slot.
+fn claimed_quietly(t: &str, v: &Value, bringing: bool) -> String {
+    let (slot, path) = (v["slot"].as_str().unwrap_or(""), v["path"].as_str().unwrap_or(""));
+    let mut line = format!("The board went quiet for {TB_TIMEOUT}s, but {t} holds {slot} ({path}). Work there from now on: cd {path}");
+    if bringing {
+        line += "\nThe files it was bringing may still be on their way: check git status there before carrying on.";
+    }
+    line
 }
 
 fn slot_claimed(t: &str, v: &Value) -> String {
     let path = v["path"].as_str().unwrap_or("");
-    let mut lines = vec![format!("{t} works in {} ({path}). Work there from now on: cd {path}", v["slot"].as_str().unwrap_or(""))];
+    let slot = v["slot"].as_str().unwrap_or("");
+    if v["held"] == true {
+        return format!("{t} already holds {slot} ({path}). Work there: cd {path}");
+    }
+    let mut lines = vec![format!("{t} works in {slot} ({path}). Work there from now on: cd {path}")];
     let list = |k: &str| v[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
     if !list("brought").is_empty() {
         lines.push(format!("Brought from the shared checkout: {} (the patch is kept at {}).", list("brought"), v["patch"].as_str().unwrap_or("")));
@@ -3853,13 +4156,27 @@ fn task_list_line(t: &Value) -> String {
     format!("{:<5}  {:<7}  {:<4}  {}{pr}", t["ref"].as_str().unwrap_or(""), status, goal_word(t), t["title"].as_str().unwrap_or(""))
 }
 
+/// An issue's state as the CLI says it: `fixed` for one closed as fixed, else the board's state.
+fn issue_state_word(b: &Value) -> &str {
+    if b["closed_as"] == "fixed" { "fixed" } else { b["state"].as_str().unwrap_or("") }
+}
+
+/// "Fixed by: T12 (PR #45) https://…" for an issue closed as fixed; nothing for any other.
+fn fixed_line(v: &Value) -> Option<String> {
+    if v["closed_as"] != "fixed" {
+        return None;
+    }
+    let by: Vec<&str> = [v["fixed_by_ref"].as_str(), v["fixed_pr"].as_str()].into_iter().flatten().filter(|s| !s.is_empty()).collect();
+    Some(if by.is_empty() { "Closed as fixed".to_string() } else { format!("Fixed by: {}", by.join(" ")) })
+}
+
 /// "B12  open  bug     G4    Crash on save", for `tb backlog list`.
 fn issue_list_line(b: &Value) -> String {
-    let task = b["task_ref"].as_str().map(|t| format!("  → {t}")).unwrap_or_default();
+    let task = b["task_ref"].as_str().or(b["fixed_by_ref"].as_str()).map(|t| format!("  → {t}")).unwrap_or_default();
     format!(
         "{:<4}  {:<6}  {:<6}  {:<4}  {}{task}",
         b["ref"].as_str().unwrap_or(""),
-        b["state"].as_str().unwrap_or(""),
+        issue_state_word(b),
         b["kind"].as_str().unwrap_or(""),
         goal_word(b),
         b["title"].as_str().unwrap_or("")
@@ -3914,6 +4231,9 @@ fn task_show_lines(v: &Value, n: usize) -> Vec<String> {
     if let Some(l) = task_lane_line(v) {
         lines.push(l);
     }
+    if let Some(n) = v["same_pr"].as_i64() {
+        lines.push(format!("Same PR as: T{n} (shares its branch and PR)"));
+    }
     if let Some(b) = v["pr_base"].as_str().filter(|b| !b.is_empty()) {
         lines.push(format!("PR into: {b}"));
     }
@@ -3964,11 +4284,12 @@ fn model_line(v: &Value) -> Option<String> {
 
 /// `tb backlog show`: GET /backlog/<id> with its history (the board sends it oldest first).
 fn issue_show_lines(v: &Value) -> Vec<String> {
-    let state = format!("{} · {}", v["state"].as_str().unwrap_or(""), v["kind"].as_str().unwrap_or(""));
+    let state = format!("{} · {}", issue_state_word(v), v["kind"].as_str().unwrap_or(""));
     let mut lines = vec![show_head(v, &state), v["title"].as_str().unwrap_or("").to_string()];
     if let Some(t) = v["task_ref"].as_str() {
         lines.push(format!("Task: {t}"));
     }
+    lines.extend(fixed_line(v));
     if let Some(k) = v["jira_key"].as_str().filter(|k| !k.is_empty()) {
         lines.push(format!("Jira: {k}"));
     }
@@ -4200,7 +4521,14 @@ fn idea_cmd(c: &Ctx, action: IdeaCmd) -> Result<i32, String> {
             }
             (post(idea_ref(&idea)?, b)?, "Changed")
         }
-        IdeaCmd::Note { idea, text } => (post(format!("{}/note", idea_ref(&idea)?), json!({"text": text}))?, "Noted on"),
+        IdeaCmd::Note { idea, text, round, question } => {
+            let mut b = json!({"text": text});
+            if let (Some(r), Some(q)) = (round, question) {
+                b["round"] = json!(r);
+                b["question"] = json!(q);
+            }
+            (post(format!("{}/note", idea_ref(&idea)?), b)?, "Noted on")
+        }
         IdeaCmd::Drop { idea, reason } => (post(format!("{}/drop", idea_ref(&idea)?), json!({"reason": reason}))?, "Dropped"),
         IdeaCmd::Shelve { idea, reason } => (post(format!("{}/shelve", idea_ref(&idea)?), json!({"reason": reason}))?, "Shelved"),
         IdeaCmd::Reopen { idea } => (post(format!("{}/reopen", idea_ref(&idea)?), json!({}))?, "Reopened"),
@@ -4208,6 +4536,8 @@ fn idea_cmd(c: &Ctx, action: IdeaCmd) -> Result<i32, String> {
             (post(format!("{}/dig", idea_ref(&idea)?), json!({"focus": focus, "web": web}))?, "Digging into")
         }
         IdeaCmd::Plan { idea } => (post(format!("{}/plan", idea_ref(&idea)?), json!({}))?, "Planning"),
+        IdeaCmd::Stop { idea } => (post(format!("{}/stop", idea_ref(&idea)?), json!({}))?, "Stopped the dig on"),
+        IdeaCmd::Unplan { idea } => (post(format!("{}/unplan", idea_ref(&idea)?), json!({}))?, "Un-planned"),
     };
     if !did.is_empty() {
         out(&format!("{did} {}.", v["ref"].as_str().unwrap_or("")));
@@ -4353,6 +4683,13 @@ fn needs_cmd(c: &Ctx, cmd: crate::needs::NeedsCmd) -> Result<i32, String> {
         return Ok(0);
     }
     let items = needs::items(&home, None);
+    if let NeedsCmd::Done { items: handles, note } = &cmd {
+        let (path, body) = needs::done_request(&items, handles, note.as_deref(), &c.session)?;
+        let v = c.call("POST", &path, Some(body))?;
+        let done: Vec<String> = v["done"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(str::to_string)).collect();
+        out(&needs::marked_done_line(&done));
+        return Ok(0);
+    }
     let item = needs::find(&items, needs::handle_of(&cmd).unwrap_or(""))?;
     let (path, body) = match &cmd {
         NeedsCmd::Show { .. } => {
@@ -4400,6 +4737,9 @@ fn pending_line(p: &Value) -> String {
         })
         .collect();
     let state = if p["running"] == true { "cutting now" } else { "pending" };
+    if after.is_empty() {
+        return format!("{} · {state}", p["name"].as_str().unwrap_or(""));
+    }
     format!("{} · {state} · after {}", p["name"].as_str().unwrap_or(""), after.join(", "))
 }
 
@@ -4419,17 +4759,18 @@ fn release_groups(v: &Value) {
 
 enum ReleaseCut {
     Cut(Value),
-    /// The release script's exit status: nothing was recorded.
-    ScriptFailed(i32),
+    /// The board took the cut and runs the release script in the background: its pending cut.
+    Started(Value),
 }
 
 /// `tb release cut`: unless `no_script`, asks the board whether the cut would go through (Unreleased
-/// isn't empty, the name is free) and for the project's release script, runs the script with the
-/// release name, and records the release only when it exits 0. `call` posts to /releases; `run` runs
-/// a script (command, release name, folder, whether it replaces a failed release) and gives its exit status.
+/// isn't empty, the name is free) and for the project's release script. With a script, checks the
+/// checkout's branch and hands the cut to the board, which runs the script in the background and records
+/// the release only when it exits 0; without one, records the release. `call` posts to /releases;
+/// `branch_ok` checks the checkout the script would run in.
 fn cut_release(
     call: &mut dyn FnMut(Value) -> Result<Value, String>,
-    run: &mut dyn FnMut(&str, &str, Option<&str>, bool) -> Result<i32, String>,
+    branch_ok: &mut dyn FnMut(Option<&str>) -> Result<(), String>,
     mut body: Value,
     no_script: bool,
 ) -> Result<ReleaseCut, String> {
@@ -4437,25 +4778,148 @@ fn cut_release(
         let mut check = body.clone();
         check["check"] = json!(true);
         let v = call(check)?;
-        if let Some(script) = v["script"].as_str() {
-            let started = std::time::Instant::now();
-            let code = run(script, v["name"].as_str().unwrap_or(""), v["dir"].as_str(), v["replaces"] == true)?;
-            if code != 0 {
-                return Ok(ReleaseCut::ScriptFailed(code));
-            }
-            // The board looks for the run the script's tag started from then on.
-            body["script_secs"] = json!(started.elapsed().as_secs_f64());
+        if v["script"].is_string() {
+            branch_ok(v["dir"].as_str())?;
+            body["now"] = json!(true);
+            return call(body).map(ReleaseCut::Started);
         }
     }
     call(body).map(ReleaseCut::Cut)
 }
 
-/// The CI run the release started, waiting up to a minute for the board to find it; none when the
+/// Where a background cut called `name` stands in a `GET /releases` list.
+#[derive(Debug, PartialEq)]
+enum CutState {
+    /// Still pending or running: the pending cut.
+    Running(Value),
+    /// Recorded: the release.
+    Done(Value),
+    /// The board dropped it: what it kept of why.
+    Dropped(Value),
+    /// None of those, as when it was cancelled before it ran.
+    Gone,
+}
+
+fn cut_state(list: &Value, name: &str) -> CutState {
+    let named = |v: &Value| v["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name));
+    if named(&list["pending"]) {
+        return CutState::Running(list["pending"].clone());
+    }
+    if named(&list["dropped"]) {
+        return CutState::Dropped(list["dropped"].clone());
+    }
+    match list["releases"].as_array().into_iter().flatten().find(|r| named(r) && !r["failed_at"].is_string()) {
+        Some(r) => CutState::Done(r.clone()),
+        None => CutState::Gone,
+    }
+}
+
+/// The lines of a running cut's log not printed yet, given how many of its `log_lines` were.
+fn new_log_lines(p: &Value, seen: usize) -> Vec<String> {
+    let log: Vec<String> = p["log"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(str::to_string)).collect();
+    let fresh = (p["log_lines"].as_u64().unwrap_or(0) as usize).saturating_sub(seen).min(log.len());
+    log[log.len() - fresh..].to_vec()
+}
+
+/// How long `tb release cut` follows a background cut before leaving it to `tb release status`, kept
+/// with the run lookup under the two minutes an agent's command gets.
+const CUT_FOLLOW_SECS: u64 = 75;
+
+/// Follows the background cut `name` for `CUT_FOLLOW_SECS`, printing its script's output as it comes: the
+/// release once it's recorded, why it dropped (exit 1), or where to look next while it still runs.
+fn follow_cut(c: &Ctx, project: Option<String>, name: &str) -> Result<i32, String> {
+    let q = release_project_query(c, project);
+    let started = std::time::Instant::now();
+    let mut seen = 0;
+    loop {
+        let v = c.call("GET", &format!("/releases?{q}&limit=5"), None)?;
+        match cut_state(&v, name) {
+            CutState::Running(p) => {
+                for l in new_log_lines(&p, seen) {
+                    out(&format!("  {l}"));
+                }
+                seen = seen.max(p["log_lines"].as_u64().unwrap_or(0) as usize);
+            }
+            CutState::Done(r) => {
+                let r = c.call("GET", &format!("/releases/{}", r["ref"].as_str().unwrap_or("")), None).unwrap_or(r);
+                out(&format!("Cut {}.", release_line(&r)));
+                release_groups(&r);
+                if let Some(url) = release_run(c, &r, 15) {
+                    out(&format!("Release run: {url}"));
+                }
+                return Ok(0);
+            }
+            CutState::Dropped(d) => {
+                eprintln!("tb: {name} didn't go out: {}. Fix it and run {} again.", d["why"].as_str().unwrap_or("the board dropped it"), d["next"].as_str().unwrap_or("tb release cut"));
+                return Ok(1);
+            }
+            CutState::Gone => return Err(format!("{name} isn't pending any more and no release by that name went out. tb releases shows where things stand.")),
+        }
+        if started.elapsed().as_secs() >= CUT_FOLLOW_SECS {
+            out(&format!("{name} is still being cut; release scripts can take several minutes. Don't cut it again: follow it with tb release status."));
+            return Ok(0);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+/// `tb release status`: the project's cut while one runs or waits, else why the last one dropped (exit 1),
+/// else the last release.
+fn release_status(c: &Ctx, project: Option<String>) -> Result<i32, String> {
+    let v = c.call("GET", &format!("/releases?{}&limit=1", release_project_query(c, project)), None)?;
+    let name = v["project"].as_str().unwrap_or("");
+    if v["on"] != true {
+        return Err(format!("releases are off for {name}. Turn them on with: tb project set {name} --releases on"));
+    }
+    for l in status_lines(&v) {
+        out(&l);
+    }
+    Ok(if v["pending"].is_object() || !v["dropped"].is_object() { 0 } else { 1 })
+}
+
+fn status_lines(v: &Value) -> Vec<String> {
+    let p = &v["pending"];
+    if p.is_object() && p["now"] == true {
+        let name = p["name"].as_str().unwrap_or("");
+        let mut lines = vec![match p["running_at"].as_str() {
+            Some(at) => format!("{name} · cutting now · started {}", match crate::needs::ago(at).as_str() {
+                "now" => "just now".to_string(),
+                a => format!("{a} ago"),
+            }),
+            None => format!("{name} · starting"),
+        }];
+        lines.extend(p["log"].as_array().into_iter().flatten().filter_map(|l| l.as_str()).map(|l| format!("  {l}")));
+        lines.push("Still going: check again in a minute. Don't cut it again.".into());
+        return lines;
+    }
+    if p.is_object() {
+        return vec![pending_line(p)];
+    }
+    let d = &v["dropped"];
+    if d.is_object() {
+        return vec![
+            format!("{} didn't go out: {}", d["name"].as_str().unwrap_or(""), d["why"].as_str().unwrap_or("the board dropped it")),
+            format!("Fix it and cut it again with: {}", d["next"].as_str().unwrap_or("tb release cut")),
+        ];
+    }
+    match v["releases"].as_array().and_then(|r| r.first()) {
+        Some(r) => {
+            let mut lines = vec![format!("Last release: {}", release_line(r))];
+            if let Some(u) = r["run_url"].as_str() {
+                lines.push(format!("  Run: {u}"));
+            }
+            lines
+        }
+        None => vec!["No release yet.".into()],
+    }
+}
+
+/// The CI run the release started, waiting up to `tries` 2-second polls for the board to find it; none when the
 /// board isn't looking for one (the project isn't on GitHub) or doesn't find it in time.
-fn release_run(c: &Ctx, v: &Value) -> Option<String> {
+fn release_run(c: &Ctx, v: &Value, tries: usize) -> Option<String> {
     let r = v["ref"].as_str()?;
     let mut v = v.clone();
-    for _ in 0..30 {
+    for _ in 0..tries {
         if let Some(url) = v["run_url"].as_str() {
             return Some(url.to_string());
         }
@@ -4500,36 +4964,9 @@ fn checkout_branch(top: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Runs a project's release script in its checkout with the release name as its one argument and in
-/// TB_RELEASE (so the script can tell tb started it), its output going straight to this terminal. When
-/// the name's last release failed, TB_RELEASE_REPLACE=1 tells the script it may replace that one's tag.
-fn run_release_script(script: &str, name: &str, dir: Option<&str>, replaces: bool) -> Result<i32, String> {
-    let top = release_checkout(dir);
-    out(&format!("Running the release script in {top}: {script} {name}"));
-    let mut cmd = std::process::Command::new(taskboardd::proc::sh());
-    taskboardd::proc::bash_args(&mut cmd, ["-c", &format!("{script} \"$1\""), "sh", name]);
-    cmd.current_dir(&top).env("TB_RELEASE", name).env_remove("TB_RELEASE_REPLACE");
-    if replaces {
-        cmd.env("TB_RELEASE_REPLACE", "1");
-    }
-    let status = cmd
-        .stdin(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("couldn't start the release script: {e}"))?;
-    // Killed by a signal: no code, so say 1.
-    Ok(status.code().unwrap_or(1))
-}
-
-/// `tb release cut`'s runner: the release script, once the checkout is on main or a release/* branch
-/// and fast-forwarded to origin's copy of it, so the release is cut from the latest.
-fn run_release_script_on_a_release_branch(script: &str, name: &str, dir: Option<&str>, replaces: bool) -> Result<i32, String> {
-    let top = release_checkout(dir);
-    let branch = checkout_branch(&top);
-    need_release_branch(&branch)?;
-    if let Some(did) = taskboardd::default_sync::catch_up(&top, &branch).map_err(|e| format!("{e}."))? {
-        out(&format!("{did}."));
-    }
-    run_release_script(script, name, dir, replaces)
+/// Whether the checkout a release script would run in is on main or a release/* branch.
+fn release_branch_ok(dir: Option<&str>) -> Result<(), String> {
+    need_release_branch(&checkout_branch(&release_checkout(dir)))
 }
 
 fn release_cmd(c: &Ctx, action: ReleaseCmd) -> Result<i32, String> {
@@ -4545,21 +4982,23 @@ fn release_cmd(c: &Ctx, action: ReleaseCmd) -> Result<i32, String> {
             out(&format!("Cancelled the pending cut {}.", v["name"].as_str().unwrap_or("")));
         }
         ReleaseCmd::Cut { name, project, notes, no_script, .. } => {
-            let body = json!({"name": name, "project": project, "notes": notes, "cwd": c.cwd});
-            match cut_release(&mut |b| c.call("POST", "/releases", Some(b)), &mut run_release_script_on_a_release_branch, body, no_script)? {
+            let body = json!({"name": name, "project": project.clone(), "notes": notes, "cwd": c.cwd});
+            match cut_release(&mut |b| c.call("POST", "/releases", Some(b)), &mut release_branch_ok, body, no_script)? {
                 ReleaseCut::Cut(v) => {
                     out(&format!("Cut {}.", release_line(&v)));
                     release_groups(&v);
-                    if let Some(url) = release_run(c, &v) {
+                    if let Some(url) = release_run(c, &v, 30) {
                         out(&format!("Release run: {url}"));
                     }
                 }
-                ReleaseCut::ScriptFailed(code) => {
-                    eprintln!("tb: the release script exited {code}, so {name} isn't recorded. Fix it and run tb release cut again.");
-                    return Ok(code);
+                ReleaseCut::Started(p) => {
+                    let name = p["name"].as_str().unwrap_or(&name).to_string();
+                    out(&format!("The board is cutting {name} in the background; it runs the release script and records the release once it succeeds."));
+                    return follow_cut(c, project, &name);
                 }
             }
         }
+        ReleaseCmd::Status { project } => return release_status(c, project),
         ReleaseCmd::Show { release, project, markdown } => {
             let r = release_ref(&release)?;
             let v = c.call("GET", &format!("/releases/{r}?{}", release_project_query(c, project)), None)?;
@@ -4787,6 +5226,30 @@ fn attach_target(url: &str, cwd: &str) -> Result<String, String> {
         return Err(format!("no such file: {}", path.display()));
     }
     Ok(taskboardd::util::canonical(&path).unwrap_or(path).to_string_lossy().to_string())
+}
+
+/// The most `tb attach --copy` reads; a page past it is refused rather than cut.
+const ATTACH_COPY_BYTES: u64 = 2 * 1024 * 1024;
+
+/// What `tb attach --copy <file>` sends: the file's text, for a link only.
+fn attach_copy(url: &str, file: &str, cwd: &str) -> Result<String, String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("--copy is for a link: the board reads an attached file itself".into());
+    }
+    let path = match file.strip_prefix("~/") {
+        Some(rest) => std::path::Path::new(&std::env::var("HOME").unwrap_or_default()).join(rest),
+        None => std::path::Path::new(cwd).join(file),
+    };
+    let meta = std::fs::metadata(&path).map_err(|_| format!("no such file: {}", path.display()))?;
+    if meta.len() > ATTACH_COPY_BYTES {
+        return Err(format!("{} is over 2 MB: give a copy of its text", path.display()));
+    }
+    let text = std::fs::read(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
+    let text = String::from_utf8(text).map_err(|_| format!("{} isn't text", path.display()))?;
+    if text.trim().is_empty() {
+        return Err(format!("{} is empty", path.display()));
+    }
+    Ok(text)
 }
 
 fn close_done_line(n: i64) -> String {
@@ -5918,7 +6381,7 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                     }
                     match v["task"].as_str() {
                         Some(t) => out(&format!("Asked {owner} on {t}; the task now waits for the answer.")),
-                        None => out(NO_TASK),
+                        None => out(&format!("Asked {owner}; wait here for their answer.")),
                     }
                     Ok(0)
                 }
@@ -5932,8 +6395,13 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
         Cmd::Withdraw { why, t } => c.run_report("tb.withdraw", json!({"why": why}), t.task, true, |v| {
             format!("Withdrew the question on {}; it's no longer waiting on {}.", v["task"].as_str().unwrap_or("the task"), c.cfg.owner)
         }),
-        Cmd::Submit { summary, pr, pr_body, pr_title, pr_branch, pr_base, no_pr, no_evidence, merged_note, human, t } => {
-            let mut f = json!({"summary": summary, "pr": pr, "human": human, "no_pr": no_pr, "no_evidence": no_evidence, "merged_note": merged_note});
+        Cmd::Submit { summary, pr, pr_body, pr_title, pr_branch, pr_base, no_pr, no_evidence, merged_note, human, fixes, t } => {
+            let mut f = json!({"summary": summary, "pr": pr, "human": human, "no_pr": no_pr, "no_evidence": no_evidence, "merged_note": merged_note,
+                               "fixes": issue_refs(&fixes)?});
+            let closes = match issue_refs(&fixes)? {
+                f if f.is_empty() => String::new(),
+                f => format!(" {} close{} as fixed once it ships.", f.join(", "), if f.len() == 1 { "s" } else { "" }),
+            };
             let Some(file) = pr_body else {
                 // The board runs the task.finishing hooks and checks the diff before it answers.
                 let task = t.task.map(|x| task_ref(&x)).transpose()?;
@@ -5941,7 +6409,7 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                     None => out(SAVED),
                     Some(v) if !v["task"].is_string() => out(NO_TASK),
                     Some(v) if v["code_review"] == true => out(v["message"].as_str().unwrap_or("")),
-                    Some(v) => out(&format!("{} is submitted.{}", v["task"].as_str().unwrap_or(""), then_next(&v))),
+                    Some(v) => out(&format!("{} is submitted.{closes}{}", v["task"].as_str().unwrap_or(""), then_next(&v))),
                 }
                 return Ok(0);
             };
@@ -5975,7 +6443,7 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                 return Ok(0);
             }
             let pr = v["pr_url"].as_str().map(|u| format!(" Its PR: {u}")).unwrap_or_default();
-            out(&format!("{} is submitted.{pr}{}", v["task"].as_str().unwrap_or(""), then_next(&v)));
+            out(&format!("{} is submitted.{pr}{closes}{}", v["task"].as_str().unwrap_or(""), then_next(&v)));
             Ok(0)
         }
         Cmd::Fail { reason, t } => {
@@ -6018,6 +6486,10 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
             Ok(0)
         }
         Cmd::Start { task, queue, now, at } => {
+            if task.len() > 1 {
+                return start_several(c, &task, queue, now, at.is_some());
+            }
+            let task = task.into_iter().next().unwrap_or_default();
             if let Some(at) = at {
                 return schedule_start(c, &task, &at);
             }
@@ -6050,6 +6522,7 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
             let mode = if queue { "queue" } else { "new" };
             let v = c.call_progress("POST", &format!("/tasks/{r}/start"), Some(json!({"mode": mode, "via_session": c.session})))?;
             out(&start_said(&r, queue, &v));
+            print_wait_line(&v);
             Ok(0)
         }
         Cmd::Preview { url, port } => crate::preview::run(&url, port),
@@ -6061,14 +6534,15 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
         }
         Cmd::Peek { midna } => {
             // whoami, not a tb.status report: a report marks the terminal active and hands it deliveries.
-            if c.session.is_empty() {
+            let terminal = midna_terminal();
+            if terminal.is_empty() {
                 if midna {
                     out("[]");
                     return Ok(0);
                 }
                 return Err("tb peek only works inside a Midna terminal.".into());
             }
-            match c.call("GET", &format!("/whoami?session={}", c.session), None) {
+            match c.call("GET", &format!("/whoami?session={terminal}"), None) {
                 Ok(v) if midna => {
                     let o = taskboardd::statusbar::Options::from_whoami(&v);
                     out(&taskboardd::statusbar::segments(&v, o).to_string())
@@ -6155,7 +6629,12 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
             _ => planning_lessons_cmd(c, project, accept),
         },
         Cmd::Quality { project, all, goals } => quality_cmd(c, project, all, goals),
-        Cmd::Review { target, since, week, save, list } => review_cmd(c, target, since, week, save, list),
+        Cmd::Review { target, since, week, save, list, file_again } => {
+            if file_again {
+                return review_file_again(c, target.as_deref().unwrap_or(""));
+            }
+            review_cmd(c, target, since, week, save, list)
+        }
         Cmd::Lessons { project, all, state, kind } => lessons_cmd(c, project, all, state, kind),
         Cmd::Search { query, project, all, kind, open } => search_cmd(c, &query, project, all, kind, open),
         Cmd::Lesson { action } => lesson_cmd(c, action),
@@ -6206,10 +6685,11 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                 out("No worktree slots yet.");
             }
             for s in slots {
-                let holder = match (s["held_by"].as_str(), s["kept_by"].as_str()) {
-                    (Some(h), _) => format!("held by {h}"),
-                    (None, Some(k)) => format!("kept by {k} (uncommitted changes)"),
-                    (None, None) => "free".into(),
+                let holder = match (s["held_by"].as_str(), s["kept_by"].as_str(), s["busy"].as_str()) {
+                    (Some(h), _, _) => format!("held by {h}"),
+                    (None, Some(k), _) => format!("kept by {k} (uncommitted changes)"),
+                    (None, None, Some(op)) => format!("not free: {op} in progress"),
+                    (None, None, None) => "free".into(),
                 };
                 let used = s["used_at"].as_str().map(|u| format!(" · last used {}", local_when(u))).unwrap_or_default();
                 let size = s["size_kb"].as_i64().map(|k| format!(" · {}", disk_size(k))).unwrap_or_default();
@@ -6237,6 +6717,9 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
             }
             for d in devices {
                 out(&device_line(&d));
+            }
+            for p in v["projects"].as_array().cloned().unwrap_or_default() {
+                out(&format!("{}'s tasks ask for {} unless they or their goal say otherwise", p["name"].as_str().unwrap_or(""), p["needs_text"].as_str().unwrap_or("")));
             }
             for w in v["waiting"].as_array().cloned().unwrap_or_default() {
                 out(&format!("{} {} · needs {} — {}", w["ref"].as_str().unwrap_or(""), w["title"].as_str().unwrap_or(""), w["needs"].as_str().unwrap_or(""), w["why"].as_str().unwrap_or("")));
@@ -6515,6 +6998,14 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                 Ok(0)
             }
         },
+        Cmd::BuriedQuestions { action } => {
+            let v = match action {
+                Some(a) => c.call("POST", "/buried-questions", Some(json!({"on": a == "on"})))?,
+                None => c.call("GET", "/buried-questions", None)?,
+            };
+            out(buried_questions_line(&v));
+            Ok(0)
+        }
         Cmd::Qa { what, r#ref, note, pr, no_pr, limit, goal } => {
             let what = what.unwrap_or_default();
             if matches!(what.as_str(), "on" | "off" | "settings") {
@@ -6610,9 +7101,12 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                 let goal = goal.map(|g| goal_ref(&g)).transpose()?;
                 let also = also.iter().map(|g| goal_ref(g)).collect::<Result<Vec<_>, _>>()?;
                 let title = title.as_deref().map(short_title).transpose()?.unwrap_or_default();
-                let mut body = json!({"title": title, "detail": detail, "goal": goal, "project": project, "planned": planned, "area": area, "not_backlog": not_backlog});
-                if let Some(i) = issue {
-                    body["issue"] = json!(issue_ref(&i)?);
+                let mut body = json!({"title": title, "detail": &detail, "goal": goal, "project": project, "planned": planned, "area": area, "not_backlog": not_backlog});
+                let linked = issue_refs(&issue)?;
+                match linked.as_slice() {
+                    [] => {}
+                    [one] => body["issue"] = json!(one),
+                    many => body["issue"] = json!(many),
                 }
                 if !also.is_empty() {
                     body["also"] = json!(also);
@@ -6692,11 +7186,15 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                 if !bits.is_empty() {
                     body["bits"] = json!(lock_arg(&bits));
                 }
-                match c.report("tb.new_task", body, None, TB_TIMEOUT)? {
+                // On the progress stream (#965): the board screens a human task with claude before it adds it,
+                // which can run past TB_TIMEOUT, and says it's still screening every couple of seconds meanwhile.
+                match c.report_progress_or("tb.new_task", body, None, |e| new_task_unconfirmed(e, &title, human))? {
+                    None if human => out(&human_task_saved(&title)),
                     None => out(SAVED),
                     Some(v) if here => {
                         let r = v["created"][0].as_str().unwrap_or("").to_string();
                         out(v["context"].as_str().filter(|s| !s.trim().is_empty()).map(|s| s.to_string()).unwrap_or(format!("Added {r} and you're on it.")).as_str());
+                        unlinked_note(c, &r, detail.as_deref(), &linked);
                         c.midna_pin(&r, v["title"].as_str().unwrap_or(&title));
                         if lane.as_deref() == Some("slot") {
                             slot_claim(c, &r, bring, &[])?;
@@ -6711,19 +7209,25 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                         };
                         out(&format!("Added {r}{where_}. {}#/?task={r}", c.cfg.page_url));
                         print_warnings(&v);
+                        print_wait_line(&v);
+                        unlinked_note(c, &r, detail.as_deref(), &linked);
                         c.midna_pin(&r, v["title"].as_str().unwrap_or(&title));
                     }
                 }
                 Ok(0)
             }
-            TaskCmd::Set { task, title, detail, goal, also, not_also, wave, priority, waits_for, lock, alone, lane, base, jira, ticket_summary, ticket_text, devices, bits, not_bits, stack_on, stack_merge, same_pr, pr, kind, status, merged_note, landed, pr_link, area, model, effort, project } => {
+            TaskCmd::Set { task, title, detail, goal, also, not_also, wave, priority, waits_for, lock, alone, lane, base, jira, ticket_summary, ticket_text, devices, bits, not_bits, stack_on, stack_merge, same_pr, pr, kind, status, merged_note, landed, pr_link, issue, area, model, effort, project } => {
                 let t = task_ref(&task)?;
                 let mut b = json!({});
                 if let Some(x) = title {
                     b["title"] = json!(short_title(&x)?);
                 }
-                if let Some(x) = detail {
+                if let Some(x) = &detail {
                     b["detail"] = json!(x);
+                }
+                let linked = issue_refs(&issue)?;
+                if !linked.is_empty() {
+                    b["issues"] = json!(linked);
                 }
                 if let Some(x) = goal {
                     b["goal_id"] = if x.eq_ignore_ascii_case("none") { Value::Null } else { json!(goal_ref(&x)?) };
@@ -6844,8 +7348,12 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                 if let Some(why) = v["why"].as_str() {
                     bits += &format!(" · {why}");
                 }
+                if !linked.is_empty() {
+                    bits += &format!(" · fixes {}", linked.join(", "));
+                }
                 out(&format!("Changed {t} “{}”{bits}.", v["title"].as_str().unwrap_or("")));
                 print_warnings(&v);
+                unlinked_note(c, &t, detail.as_deref(), &linked);
                 Ok(0)
             }
             TaskCmd::Delete { task } => {
@@ -7036,6 +7544,12 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
             out(&format!("Closed {} as won't do.", issue_refs(&issues)?.join(", ")));
             Ok(0)
         }
+        Cmd::Backlog { action: BacklogCmd::Fixed { issues, by } } => {
+            let refs = issue_refs(&issues)?;
+            let v = c.call("POST", "/backlog/fixed", Some(json!({"ids": refs, "by": by.trim(), "who": c.who()})))?;
+            out(&format!("Closed {} as fixed by {}.", refs.join(", "), v["by"].as_str().unwrap_or(by.trim())));
+            Ok(0)
+        }
         Cmd::Backlog { action: BacklogCmd::Tidy { on, off, every, now, reset } } => {
             let mut b = json!({});
             if on || off {
@@ -7086,11 +7600,12 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                 format!("Removed {} from {}.", v["removed"].as_str().unwrap_or("it"), v["goal"].as_str().or(v["task"].as_str()).unwrap_or("the task"))
             })
         }
-        Cmd::Attach { url, kind, title, summary, goal, t } => {
+        Cmd::Attach { url, kind, title, summary, copy, goal, t } => {
             let goal = goal.map(|g| goal_ref(&g)).transpose()?;
             let url = attach_target(&url, &c.cwd)?;
+            let copy = copy.map(|f| attach_copy(&url, &f, &c.cwd)).transpose()?;
             let needs = goal.is_none();
-            c.run_report("tb.attach", json!({"url": url, "kind": kind, "title": title, "summary": summary, "goal": goal}), t.task, needs, |v| {
+            c.run_report("tb.attach", json!({"url": url, "kind": kind, "title": title, "summary": summary, "copy": copy, "goal": goal}), t.task, needs, |v| {
                 format!("Attached {} to {}.", v["attachment"]["title"].as_str().unwrap_or("it"), v["goal"].as_str().or(v["task"].as_str()).unwrap_or("the task"))
             })
         }
@@ -7267,7 +7782,7 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
         }
         Cmd::Pr { action } => match action {
             PrCmd::Check => {
-                let v = c.call("POST", "/prs/refresh", Some(json!({})))?;
+                let v = c.call_progress("POST", "/prs/refresh", Some(json!({})))?;
                 out(&pr_check_line(&v));
                 for line in pr_check_rate_lines(&v["rate_limits"]) {
                     out(&line);
@@ -7401,7 +7916,7 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
             }
             PrCmd::Wait { task } => {
                 let t = c.pr_task(task)?;
-                c.call("POST", &format!("/tasks/{t}/pr/wait"), Some(json!({})))?;
+                c.call_progress("POST", &format!("/tasks/{t}/pr/wait"), Some(json!({})))?;
                 out(&format!("The board watches {t}'s PR again and brings this conversation back when it needs you. You can stop here."));
                 Ok(0)
             }
@@ -7515,6 +8030,7 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
         }
         Cmd::Api { provider, path, method, data, fresh } => api_call(&c.cfg, &provider, &path, method, data, fresh),
         Cmd::Hook { event } => Ok(hook::run(event.as_deref())),
+        Cmd::InstallHooks { plugin } => install_hooks(&plugin),
         Cmd::GitCredential { op } => Ok(crate::gitcred::run(&op)),
         Cmd::Statusline { pass } => Ok(hook::statusline(pass)),
     }
@@ -7541,6 +8057,11 @@ fn project_line(p: &Value) -> String {
         ),
         None => String::new(),
     };
+    let required = match r["required"].as_array() {
+        Some(l) if !l.is_empty() => format!(" · merges once {} pass", l.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")),
+        _ => String::new(),
+    };
+    let expected = expected + &required;
     let switches: String = [("ask_stage", "ask stage"), ("swap", "swaps"), ("review", "review"), ("agents_merge", "agents merge"), ("owner_review", "owner review")]
         .iter()
         .filter_map(|(k, label)| r[*k].as_bool().map(|on| format!(" · {label} {}", if on { "on" } else { "off" })))
@@ -7548,9 +8069,13 @@ fn project_line(p: &Value) -> String {
     let terminals = p["max_terminals"].as_i64().map(|n| format!(" · up to {n} busy terminals")).unwrap_or_default();
     let slots = if p["worktrees"]["set"].as_object().is_some_and(|s| !s.is_empty()) {
         let w = &p["worktrees"];
+        let after = |k: &str| match w[k].as_i64() {
+            Some(0) => "never".to_string(),
+            _ => format!("after {} days", w[k]),
+        };
         format!(
-            " · {}–{} worktree slots, idle ones cleared after {} days and removed after {} (sooner under {} GB free)",
-            w["min_slots"], w["max_slots"], w["idle_trim_days"], w["idle_remove_days"], w["low_disk_gb"]
+            " · {}–{} worktree slots, idle ones cleared {} and removed {} (sooner under {} GB free)",
+            w["min_slots"], w["max_slots"], after("idle_trim_days"), after("idle_remove_days"), w["low_disk_gb"]
         )
     } else {
         String::new()
@@ -7564,6 +8089,7 @@ fn project_line(p: &Value) -> String {
     let waits_on: Vec<&str> = p["waits_on"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
     let waits_on = if waits_on.is_empty() { String::new() } else { format!(" · its tasks may wait for {}'s", waits_on.join(", ")) };
     let stacks = p["stack_merge_set"].as_str().map(|m| format!(" · stacks {m}-merge")).unwrap_or_default();
+    let devices = p["devices"].as_str().filter(|d| !d.is_empty()).map(|d| format!(" · its tasks ask for {d}")).unwrap_or_default();
     let review = match (p["code_review"].as_str(), p["code_review_set"].as_str()) {
         (Some(cmd), _) => format!(" · code review {cmd}"),
         (None, Some(_)) => " · no code review".to_string(),
@@ -7578,7 +8104,7 @@ fn project_line(p: &Value) -> String {
         .map(|a| a.iter().filter_map(|w| w.as_str()).map(|w| format!("\n  Worktree no task claims (left for you): {w}")).collect())
         .unwrap_or_default();
     format!(
-        "{} · PR flow {} · {} · {remote}{terminals}{slots}{releases}{review}{waits_on}{stacks}{approvals}{expected}{switches}{gaps}{stray}",
+        "{} · PR flow {} · {} · {remote}{terminals}{slots}{releases}{review}{waits_on}{stacks}{devices}{approvals}{expected}{switches}{gaps}{stray}",
         p["name"].as_str().unwrap_or(""),
         p["pr_flow"].as_str().unwrap_or("auto"),
         if p["ships_prs"] == true { "work ends in PRs" } else { "no PRs" }
@@ -7586,7 +8112,7 @@ fn project_line(p: &Value) -> String {
 }
 
 /// `tb project set`'s PR-rule flags as the API's body: `default` sends null (back to config.toml's).
-fn project_rules(approvals: Option<String>, expected: Vec<String>, wait: Option<String>) -> Result<serde_json::Map<String, Value>, String> {
+fn project_rules(approvals: Option<String>, expected: Vec<String>, wait: Option<String>, required: Vec<String>) -> Result<serde_json::Map<String, Value>, String> {
     let mut b = serde_json::Map::new();
     let is_default = |s: &str| s.trim().eq_ignore_ascii_case("default");
     if let Some(a) = approvals {
@@ -7604,6 +8130,14 @@ fn project_rules(approvals: Option<String>, expected: Vec<String>, wait: Option<
     if let Some(w) = wait {
         let v = if is_default(&w) { Value::Null } else { json!(w.trim().parse::<f64>().map_err(|_| format!("--expected-wait takes minutes or default, not “{w}”"))?) };
         b.insert("expected_wait_mins".into(), v);
+    }
+    if !required.is_empty() {
+        let v = match required.as_slice() {
+            [one] if is_default(one) => Value::Null,
+            [one] if one.trim().eq_ignore_ascii_case("none") => json!([]),
+            list => json!(list),
+        };
+        b.insert("required".into(), v);
     }
     Ok(b)
 }
@@ -7643,8 +8177,8 @@ fn project_cmd(c: &Ctx, action: ProjectCmd) -> Result<i32, String> {
             }
             Ok(0)
         }
-        ProjectCmd::Set { name, pr_flow, approvals, expected_check, expected_wait, ask_stage, swap, review, agents_merge, owner_review, max_terminals, min_slots, max_slots, idle_trim_days, idle_remove_days, low_disk_gb, waits_on, stack_merge_default, releases, release_tags, release_script, code_review } => {
-            let mut body = project_rules(approvals, expected_check, expected_wait)?;
+        ProjectCmd::Set { name, pr_flow, approvals, expected_check, required_check, expected_wait, ask_stage, swap, review, agents_merge, owner_review, max_terminals, min_slots, max_slots, idle_trim_days, idle_remove_days, low_disk_gb, waits_on, stack_merge_default, devices, releases, release_tags, release_script, code_review } => {
+            let mut body = project_rules(approvals, expected_check, expected_wait, required_check)?;
             for (key, flag, v) in [
                 ("min_slots", "--min-slots", min_slots),
                 ("max_slots", "--max-slots", max_slots),
@@ -7665,6 +8199,9 @@ fn project_cmd(c: &Ctx, action: ProjectCmd) -> Result<i32, String> {
             }
             if let Some(m) = stack_merge_default {
                 body.insert("stack_merge_default".into(), if m == "default" { Value::Null } else { json!(m) });
+            }
+            if !devices.is_empty() {
+                body.insert("devices".into(), json!(lock_arg(&devices)));
             }
             if let Some(m) = max_terminals {
                 let v = if m.trim().eq_ignore_ascii_case("default") {
@@ -7725,6 +8262,20 @@ fn project_cmd(c: &Ctx, action: ProjectCmd) -> Result<i32, String> {
             let on = if v["owner_review"] == true { "on" } else { "off: the board marks green PRs reviewed" };
             let from = if v["set"].is_boolean() { "set on the board" } else { "config.toml's pr.owner_review" };
             out(&format!("Owner review: {on} for projects that don't say ({from})."));
+            Ok(0)
+        }
+        ProjectCmd::Review { value } => {
+            let v = match value {
+                None => c.call("GET", "/projects/review", None)?,
+                Some(s) => {
+                    let mut body = serde_json::Map::new();
+                    project_switch(&mut body, "review", Some(s));
+                    c.call("POST", "/projects/review", Some(Value::Object(body)))?
+                }
+            };
+            let on = if v["review"] == true { "on" } else { "off: PRs go to merge without reviewers" };
+            let from = if v["set"].is_boolean() { "set on the board" } else { "config.toml's pr.review" };
+            out(&format!("Review step: {on} for projects that don't say ({from})."));
             Ok(0)
         }
     }
@@ -8029,7 +8580,7 @@ fn stream_send(c: &Ctx, json: Option<String>) -> Result<i32, String> {
         Some(j) => j.to_string(),
     };
     let body: Value = serde_json::from_str(&text).map_err(|e| format!("That isn't JSON: {e}"))?;
-    let v = c.call("POST", "/stream/events", Some(body))?;
+    let v = c.call_relay("POST", "/stream/events", Some(body))?;
     for r in v["results"].as_array().into_iter().flatten() {
         let id = r["id"].as_str().unwrap_or("(no id)");
         match r["why"].as_str() {
@@ -8066,7 +8617,7 @@ fn feed_cmd(c: &Ctx, action: Option<FeedCmd>) -> Result<i32, String> {
             if mine {
                 body["mine"] = json!(true);
             }
-            let v = c.call("POST", "/prs/event", Some(body))?;
+            let v = c.call_relay("POST", "/prs/event", Some(body))?;
             match v["task"].as_str() {
                 Some(t) if v["refreshed"] == true => out(&format!("Read {t}'s PR again: {}.", v["phase"].as_str().unwrap_or("no stage"))),
                 Some(t) => out(&format!("Noted for {t}.{}", v["read_error"].as_str().map(|e| format!(" Its PR couldn't be read: {e}")).unwrap_or_default())),
@@ -8241,7 +8792,7 @@ fn master_cmd(c: &Ctx, args: Vec<String>, verdict: Verdict, open_only: bool, lim
             }
         }
         (None, Some("check")) => {
-            let v = c.call("POST", "/master/check", Some(json!({})))?;
+            let v = c.call_progress("POST", "/master/check", Some(json!({})))?;
             out(&format!("Read every watched branch: {} red.", v["open"].as_array().map(|a| a.len()).unwrap_or(0)));
         }
         (Some(r), None | Some("show")) => out(&break_detail(&c.call("GET", &format!("/master/{r}"), None)?)),
@@ -8255,6 +8806,22 @@ fn master_cmd(c: &Ctx, args: Vec<String>, verdict: Verdict, open_only: bool, lim
         (_, Some(w)) => return Err(format!("{w} isn't a master command: show, ours, not-ours, unsure or check")),
     }
     Ok(0)
+}
+
+/// `tb install-hooks`: the plugin from `plugin`, and hooks that run this `tb`.
+fn install_hooks(plugin: &std::path::Path) -> Result<i32, String> {
+    use taskboardd::claude_hooks::{self, Hooks, Target};
+    let plugin = plugin.canonicalize().map_err(|e| format!("couldn't find {}: {e}", plugin.display()))?;
+    let tb = std::env::current_exe().map_err(|e| format!("couldn't tell where this tb is: {e}"))?;
+    let t = Target { plugin, tb, can_install: true };
+    claude_hooks::install(&t)?;
+    match claude_hooks::check(&claude_hooks::claude_dir(), &t) {
+        Hooks::Current => {
+            out(&format!("Installed the board's hooks (running {}) and the task-board plugin. New Claude sessions report to the board.", t.tb.display()));
+            Ok(0)
+        }
+        other => Err(format!("installed, but Claude Code's config still doesn't match: {other:?}")),
+    }
 }
 
 pub fn main_with(args: Vec<String>) -> i32 {
@@ -8293,6 +8860,36 @@ pub fn main_with(args: Vec<String>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tb_speaks_for_its_terminal_only_when_claude_runs_it() {
+        assert_eq!(own_terminal("429902dc".into(), true), "429902dc");
+        assert_eq!(own_terminal("429902dc".into(), false), "", "a tb typed into a plain Midna shell");
+        assert_eq!(own_terminal(String::new(), true), "", "Claude outside Midna");
+    }
+
+    #[test]
+    fn pr_status_says_since_when_the_board_watches_the_pr() {
+        let at = "2026-11-16T21:05:00Z";
+        assert_eq!(watching_line(&json!({"since": at})).unwrap(), format!("Watching since {}: the board brings the agent back when the PR needs it", local_when(at)));
+        assert!(local_when(at).ends_with(" PM") || local_when(at).ends_with(" AM"), "{}", local_when(at));
+        assert_eq!(watching_line(&json!({"since": null})).unwrap(), "Watching: the board brings the agent back when the PR needs it");
+        assert_eq!(watching_line(&Value::Null), None, "a visit is on, or the PR isn't watched");
+    }
+
+    #[test]
+    fn a_repeat_slot_claim_says_the_task_already_holds_it() {
+        let v = json!({"task": "T4", "slot": "slot-2", "path": "/r/.claude/worktrees/slot-2", "held": true, "brought": [], "left": []});
+        assert_eq!(slot_claimed("T4", &v), "T4 already holds slot-2 (/r/.claude/worktrees/slot-2). Work there: cd /r/.claude/worktrees/slot-2");
+    }
+
+    #[test]
+    fn a_claim_the_board_went_quiet_on_names_the_slot_the_task_now_holds() {
+        let v = json!({"task": "T4", "slot": "slot-2", "path": "/r/.claude/worktrees/slot-2", "held": true});
+        let line = claimed_quietly("T4", &v, false);
+        assert!(line.contains("T4 holds slot-2 (/r/.claude/worktrees/slot-2)") && line.ends_with("cd /r/.claude/worktrees/slot-2"), "{line}");
+        assert!(claimed_quietly("T4", &v, true).contains("check git status there"));
+    }
 
     #[test]
     fn a_plan_review_shows_its_findings_with_a_12_hour_time() {
@@ -8454,6 +9051,9 @@ mod tests {
         assert_eq!(task_lane_line(&json!({"lane": {"lane": "slot", "from": "auto"}})).as_deref(), Some("Lane: slot (the board's pick)"));
         assert_eq!(task_lane_line(&json!({"lane": {"lane": "shared", "from": "task"}})).as_deref(), Some("Lane: shared"));
         assert_eq!(task_lane_line(&json!({"lane": {"lane": "shared", "from": "auto"}})), None);
+        let shows = |v: Value| task_show_lines(&v, 0).iter().any(|l| l == "Same PR as: T1666 (shares its branch and PR)");
+        assert!(shows(json!({"ref": "T1667", "title": "Credits", "same_pr": 1666})));
+        assert!(!shows(json!({"ref": "T1666", "title": "Charges", "same_pr": null})));
         assert_eq!(lane_text("auto"), None);
     }
 
@@ -8543,6 +9143,173 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data);
     }
 
+    /// Points `c` at a board on a local port that answers one request on the progress stream with each of
+    /// `lines`, `gap` before each, then hangs up. Hands back the request it got, head and body.
+    fn streaming_board(c: &mut Ctx, lines: &[&str], gap: std::time::Duration) -> std::sync::mpsc::Receiver<String> {
+        use std::io::{BufRead, Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        c.cfg.port = l.local_addr().unwrap().port();
+        let lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut r = std::io::BufReader::new(s.try_clone().unwrap());
+            let (mut head, mut len) = (String::new(), 0);
+            loop {
+                let mut h = String::new();
+                r.read_line(&mut h).unwrap();
+                if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap();
+                }
+                if h.trim().is_empty() {
+                    break;
+                }
+                head.push_str(&h);
+            }
+            let mut body = vec![0; len];
+            let _ = r.read_exact(&mut body);
+            let _ = tx.send(format!("{head}\n{}", String::from_utf8_lossy(&body)));
+            let _ = write!(s, "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\nconnection: close\r\n\r\n");
+            for line in lines {
+                std::thread::sleep(gap);
+                let _ = writeln!(s, "{line}");
+                let _ = s.flush();
+            }
+            // Hang up now, not when the socket's last handle closes: on Windows a process another test
+            // starts meanwhile can inherit it, and its exit then resets the connection instead.
+            let _ = s.shutdown(std::net::Shutdown::Write);
+        });
+        rx
+    }
+
+    fn spooled(c: &Ctx) -> usize {
+        std::fs::read_dir(c.cfg.spool_dir()).map(|d| d.count()).unwrap_or(0)
+    }
+
+    const NEW_HUMAN: [&str; 7] = ["tb", "task", "new", "Sign the agreement", "--human", "--detail", "1. Open https://x.test/sign and sign it"];
+
+    #[test]
+    fn tb_task_new_human_waits_out_a_screen_slower_than_its_time_limit() {
+        // #965: the board screens a human task with claude for 5-8s. Past TB_TIMEOUT in all, tb used to give
+        // up, save it and say the board was down while the board went on and added it.
+        let (mut c, data) = board_down_ctx("human-slow");
+        let still = r#"{"progress":"still waiting on claude to screen the human task"}"#;
+        let added = r#"{"result":{"ok":true,"created":["H9"],"title":"Sign the agreement"}}"#;
+        let gap = std::time::Duration::from_secs_f64(TB_TIMEOUT * 0.4);
+        let got = streaming_board(&mut c, &[still, still, added], gap);
+        assert_eq!(run_cmd(&c, Cli::try_parse_from(NEW_HUMAN).unwrap().cmd), Ok(0));
+        let req = got.recv().unwrap();
+        assert!(req.to_ascii_lowercase().contains("x-task-board-progress: 1"), "on the progress stream: {req}");
+        assert!(req.contains(r#""event":"tb.new_task""#) && req.contains(r#""kind":"human""#), "{req}");
+        assert_eq!(spooled(&c), 0, "the board answered, so nothing is saved for later");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn tb_task_new_human_prints_the_screens_refusal() {
+        let (mut c, data) = board_down_ctx("human-refused");
+        let why = "Not a human task: an agent can do this, so it never reaches Morgan.";
+        let refused = json!({"error": why, "status": 409}).to_string();
+        let _got = streaming_board(&mut c, &[r#"{"progress":"still waiting on claude to screen the human task"}"#, &refused], std::time::Duration::from_millis(10));
+        assert_eq!(run_cmd(&c, Cli::try_parse_from(NEW_HUMAN).unwrap().cmd), Err(why.to_string()));
+        assert_eq!(spooled(&c), 0, "a refusal is never saved for later");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn tb_task_new_the_board_took_but_never_confirmed_isnt_saved() {
+        // The board has the request and skips a saved copy of it, so saving it would only claim it's down.
+        let (mut c, data) = board_down_ctx("human-quiet");
+        let _got = streaming_board(&mut c, &[r#"{"progress":"still waiting on claude to screen the human task"}"#], std::time::Duration::from_millis(10));
+        let e = run_cmd(&c, Cli::try_parse_from(NEW_HUMAN).unwrap().cmd).unwrap_err();
+        assert!(e.starts_with("the board went quiet"), "{e}");
+        assert!(e.contains(r#"tb search "Sign the agreement" --all --kind human"#), "says how to find it: {e}");
+        assert_eq!(spooled(&c), 0);
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// Runs `args` against a board that reads a PR host for longer than tb's time limit in all, saying
+    /// each stage under it, and hands back the request it sent (B43).
+    fn waits_out_a_slow_board(tag: &str, args: &[&str], result: Value) -> String {
+        let (mut c, data) = board_down_ctx(tag);
+        let still = r#"{"progress":"still waiting on GitHub"}"#;
+        let done = json!({"result": result}).to_string();
+        let gap = std::time::Duration::from_secs_f64(TB_TIMEOUT * 0.6);
+        let got = streaming_board(&mut c, &[still, &done], gap);
+        assert_eq!(run_cmd(&c, Cli::try_parse_from(args).unwrap().cmd), Ok(0), "{args:?}");
+        let req = got.recv().unwrap();
+        assert!(req.to_ascii_lowercase().contains("x-task-board-progress: 1"), "{args:?} on the progress stream: {req}");
+        let _ = std::fs::remove_dir_all(&data);
+        req
+    }
+
+    #[test]
+    fn tb_stream_send_waits_out_a_board_slower_than_its_time_limit() {
+        let ev = r#"{"v":1,"events":[{"id":"e1","kind":"heartbeat","source":"fi","at":"2026-11-21T15:00:00Z"}]}"#;
+        let req = waits_out_a_slow_board("stream-slow", &["tb", "stream", "send", ev], json!({"results": [{"id": "e1", "status": "accepted"}], "rejected": 0}));
+        assert!(req.starts_with("POST /tasks/api/stream/events"), "{req}");
+    }
+
+    #[test]
+    fn tb_feed_event_waits_out_a_board_slower_than_its_time_limit() {
+        let args = ["tb", "feed", "event", "--repo", "acme/webapp", "--num", "3"];
+        let req = waits_out_a_slow_board("feed-slow", &args, json!({"task": "T3", "refreshed": true, "phase": "review"}));
+        assert!(req.starts_with("POST /tasks/api/prs/event"), "{req}");
+    }
+
+    #[test]
+    fn tb_master_check_waits_out_a_board_slower_than_its_time_limit() {
+        let req = waits_out_a_slow_board("master-slow", &["tb", "master", "check"], json!({"open": []}));
+        assert!(req.starts_with("POST /tasks/api/master/check"), "{req}");
+    }
+
+    #[test]
+    fn tb_pr_check_waits_out_a_board_slower_than_its_time_limit() {
+        let req = waits_out_a_slow_board("prcheck-slow", &["tb", "pr", "check"], json!({"ok": true, "changed": 0}));
+        assert!(req.starts_with("POST /tasks/api/prs/refresh"), "{req}");
+    }
+
+    /// Points `c` at a board that takes one request and never answers it, holding the connection open.
+    fn quiet_board(c: &mut Ctx) {
+        use std::io::Read;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        c.cfg.port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0; 4096];
+            while matches!(s.read(&mut buf), Ok(n) if n > 0) {}
+        });
+    }
+
+    #[test]
+    fn a_report_the_board_took_but_never_answered_isnt_saved_for_a_replay() {
+        // The board may have applied it (a note, a take, a found), so replaying the saved copy would do it twice.
+        let (mut c, data) = board_down_ctx("report-quiet");
+        quiet_board(&mut c);
+        let e = c.report("tb.note", json!({"text": "half way"}), None, 0.3).unwrap_err();
+        assert!(e.starts_with("the board didn't answer within 0.3s"), "{e}");
+        assert!(e.contains("may still go through"), "says it may have landed: {e}");
+        assert_eq!(spooled(&c), 0, "not saved, so it can't be replayed");
+
+        let (c, data2) = board_down_ctx("report-down");
+        assert_eq!(c.report("tb.note", json!({"text": "half way"}), None, 0.3), Ok(None), "a board that's down still gets it later");
+        assert_eq!(spooled(&c), 1);
+        let _ = std::fs::remove_dir_all(&data);
+        let _ = std::fs::remove_dir_all(&data2);
+    }
+
+    #[test]
+    fn tb_task_new_human_with_the_board_down_is_saved_and_says_how_to_find_its_id() {
+        let (c, data) = board_down_ctx("human-down");
+        assert_eq!(run_cmd(&c, Cli::try_parse_from(NEW_HUMAN).unwrap().cmd), Ok(0));
+        assert_eq!(spooled(&c), 1, "saved for when the board is back");
+        let line = human_task_saved("Sign the agreement");
+        assert!(line.starts_with(SAVED), "{line}");
+        assert!(line.contains(r#"tb search "Sign the agreement" --all --kind human"#) && line.contains("tb wait-for H<n>"), "{line}");
+        assert!(human_task_saved("").contains(r#"tb search "<words from its title>" --all --kind human"#));
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
     // Its fake midna is a shell script (run in Git Bash on Windows).
     #[test]
     fn tb_question_under_test_never_runs_midna() {
@@ -8598,6 +9365,14 @@ mod tests {
         let missing = |p: &str| format!("no such file: {}", std::path::Path::new(&cwd).join(p).display());
         assert_eq!(attach_target("/no/such/missing.png", &cwd).unwrap_err(), missing("/no/such/missing.png"));
         assert_eq!(attach_target("missing.png", &cwd).unwrap_err(), missing("missing.png"));
+
+        std::fs::write(dir.join("page.html"), "<h1>Review</h1>").unwrap();
+        std::fs::write(dir.join("blank.html"), "  \n").unwrap();
+        let link = "https://claude.ai/artifact/abc";
+        assert_eq!(attach_copy(link, "page.html", &cwd).unwrap(), "<h1>Review</h1>", "the copy is sent as it is");
+        assert!(attach_copy(&full, "page.html", &cwd).unwrap_err().starts_with("--copy is for a link"));
+        assert!(attach_copy(link, "blank.html", &cwd).unwrap_err().ends_with("is empty"));
+        assert!(attach_copy(link, "nope.html", &cwd).unwrap_err().starts_with("no such file"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8667,6 +9442,29 @@ mod tests {
                        "task_ref": null, "jira_key": "", "from": "Found by T12", "detail": "tb can't list tasks.",
                        "history": [{"at": "", "who": "T12", "kind": "found", "text": "Filed"}]});
         assert_eq!(issue_show_lines(&b), ["B7 · open · gap · taskboard", "No readers", "Found by T12", "", "Detail:", "  tb can't list tasks.", "", "History:", "   · T12 · found: Filed"]);
+    }
+
+    #[test]
+    fn tb_backlog_fixed_closes_issues_by_a_task_or_a_pr_and_shows_them_as_fixed() {
+        let Cmd::Backlog { action: BacklogCmd::Fixed { issues, by } } = Cli::try_parse_from(["tb", "backlog", "fixed", "B3", "B4", "--by", "T12"]).unwrap().cmd else {
+            panic!("not tb backlog fixed")
+        };
+        assert_eq!((issues, by.as_str()), (vec!["B3".to_string(), "B4".to_string()], "T12"));
+        assert!(Cli::try_parse_from(["tb", "backlog", "fixed", "B3", "--by", "https://github.com/o/r/pull/45"]).is_ok());
+        assert!(Cli::try_parse_from(["tb", "backlog", "fixed", "B3"]).is_err(), "--by is required");
+        assert!(Cli::try_parse_from(["tb", "backlog", "fixed", "--by", "T12"]).is_err(), "at least one issue");
+        let b = json!({"ref": "B3", "state": "drop", "closed_as": "fixed", "kind": "bug", "project": "taskboard", "goal": null, "title": "Crash on save",
+                       "task_ref": null, "fixed_by_ref": "T12", "fixed_pr": "https://github.com/o/r/pull/45", "history": []});
+        assert_eq!(issue_list_line(&b), "B3    fixed   bug     -     Crash on save  → T12");
+        assert_eq!(issue_show_lines(&b)[..3], ["B3 · fixed · bug · taskboard", "Crash on save", "Fixed by: T12 https://github.com/o/r/pull/45"]);
+        let mut wont = b.clone();
+        wont["closed_as"] = json!("wont_do");
+        assert!(issue_list_line(&wont).starts_with("B3    drop "), "a won't-do close keeps its state");
+        assert!(!issue_show_lines(&wont).iter().any(|l| l.starts_with("Fixed by")));
+        let mut tidied = b.clone();
+        tidied["fixed_by_ref"] = Value::Null;
+        tidied["fixed_pr"] = Value::Null;
+        assert_eq!(issue_show_lines(&tidied)[2], "Closed as fixed");
     }
 
     #[test]
@@ -8879,6 +9677,9 @@ mod tests {
         // Bitbucket keeps every reviewer requested: that alone isn't an ask to look again.
         assert_eq!(reviewer_state(&json!({"state": "changes", "requested": true})), "asked for changes");
         assert_eq!(reviewer_state(&json!({"state": "approved", "rereview": {"at": "2026-10-27T15:26:00Z"}})), "approved");
+        let commented = reviewer_state(&json!({"state": "commented", "rereview": {"at": "2026-10-27T15:26:00Z", "queued": false}}));
+        assert!(commented.starts_with("commented, asked to look again Oct 27, "), "{commented}");
+        assert_eq!(reviewer_state(&json!({"state": "commented"})), "commented");
     }
 
     #[test]
@@ -9174,6 +9975,8 @@ mod tests {
         assert!(Cli::try_parse_from(["tb", "checkpoint", "--done", "a", "--next", "b", "--decision", "c"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "limits", "--review-gap", "10", "--step", "Author review"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "found", "x", "--kind", "nope"]).is_err());
+        assert!(Cli::try_parse_from(["tb", "needs", "done", "H3", "H4", "--note", "Signed"]).is_ok());
+        assert!(Cli::try_parse_from(["tb", "needs", "done"]).is_err(), "it names at least one");
         assert!(Cli::try_parse_from(["tb", "task", "new", "x", "--goal", "G1", "--also", "G2", "--also", "G3"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "task", "set", "T1", "--also", "G2", "--not-also", "G3"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "task", "new", "x", "--detail", "y", "--here"]).is_ok());
@@ -9268,6 +10071,8 @@ mod tests {
         assert_eq!(issue_refs(&["b4".into(), "B5".into(), "B4".into()]).unwrap(), vec!["B4", "B5"]);
         assert!(Cli::try_parse_from(["tb", "hours", "--alert-every", "10"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "start", "G1", "--now"]).is_ok());
+        assert!(Cli::try_parse_from(["tb", "start", "T4", "T5", "T6"]).is_ok());
+        assert!(Cli::try_parse_from(["tb", "start"]).is_err());
         assert!(Cli::try_parse_from(["tb", "start", "G1", "--now", "--queue"]).is_err());
         assert!(Cli::try_parse_from(["tb", "review", "--week", "last"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "review", "T12"]).is_ok());
@@ -9293,7 +10098,7 @@ mod tests {
         let Cmd::Task { action: TaskCmd::New { title, issue, .. } } = Cli::try_parse_from(["tb", "task", "new", "--issue", "B7", "--here"]).unwrap().cmd else {
             panic!("task new")
         };
-        assert_eq!((title, issue.as_deref()), (None, Some("B7")));
+        assert_eq!((title, issue), (None, vec!["B7".to_string()]));
         assert!(Cli::try_parse_from(["tb", "task", "new", "--issue", "B7", "--here", "--next"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "task", "new", "--issue", "B7", "--here", "--now"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "task", "new", "Own title", "--issue", "B7", "--goal", "G2"]).is_ok());
@@ -9317,6 +10122,14 @@ mod tests {
         assert!(Cli::try_parse_from(["tb", "submit", "x", "--pr-body", "body.md", "--no-pr", "why"]).is_err());
         assert!(Cli::try_parse_from(["tb", "submit", "x", "--title", "Add x"]).is_err());
         assert!(Cli::try_parse_from(["tb", "done", "x", "--no-pr", "covered by T3"]).is_ok(), "tb done still works for agents on an older handoff");
+        match Cli::try_parse_from(["tb", "submit", "x", "--fixes", "B3", "--fixes", "b4", "--no-pr", "why"]).unwrap().cmd {
+            Cmd::Submit { fixes, .. } => assert_eq!(issue_refs(&fixes).unwrap(), vec!["B3", "B4"]),
+            _ => panic!("not a submit"),
+        }
+        assert!(issue_refs(&["T3".to_string()]).is_err(), "--fixes takes backlog issues only");
+        assert!(Cli::try_parse_from(["tb", "review", "12", "--file-again"]).is_ok());
+        assert!(Cli::try_parse_from(["tb", "review", "--file-again"]).is_err(), "--file-again needs the review");
+        assert!(Cli::try_parse_from(["tb", "review", "12", "--file-again", "--save"]).is_err());
         assert!(Cli::try_parse_from(["tb", "step", "triage", "Review", "F2", "--state", "fixed", "--commit", "abc"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "step", "triage", "Review", "F2", "--state", "gone"]).is_err());
         assert!(Cli::try_parse_from(["tb", "step", "again", "Review"]).is_ok());
@@ -9325,6 +10138,15 @@ mod tests {
         assert!(Cli::try_parse_from(["tb", "step", "run", "Tests", "--worktree", "/tmp/wt"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "step", "run", "Tests", "--branch", "feat/x", "--commit", "abc"]).is_ok(), "a commit on a branch");
         assert!(Cli::try_parse_from(["tb", "pr", "body-check", "-"]).is_ok());
+    }
+
+    #[test]
+    fn file_again_says_what_it_did() {
+        let v = |f: Value| json!({"fixes": f});
+        assert_eq!(file_again_line("4", &v(json!({"state": "running"}))), "Filing review 4's fixes as backlog issues; the review page shows them when they're in.");
+        assert_eq!(file_again_line("4", &v(json!({"state": "failed", "error": "Claude timed out."}))), "Couldn't file review 4's fixes: Claude timed out.");
+        assert_eq!(file_again_line("4", &v(json!({"state": "done", "filed": ["B12", "B13"], "linked": ["B9"]}))), "Review 4's fixes are in the backlog: B12, B13; linked B9.");
+        assert_eq!(file_again_line("4", &v(json!({"state": "done", "filed": [], "linked": []}))), "Review 4 has no fixes to file.");
     }
 
     #[test]
@@ -9388,6 +10210,16 @@ mod tests {
     }
 
     #[test]
+    fn finding_help_gives_backlog_its_blocks() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd.find_subcommand_mut("finding").unwrap().render_help().to_string();
+        assert!(help.contains("backlog --blocks none|pr|goal"), "{help}");
+        assert!(!help.contains("fix|backlog|dismiss"), "{help}");
+        assert!(Cli::try_parse_from(["tb", "finding", "T5", "F2", "backlog", "--blocks", "none", "not", "this", "change"]).is_ok());
+    }
+
+    #[test]
     fn titles_stay_short() {
         assert_eq!(short_title("  Fix the\n login  flicker ").unwrap(), "Fix the login flicker");
         assert!(short_title(&"x".repeat(TITLE_MAX)).is_ok());
@@ -9428,27 +10260,29 @@ mod tests {
         assert_eq!(pr_hint("GET", "repositories/acme/web/src/main/README.md", None), None);
     }
 
-    /// `cut_release` against a fake board: the bodies it posted, and the scripts it ran.
-    fn cut_with(script: Option<&str>, code: i32, no_script: bool) -> (Result<ReleaseCut, String>, Vec<Value>, Vec<(String, String, Option<String>)>) {
+    /// `cut_release` against a fake board: the result, the bodies it posted, and the checkouts it checked.
+    fn cut_with(script: Option<&str>, branch: Result<(), String>, no_script: bool) -> (Result<ReleaseCut, String>, Vec<Value>, Vec<Option<String>>) {
         let mut posted = vec![];
-        let mut ran = vec![];
+        let mut checked = vec![];
         let r = cut_release(
             &mut |b| {
                 posted.push(b.clone());
                 Ok(if b["check"] == true {
                     json!({"project": "webapp", "name": "v1.4", "script": script, "dir": "/repo"})
+                } else if b["now"] == true {
+                    json!({"name": "v1.4", "now": true, "after": []})
                 } else {
                     json!({"ref": "R1", "name": "v1.4"})
                 })
             },
-            &mut |s, n, d, _| {
-                ran.push((s.to_string(), n.to_string(), d.map(str::to_string)));
-                Ok(code)
+            &mut |d| {
+                checked.push(d.map(str::to_string));
+                branch.clone()
             },
             json!({"name": "v1.4", "cwd": "/repo"}),
             no_script,
         );
-        (r, posted, ran)
+        (r, posted, checked)
     }
 
     #[test]
@@ -9461,46 +10295,76 @@ mod tests {
     }
 
     #[test]
-    fn release_cut_runs_the_script_then_records_the_release() {
-        let (r, posted, ran) = cut_with(Some("scripts/release.sh"), 0, false);
-        assert!(matches!(r, Ok(ReleaseCut::Cut(v)) if v["ref"] == "R1"));
-        assert_eq!(ran, vec![("scripts/release.sh".into(), "v1.4".into(), Some("/repo".into()))]);
+    fn release_cut_hands_a_script_cut_to_the_board_to_run_in_the_background() {
+        let (r, posted, checked) = cut_with(Some("scripts/release.sh"), Ok(()), false);
+        assert!(matches!(r, Ok(ReleaseCut::Started(v)) if v["name"] == "v1.4"));
+        assert_eq!(checked, vec![Some("/repo".to_string())], "it checks the branch the script would run on");
         assert_eq!(posted.len(), 2);
-        assert_eq!(posted[0]["check"], true, "it asks before running the script");
+        assert_eq!(posted[0]["check"], true, "it asks before handing it over");
+        assert_eq!(posted[1]["now"], true);
         assert_eq!(posted[1].get("check"), None);
     }
 
     #[test]
-    fn release_cut_records_nothing_when_the_script_fails() {
-        let (r, posted, ran) = cut_with(Some("scripts/release.sh"), 3, false);
-        assert!(matches!(r, Ok(ReleaseCut::ScriptFailed(3))));
-        assert_eq!(ran.len(), 1);
+    fn release_cut_hands_nothing_over_from_a_feature_branch() {
+        let (r, posted, _) = cut_with(Some("scripts/release.sh"), Err("on feat/x".into()), false);
+        assert_eq!(r.err().as_deref(), Some("on feat/x"));
         assert_eq!(posted.len(), 1, "only the check, no cut");
     }
 
     #[test]
     fn release_cut_without_a_script_or_with_no_script_just_records() {
-        let (r, posted, ran) = cut_with(None, 0, false);
+        let (r, posted, checked) = cut_with(None, Ok(()), false);
         assert!(matches!(r, Ok(ReleaseCut::Cut(_))));
-        assert!(ran.is_empty());
+        assert!(checked.is_empty());
         assert_eq!(posted.len(), 2);
+        assert_eq!(posted[1].get("now"), None);
 
-        let (r, posted, ran) = cut_with(Some("scripts/release.sh"), 1, true);
+        let (r, posted, checked) = cut_with(Some("scripts/release.sh"), Ok(()), true);
         assert!(matches!(r, Ok(ReleaseCut::Cut(_))));
-        assert!(ran.is_empty(), "--no-script skips it");
+        assert!(checked.is_empty(), "--no-script skips it");
         assert_eq!(posted.len(), 1);
         assert_eq!(posted[0].get("check"), None);
     }
 
     #[test]
-    fn release_cut_tells_the_script_when_it_replaces_a_failed_release() {
-        for replaces in [true, false] {
-            let mut told = None;
-            let check = json!({"name": "v1.4", "script": "scripts/release.sh", "replaces": replaces});
-            let r = cut_release(&mut |b| Ok(if b["check"] == true { check.clone() } else { json!({"ref": "R2"}) }), &mut |_, _, _, re| { told = Some(re); Ok(0) }, json!({"name": "v1.4"}), false);
-            assert!(r.is_ok());
-            assert_eq!(told, Some(replaces));
-        }
+    fn a_background_cut_is_found_by_name_in_the_release_list() {
+        let running = json!({"pending": {"name": "v1.4", "now": true, "running": true}, "dropped": null, "releases": []});
+        assert!(matches!(cut_state(&running, "V1.4"), CutState::Running(_)));
+        let failed_before = json!({"name": "v1.4", "ref": "R1", "failed_at": "2026-11-20T10:00:00Z"});
+        let done = json!({"pending": null, "dropped": null, "releases": [{"name": "v1.4", "ref": "R2"}, failed_before]});
+        assert!(matches!(cut_state(&done, "v1.4"), CutState::Done(r) if r["ref"] == "R2"));
+        let dropped = json!({"pending": null, "dropped": {"name": "v1.4", "why": "the release script exited 1: no key"}, "releases": [failed_before]});
+        assert!(matches!(cut_state(&dropped, "v1.4"), CutState::Dropped(_)));
+        assert_eq!(cut_state(&json!({"pending": {"name": "v2"}, "releases": [failed_before]}), "v1.4"), CutState::Gone);
+    }
+
+    #[test]
+    fn a_followed_cut_prints_only_the_log_lines_it_hasnt_yet() {
+        let p = json!({"log": ["c", "d", "e"], "log_lines": 5});
+        assert_eq!(new_log_lines(&p, 0), vec!["c", "d", "e"], "only what the board kept");
+        assert_eq!(new_log_lines(&p, 3), vec!["d", "e"]);
+        assert!(new_log_lines(&p, 5).is_empty());
+        assert!(new_log_lines(&json!({}), 0).is_empty());
+    }
+
+    #[test]
+    fn release_status_says_where_the_cut_stands() {
+        let starting = json!({"pending": {"name": "v1.4", "now": true, "running": false, "after": []}});
+        assert_eq!(status_lines(&starting)[0], "v1.4 · starting");
+        let running = json!({"pending": {"name": "v1.4", "now": true, "running": true, "running_at": taskboardd::util::now_iso(), "log": ["Pushed v1.4."]}});
+        let lines = status_lines(&running);
+        assert_eq!(lines[0], "v1.4 · cutting now · started just now");
+        assert_eq!(lines[1], "  Pushed v1.4.");
+        assert!(lines[2].contains("Don't cut it again"));
+        let waiting = json!({"pending": {"name": "v1.5", "running": false, "after": [{"ref": "T1", "state": "waiting"}]}});
+        assert_eq!(status_lines(&waiting), vec!["v1.5 · pending · after T1"]);
+        let dropped = json!({"pending": null, "dropped": {"name": "v1.4", "why": "the release script exited 1: no key", "next": "tb release cut v1.4"}});
+        assert_eq!(status_lines(&dropped), vec!["v1.4 didn't go out: the release script exited 1: no key", "Fix it and cut it again with: tb release cut v1.4"]);
+        let last = json!({"pending": null, "dropped": null, "releases": [{"ref": "R2", "name": "v1.4", "cut_at": "2026-11-21T10:00:00Z", "tasks": 3, "run_url": "https://x/runs/1"}]});
+        assert_eq!(status_lines(&last), vec!["Last release: R2 · v1.4 · 2026-11-21 · 3 tasks", "  Run: https://x/runs/1"]);
+        assert_eq!(status_lines(&json!({"releases": []})), vec!["No release yet."]);
+        assert_eq!(pending_line(&json!({"name": "v1.4", "running": true, "after": []})), "v1.4 · cutting now");
     }
 
     #[test]
@@ -9513,49 +10377,10 @@ mod tests {
 
     #[test]
     fn release_cut_stops_when_the_board_refuses_the_check() {
-        let mut ran = false;
-        let r = cut_release(&mut |_| Err("Nothing to release".into()), &mut |_, _, _, _| { ran = true; Ok(0) }, json!({"name": "v1"}), false);
+        let mut checked = false;
+        let r = cut_release(&mut |_| Err("Nothing to release".into()), &mut |_| { checked = true; Ok(()) }, json!({"name": "v1"}), false);
         assert_eq!(r.err().as_deref(), Some("Nothing to release"));
-        assert!(!ran, "a doomed cut never runs the script");
-    }
-
-    #[test]
-    fn release_script_gets_the_name_as_one_argument() {
-        let dir = std::env::temp_dir().join(format!("tb-release-script-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let d = dir.to_string_lossy().to_string();
-        std::fs::write(dir.join("release.sh"), "test \"$#\" = 1 && test \"$1\" = 'v1 rc' && test \"$TB_RELEASE\" = 'v1 rc' && exit 7\nexit 1\n").unwrap();
-        assert_eq!(run_release_script("sh release.sh", "v1 rc", Some(&d), false).unwrap(), 7);
-        assert_eq!(run_release_script("true", "v1", Some(&d), false).unwrap(), 0);
-        assert_eq!(run_release_script("test \"$TB_RELEASE_REPLACE\" = 1 #", "v1", Some(&d), true).unwrap(), 0);
-        assert_eq!(run_release_script("test -z \"$TB_RELEASE_REPLACE\" #", "v1", Some(&d), false).unwrap(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn release_cut_runs_the_script_only_from_main_or_a_release_branch() {
-        let dir = std::env::temp_dir().join(format!("tb-release-branch-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let d = dir.to_string_lossy().to_string();
-        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&d).args(args).output().unwrap().status.success());
-        git(&["init", "-q", "-b", "main"]);
-        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
-        let ran = dir.join("ran");
-        let script = format!("touch '{}' #", ran.display());
-        let run = |branch: &str| {
-            git(&["checkout", "-q", "-B", branch]);
-            let _ = std::fs::remove_file(&ran);
-            let r = run_release_script_on_a_release_branch(&script, "v1", Some(&d), false);
-            (r, ran.exists())
-        };
-
-        let (r, did) = run("feat/t1-x");
-        assert!(r.unwrap_err().contains("on feat/t1-x"));
-        assert!(!did, "a feature branch doesn't run the script");
-        assert!(matches!(run("release/1.4"), (Ok(0), true)));
-        assert!(matches!(run("main"), (Ok(0), true)));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!checked, "a doomed cut is never handed over");
     }
 
     /// `bash`: Git Bash on Windows, where the `bash` on PATH may be WSL's.
@@ -9659,8 +10484,69 @@ mod tests {
     }
 
     #[test]
+    fn release_sh_cuts_a_beta_only_from_main_or_a_release_branch() {
+        let (tmp, origin, _seed, at) = release_sh_behind_origin("beta-branch");
+        let switch = |b: &str| {
+            let o = std::process::Command::new("git").arg("-C").arg(&at).args(["switch", "-q", "-c", b]).output().unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        };
+        switch("feat/t1-x");
+        let before = rev(&at);
+        let (code, err) = release_sh_in(&at);
+        assert_eq!(code, 1);
+        assert!(err.contains("A beta goes from main or a release/* branch (on feat/t1-x)"), "{err}");
+        assert_eq!(rev(&at), before, "no version commit on the feature branch");
+        let tags = std::process::Command::new("git").arg("-C").arg(&at).args(["tag", "--list"]).output().unwrap();
+        assert!(tags.stdout.is_empty(), "no tag");
+
+        switch("release/0.1");
+        let (code, err) = release_sh_in(&at);
+        assert_eq!(code, 1);
+        assert!(err.contains("No release deploy key"), "a release/* branch gets past the branch check: {err}");
+        let _ = (origin, std::fs::remove_dir_all(&tmp));
+    }
+
+    #[test]
     fn release_sh_pushes_the_branch_and_tag_atomically() {
         let script = include_str!("../../../scripts/release.sh");
         assert!(script.contains("git push --atomic "), "a rejected branch must not leave a pushed tag");
+    }
+
+    #[test]
+    fn issue_takes_several_backlog_items_on_task_new_and_set() {
+        match Cli::try_parse_from(["tb", "task", "new", "--issue", "B3", "--issue", "b4"]).unwrap().cmd {
+            Cmd::Task { action: TaskCmd::New { title, issue, .. } } => {
+                assert_eq!(title, None, "the first item's title when none is given");
+                assert_eq!(issue_refs(&issue).unwrap(), vec!["B3", "B4"]);
+            }
+            _ => panic!("not a task new"),
+        }
+        match Cli::try_parse_from(["tb", "task", "set", "T1", "--issue", "B5", "--issue", "B6"]).unwrap().cmd {
+            Cmd::Task { action: TaskCmd::Set { issue, .. } } => assert_eq!(issue_refs(&issue).unwrap(), vec!["B5", "B6"]),
+            _ => panic!("not a task set"),
+        }
+        assert!(Cli::try_parse_from(["tb", "task", "new", "--issue", "B3", "--not-backlog"]).is_err());
+        assert!(Cli::try_parse_from(["tb", "task", "new"]).is_err(), "a title or an issue");
+    }
+
+    #[test]
+    fn a_detail_names_backlog_refs_standing_as_words() {
+        assert_eq!(detail_issue_refs("Fixes B333, B562 and (B12). B333 again."), vec!["B333", "B562", "B12"]);
+        assert!(detail_issue_refs("AB12 B12x B Bx b14 T12 B-1").is_empty(), "{:?}", detail_issue_refs("AB12 B12x B Bx b14 T12 B-1"));
+        assert_eq!(detail_issue_refs("B7"), vec!["B7"]);
+        assert_eq!(detail_issue_refs("see B8: also B9/B10"), vec!["B8", "B9", "B10"]);
+    }
+
+    #[test]
+    fn the_unlinked_warning_offers_issue_for_each_ref() {
+        assert_eq!(unlinked_text("T4", &[]), None);
+        assert_eq!(
+            unlinked_text("T4", &["B3".into()]).unwrap(),
+            "Note: the detail names B3 without linking it, so finishing T4 won't close it. If T4 fixes it: tb task set T4 --issue B3"
+        );
+        assert_eq!(
+            unlinked_text("T4", &["B3".into(), "B9".into()]).unwrap(),
+            "Note: the detail names B3, B9 without linking them, so finishing T4 won't close them. If T4 fixes them: tb task set T4 --issue B3 --issue B9"
+        );
     }
 }

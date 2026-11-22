@@ -10,7 +10,7 @@ mod view;
 use crate::app::{MainWindow, Page, Panel, TaskTab};
 use crate::fmt::{self, s};
 use crate::theme::{Theme, ThemeMode};
-use crate::ui::kit;
+use crate::ui::{focus, kit};
 use crate::ui::select::{sel, sel_styled};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -41,13 +41,27 @@ thread_local! {
     static HANDOFF_AT: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
     static NOTE_GEN: RefCell<HashMap<String, u64>> = RefCell::new(HashMap::new());
     /// When a click outside last closed the terminal menu, so the same click on ⋯ doesn't reopen it.
-    static MENU_CLOSED: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    static MENU_CLOSED: std::cell::Cell<Option<(std::time::Instant, &'static str)>> = const { std::cell::Cell::new(None) };
     /// The same for a reviewer's popover: when, and whose, so a click on their name doesn't reopen it.
     static REV_CLOSED: RefCell<Option<(std::time::Instant, String)>> = const { RefCell::new(None) };
 }
 
 fn ui<R>(f: impl FnOnce(&mut view::Ui) -> R) -> R {
     UI.with(|u| f(&mut u.borrow_mut()))
+}
+
+/// The panel's typed drafts (answers, notes, picks), to keep across an update restart.
+pub fn drafts() -> std::collections::HashMap<String, String> {
+    ui(|u| u.drafts.iter().filter(|(_, v)| !v.trim().is_empty()).map(|(k, v)| (k.clone(), v.clone())).collect())
+}
+
+/// Put drafts kept across an update restart back; a draft typed since wins.
+pub fn restore_drafts(kept: std::collections::HashMap<String, String>) {
+    ui(|u| {
+        for (k, v) in kept {
+            u.drafts.entry(k).or_insert(v);
+        }
+    });
 }
 
 /// Per-task GPUI state: the text fields drawn in the panel, by their web key (`data-k`).
@@ -379,35 +393,6 @@ fn drop_field(m: &mut MainWindow, key: &str) {
     m.task_panel.fields.remove(key);
 }
 
-/// `saveMeta(el, r, msg)`.
-fn save_meta(m: &mut MainWindow, r: &str, msg: &'static str, cx: &mut Context<MainWindow>) {
-    let rows: Vec<Value> = ui(|u| u.meta_edit.get(r).cloned().unwrap_or_default())
-        .into_iter()
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .filter(|(k, v)| !k.is_empty() || !v.is_empty())
-        .map(|(k, v)| json!([k, v]))
-        .collect();
-    let a = Act::new("meta", "", r, format!("meta:{r}"));
-    let r2 = r.to_string();
-    run(
-        m,
-        &a,
-        format!("tasks/{r}/meta"),
-        json!({ "meta": rows }),
-        move |m, _| {
-            // Keep the edit while one of its fields still has focus (the reader is still typing).
-            let prefix = format!("meta:{r2}:");
-            let editing = m.task_panel.focused.as_ref().is_some_and(|f| m.task_panel.fields.iter().any(|(k, i)| k.starts_with(&prefix) && i.focus == *f));
-            if !editing {
-                ui(|u| u.meta_edit.remove(&r2));
-                m.task_panel.fields.retain(|k, _| !k.starts_with(&format!("meta:{r2}:")));
-            }
-            msg.to_string()
-        },
-        cx,
-    );
-}
-
 /// Run one control, exactly as the web board's `ACTIONS[act]` did.
 pub fn act(m: &mut MainWindow, a: &Act, cx: &mut Context<MainWindow>) {
     let id = a.id.clone();
@@ -434,6 +419,7 @@ pub fn act(m: &mut MainWindow, a: &Act, cx: &mut Context<MainWindow>) {
         }
         "open-task" => open_from_panel(m, &id, cx),
         "tab" => {
+            ui(close_menus);
             if let Some(Panel::Task { tab, .. }) = m.panel.as_mut() {
                 *tab = match a.arg.as_str() {
                     "what" => TaskTab::What,
@@ -535,14 +521,19 @@ pub fn act(m: &mut MainWindow, a: &Act, cx: &mut Context<MainWindow>) {
         "pr-reviewed" => run(m, a, tp("/pr/reviewed"), json!({}), |_, _| "Marked reviewed".into(), cx),
         // Only asks: the confirm merges it.
         "pr-merge-now" => {
+            ui(|u| u.pr_menu = false);
             m.modal = Some(crate::ui::modals::Modal::finish(a.id.clone(), crate::ui::modals::Ask::Merge));
             cx.notify();
         }
         // No group: the row itself turns to "created" when the task reloads; a failure is a toast.
-        "bit-made" => run(m, a, format!("bits/{}/made", a.arg), json!({}), |_, _| String::new(), cx),
-        "term-menu" => {
-            let just_closed = MENU_CLOSED.with(|c| c.take()).is_some_and(|at| at.elapsed() < Duration::from_millis(300));
-            ui(|u| u.term_menu = !u.term_menu && !just_closed);
+        // The ⋯ menus: the terminal's, the need box's and the PR's. One open at a time.
+        "term-menu" | "box-menu" | "pr-menu" => {
+            let which = a.act;
+            let just_closed = MENU_CLOSED.with(|c| c.take()).is_some_and(|(at, w)| w == which && at.elapsed() < Duration::from_millis(300));
+            ui(|u| {
+                let open = close_menus(u) != Some(which) && !just_closed;
+                *menu_flag(u, which) = open;
+            });
             cx.notify();
         }
         // A reviewer's name: open (and fetch) their popover, or close it.
@@ -564,6 +555,14 @@ pub fn act(m: &mut MainWindow, a: &Act, cx: &mut Context<MainWindow>) {
         }
         "close-term" => {
             ui(|u| u.term_menu = false);
+            // A failed task's terminal, or a command still running: ask first.
+            let failed = m.data.task.as_ref().is_some_and(|t| t["failed"] == true);
+            if failed || a.arg == "force" {
+                let ask = if a.arg == "force" { crate::ui::modals::Ask::CloseForce } else { crate::ui::modals::Ask::Close };
+                m.modal = Some(crate::ui::modals::Modal::finish(a.id.clone(), ask));
+                cx.notify();
+                return;
+            }
             run(m, a, tp("/close-terminal"), json!({"force": a.arg == "force"}), |m, _| sent(m), cx)
         }
         "focus" => run(m, a, tp("/focus"), json!({}), |m, _| sent(m), cx),
@@ -572,118 +571,58 @@ pub fn act(m: &mut MainWindow, a: &Act, cx: &mut Context<MainWindow>) {
         "did" => {
             let k = format!("did:{id}");
             let note = ui(|u| u.drafts.get(&k).cloned().unwrap_or_default()).trim().to_string();
+            let r = id.clone();
+            // An empty note when a step asks for one: ask once, and the next Done sends it as it is.
+            if note.is_empty() && !ui(|u| u.did_asked.contains(&k)) {
+                let detail = m.data.task.as_ref().map(|t| s(t, "detail").to_string()).unwrap_or_default();
+                if let Some(ask) = view::note_ask(&detail) {
+                    ui(|u| u.did_asked.insert(k.clone()));
+                    set_note(&a.grp, ask, true, cx);
+                    return;
+                }
+            }
+            ui(|u| u.did_asked.remove(&k));
             run(
                 m,
                 a,
                 tp("/did"),
                 json!({"note": note}),
-                // The box turning to "Done by you" says it; no note beside the button.
+                // The box turning to "Done by you" says it; no note beside the button, only the
+                // toast that can take it back.
                 move |m, _| {
                     ui(|u| u.drafts.remove(&k));
                     drop_field(m, &k);
+                    let (text, undo) = (format!("Marked {r} done"), format!("tasks/{r}/owner-reopen"));
+                    m.settle(Instant::now(), move |m, cx| m.toast_undo(text, undo, cx));
                     String::new()
                 },
                 cx,
             );
         }
+        // Reopen on a done human task: back in Needs you, waiting on the owner.
+        "owner-reopen" => run(m, a, tp("/owner-reopen"), json!({}), |_, _| String::new(), cx),
         "talk" => run(m, a, tp("/talk"), json!({}), |m, _| sent(m), cx),
         "open-url" => open_target(&a.arg, cx),
+        // Another of the task's terminals (the PR's, or one still open from before): bring it up in Midna.
         "term-focus" => run(m, a, format!("sessions/{id}/focus"), json!({}), |m, _| sent(m), cx),
-        "resume" => run(m, a, tp("/resume"), json!({"mode": a.arg}), |m, _| sent(m), cx),
-        "meta-del" => {
-            let Some(task) = m.data.task.clone() else { return };
-            let i: usize = a.arg.parse().unwrap_or(usize::MAX);
-            let original = fmt::arr(&task, "meta").len();
-            ui(|u| {
-                let mut rows = view::meta_rows(&task, u);
-                if i < rows.len() {
-                    rows.remove(i);
-                }
-                u.meta_edit.insert(id.clone(), rows);
-            });
-            m.task_panel.fields.retain(|k, _| !k.starts_with(&format!("meta:{id}:")));
-            if i >= original {
-                ui(|u| u.notes.remove(&format!("meta:{id}")));
-                cx.notify();
-                return;
-            }
-            save_meta(m, &id, "Removed", cx);
+        "resume" => {
+            ui(|u| u.box_menu = false);
+            run(m, a, tp("/resume"), json!({"mode": a.arg}), |m, _| sent(m), cx)
         }
         "open-project" => crate::ui::projects::open_for(m, &a.arg, cx),
         "att-drop" => {
             ui(|u| u.att_drop = !u.att_drop);
             cx.notify();
         }
-        "att-menu" => {
-            ui(|u| u.att_menu = if u.att_menu.as_deref() == Some(id.as_str()) { None } else { Some(id.clone()) });
-            cx.notify();
-        }
-        "att-menu-close" => {
-            if let Some(a) = attachment(m, &id) {
-                if let Some(h) = view::att_href(&a) {
-                    open_target(&h, cx);
-                }
-            }
-            ui(|u| u.att_menu = None);
-            cx.notify();
-        }
-        "att-copy" => {
-            ui(|u| u.att_menu = None);
-            let url = attachment(m, &id).map(|a| s(&a, "url").to_string()).unwrap_or_default();
-            cx.write_to_clipboard(ClipboardItem::new_string(url));
-            m.toast("Copied", false, cx);
-        }
-        "att-edit" => {
-            ui(|u| {
-                u.att_menu = None;
-                u.att_edit = Some(id.clone());
-                clear_att_edit(u, &id);
-            });
-            m.task_panel.fields.retain(|k, _| !k.starts_with(&format!("attedit:{id}:")));
-            cx.notify();
-        }
-        "att-ekind" => {
-            ui(|u| u.drafts.insert(format!("attedit:{id}:kind"), a.arg.clone()));
-            cx.notify();
-        }
-        "att-ecancel" => {
-            ui(|u| {
-                u.att_edit = None;
-                clear_att_edit(u, &id);
-            });
-            cx.notify();
-        }
-        "att-esave" => {
-            let k = format!("attedit:{id}");
-            let body = ui(|u| {
-                let mut b = serde_json::Map::new();
-                for f in ["title", "url", "kind"] {
-                    if let Some(v) = u.drafts.get(&format!("{k}:{f}")) {
-                        b.insert(f.into(), json!(v));
-                    }
-                }
-                Value::Object(b)
-            });
-            let id2 = id.clone();
-            run(
-                m,
-                a,
-                format!("attachments/{id}"),
-                body,
-                move |_, _| {
-                    ui(|u| {
-                        u.att_edit = None;
-                        clear_att_edit(u, &id2);
-                    });
-                    "Saved".into()
-                },
-                cx,
-            );
-        }
-        "att-remove" => {
-            ui(|u| u.att_menu = None);
-            run(m, a, format!("attachments/{id}/remove"), json!({}), |_, _| "Removed".into(), cx);
-        }
+        // A merge that went without a note for testers: the board brings the conversation back to write it.
+        "write-note" => run(
+            m,
+            a,
+            tp("/merged-note/ask"),
+            json!({}),
+            |_, v| if v["asked"] == true { "Asked. Its conversation comes back to write it.".into() } else { "Asked. It comes back to write it once it can.".into() },
+            cx,
+        ),
         // Show all: the whole note for testers in a dialog.
         "note-all" => {
             let text = m.data.task.as_ref().and_then(|t| t["merged_note"]["text"].as_str()).unwrap_or_default().to_string();
@@ -692,17 +631,6 @@ pub fn act(m: &mut MainWindow, a: &Act, cx: &mut Context<MainWindow>) {
         }
         _ => {}
     }
-}
-
-fn clear_att_edit(u: &mut view::Ui, id: &str) {
-    for f in ["kind", "title", "url"] {
-        u.drafts.remove(&format!("attedit:{id}:{f}"));
-    }
-}
-
-fn attachment(m: &MainWindow, id: &str) -> Option<Value> {
-    let t = m.data.task.as_ref()?;
-    fmt::arr(t, "attachments").iter().chain(fmt::arr(t, "goal_attachments")).find(|a| fmt::ref_of(&a["id"], "") == id || a["id"].to_string() == id).cloned()
 }
 
 /// Follow a plain link (`<a href>`).
@@ -733,6 +661,7 @@ fn go(m: &mut MainWindow, g: &Go, cx: &mut Context<MainWindow>) {
         Go::Goal(r) => {
             m.go(Page::Goal(r.clone()), cx);
         }
+        Go::GoalWave(r, w) => crate::ui::goal::open_at(m, r, *w, cx),
         // The terminal itself, in Midna: the board stays where it is.
         Go::Session(id) => m.show_in_midna(id, cx),
         Go::Issue(r) => {
@@ -758,6 +687,12 @@ fn open_target(url: &str, cx: &mut App) {
 fn handoff_stamp(t: &Value) -> String {
     let newest = t["log"].get(0).map(|e| e["at"].to_string()).unwrap_or_default();
     format!("{}|{}|{}|{newest}", t["ctx_version"], t["updated_at"], t["status"])
+}
+
+/// `handoffWanted(t)`: the Context tab fetches the handoff when there's none to show, or when the
+/// detail doesn't carry it and `fetched_at` (the stamp of the last fetch) is from an older state.
+pub(crate) fn handoff_wanted(t: &Value, u: &view::Ui, fetched_at: Option<&str>) -> bool {
+    view::handoff_text(t, u).is_none() || (t.get("handoff").is_none() && fetched_at != Some(handoff_stamp(t).as_str()))
 }
 
 /// `loadHandoff(r)`: fetch the handoff when the Context tab needs it and the task has none, or
@@ -792,8 +727,8 @@ fn load_handoff(m: &MainWindow, cx: &mut Context<MainWindow>) {
     let Some(task) = m.data.task.as_ref() else { return };
     let r = r.clone();
     let stamp = handoff_stamp(task);
-    let fresh = ui(|u| view::handoff_text(task, u).is_some()) && (task.get("handoff").is_some() || HANDOFF_AT.with(|h| h.borrow().get(&r) == Some(&stamp)));
-    if fresh || LOADING.with(|l| !l.borrow_mut().insert(r.clone())) {
+    let wanted = HANDOFF_AT.with(|h| ui(|u| handoff_wanted(task, u, h.borrow().get(&r).map(String::as_str))));
+    if !wanted || LOADING.with(|l| !l.borrow_mut().insert(r.clone())) {
         return;
     }
     let backend = m.backend.clone();
@@ -831,22 +766,14 @@ fn sync_fields(m: &mut MainWindow, n: &Node, window: &mut Window, cx: &mut Conte
             let k = key.clone();
             let sub = cx.subscribe(&input.field, move |m, field, _: &crate::ui::text_input::FieldChanged, cx| {
                 let text = field.read(cx).text().to_string();
+                // Send answer is off while the box is empty: redraw when that flips.
+                let flips = k.starts_with("answer:") && ui(|u| u.drafts.get(&k).is_none_or(|d| d.trim().is_empty())) != text.trim().is_empty();
                 on_input(m, &k, text);
+                if flips {
+                    cx.notify();
+                }
             });
             m.task_panel.subs.push(sub);
-            if key.starts_with("meta:") {
-                // `change` on leaving the field saves the Details (`saveMeta`).
-                let k = key.clone();
-                let sub = cx.on_blur(&input.focus, window, move |m, _, cx| {
-                    if let Some(r) = k.split(':').nth(1) {
-                        let r = r.to_string();
-                        if ui(|u| u.meta_edit.contains_key(&r)) {
-                            save_meta(m, &r, "Saved", cx);
-                        }
-                    }
-                });
-                m.task_panel.subs.push(sub);
-            }
             m.task_panel.fields.insert(key.clone(), input);
         }
         Node::El { .. } => {
@@ -858,28 +785,9 @@ fn sync_fields(m: &mut MainWindow, n: &Node, window: &mut Window, cx: &mut Conte
     }
 }
 
-/// The web's `input` listener: `data-k` → drafts; `data-meta="r:i:j"` → the Details edit.
-fn on_input(m: &mut MainWindow, key: &str, text: String) {
-    if let Some(rest) = key.strip_prefix("meta:") {
-        let mut it = rest.split(':');
-        let (Some(r), Some(i), Some(j)) = (it.next(), it.next().and_then(|x| x.parse::<usize>().ok()), it.next()) else { return };
-        let Some(task) = m.data.task.clone() else { return };
-        ui(|u| {
-            if !u.meta_edit.contains_key(r) {
-                let rows = view::meta_rows(&task, u);
-                u.meta_edit.insert(r.to_string(), rows);
-            }
-            if let Some(row) = u.meta_edit.get_mut(r).and_then(|rows| rows.get_mut(i)) {
-                if j == "0" {
-                    row.0 = text;
-                } else {
-                    row.1 = text;
-                }
-            }
-        });
-    } else {
-        ui(|u| u.drafts.insert(key.to_string(), text));
-    }
+/// The web's `input` listener: `data-k` → drafts.
+fn on_input(_m: &mut MainWindow, key: &str, text: String) {
+    ui(|u| u.drafts.insert(key.to_string(), text));
 }
 
 // ------------------------------------------------------------------ render
@@ -887,10 +795,11 @@ fn on_input(m: &mut MainWindow, key: &str, text: String) {
 /// `.panel { width: min(480px, 100vw) }`, as wide as the issue panel.
 pub const WIDTH: f32 = 480.;
 
-/// The task panel on the right, floating over the page's right edge: going to another page keeps it; Esc
-/// and its close button close it.
+/// The task panel on the right, docked beside the page from [`crate::app::DOCK_FROM`] wide and floating
+/// over the page's right edge below that: going to another page keeps it; Esc and its close button close it.
 pub fn render(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWindow>) -> AnyElement {
     let t = cx.global::<Theme>().clone();
+    let floats = !crate::app::docked(window);
     let body = match body(m, &t, window, cx) {
         Some(b) => b,
         None => {
@@ -907,7 +816,7 @@ pub fn render(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWind
         .bg(t.card)
         .border_l_1()
         .border_color(t.border)
-        .shadow_lg()
+        .when(floats, |d| d.shadow_lg())
         .occlude()
         .child(div().flex().flex_col().flex_1().min_h_0().child(body))
         .into_any_element()
@@ -920,7 +829,7 @@ fn body(m: &mut MainWindow, t: &Theme, window: &mut Window, cx: &mut Context<Mai
     if m.task_panel.r != r {
         m.task_panel = State { r: r.clone(), ..Default::default() };
         ui(|u| {
-            u.term_menu = false;
+            close_menus(u);
             u.tl_open.clear();
             u.rev_pop = None;
         });
@@ -1001,20 +910,20 @@ impl Draw<'_> {
         self.within.last().copied()
     }
 
-    /// The sheet scrolls (`.panel { overflow-y: auto; gap: 18px; padding: 16px 24px 32px }`) between
-    /// the header (breadcrumb, title, chips), pinned above it, and the footer tabs, pinned under it.
+    /// The sheet scrolls (`.panel { overflow-y: auto; gap: 18px; padding: 16px 24px 32px }`) under
+    /// the header (breadcrumb, title, chips) and the tabs, both pinned above it.
     fn panel(&mut self, m: &MainWindow, tree: &Node, cx: &mut Context<MainWindow>) -> AnyElement {
         let r = m.task_panel.r.clone();
         let panel = div().size_full().flex().flex_col().text_size(px(14.));
         let (head, col, foot) = self.sheet(m, tree, true, cx);
-        let head = head.map(|h| h.flex_none().px(px(24.)).pt(px(16.)).pb(px(16.)).line_height(relative(1.5)).border_b_1().border_color(self.t.border));
+        let head = head.map(|h| h.flex_none().px(px(24.)).pt(px(16.)).pb(px(if foot.is_some() { 12. } else { 16. })).line_height(relative(1.5)).when(foot.is_none(), |d| d.border_b_1().border_color(self.t.border)));
         // The Full log: a list that draws only what's in view, the sheet above as its first item.
         if let (Some(l), Some(_)) = (&m.task_panel.log_list, find_log(tree)) {
             let items = list(l.state.clone(), cx.processor(log_list_item)).flex_1().min_h_0();
-            return panel.children(head).child(items).children(foot).into_any_element();
+            return panel.children(head).children(foot).child(items).into_any_element();
         }
         let body = div().id(SharedString::from(format!("task-body-{r}"))).flex_1().min_h_0().overflow_y_scroll().child(col.pb(px(32.)));
-        panel.children(head).child(body).children(foot).into_any_element()
+        panel.children(head).children(foot).child(body).into_any_element()
     }
 
     /// The header (breadcrumb, title, chips), the sheet under it and (when `with_foot`) the footer.
@@ -1026,12 +935,12 @@ impl Draw<'_> {
         let mut foot = None;
         self.within.push(K::Col);
         for (i, k) in kids.iter().enumerate() {
-            if !with_foot && matches!(k, Node::El { k: K::Foot, .. }) {
+            if !with_foot && matches!(k, Node::El { k: K::PanelTabs, .. }) {
                 continue;
             }
             self.path.push(i);
             let e = self.node(m, k, None, cx);
-            if let Node::El { k: K::Foot, .. } = k {
+            if let Node::El { k: K::PanelTabs, .. } = k {
                 self.path.pop();
                 foot = Some(e);
                 continue;
@@ -1143,7 +1052,7 @@ impl Draw<'_> {
             kit::disabled(b)
         } else {
             let a = a.clone();
-            b.on_click(cx.listener(move |m, _, window, cx| {
+            focus::stop(self.t, b).on_click(cx.listener(move |m, _, window, cx| {
                 let had = m.modal.is_some();
                 act(m, &a, cx);
                 // A control that opened a dialog hands it the keys, so esc closes it.
@@ -1173,7 +1082,7 @@ impl Draw<'_> {
         } else {
             link(t, self.id("link"), s, look)
         };
-        let l = l.on_click(cx.listener(move |m, _, _, cx| go(m, &g, cx)));
+        let l = focus::stop(t, l).on_click(cx.listener(move |m, _, _, cx| go(m, &g, cx)));
         match tip {
             Some(tip) => l.tooltip(kit::tip(tip.clone())).into_any_element(),
             None => l.into_any_element(),
@@ -1186,8 +1095,6 @@ impl Draw<'_> {
         let Some(input) = m.task_panel.fields.get(key) else { return div().into_any_element() };
         let k = key.to_string();
         let focused = input.focus.is_focused(self.window);
-        let meta = self.parent() == Some(K::MetaRow);
-        let name = meta && key.ends_with(":0");
         input
             .render(t, self.id("field"), self.window)
             // `.input`: 14px, 10px 12px, 9px corners.
@@ -1198,10 +1105,6 @@ impl Draw<'_> {
             .when(multi, |d| d.min_h(px(64.)).items_start())
             .when(mono, |d| d.font_family(t.mono_font.clone()))
             .when(boxed == Some(BoxTone::Ask) && !focused, |d| d.border_color(warn_input(t)))
-            // `.meta-row .input`: 36px, 13px, 7px corners, the light border; the name in semibold.
-            .when(meta, |d| d.min_h(px(36.)).py(px(0.)).px(px(10.)).text_size(px(13.)).rounded(px(7.)).when(!focused, |d| d.border_color(t.border)))
-            .when(name, |d| d.w(px(140.)).flex_none().font_weight(FontWeight::SEMIBOLD))
-            .when(meta && !name, |d| d.flex_1().min_w_0())
             .on_key_down(cx.listener(move |m, ev: &KeyDownEvent, _, cx| on_key(m, &k, ev, cx)))
             .into_any_element()
     }
@@ -1301,7 +1204,7 @@ impl Draw<'_> {
             K::TlActs => self.c_tl_acts(m, n, boxed, cx),
             K::TermMenu => self.c_term_menu(m, n, boxed, cx),
             K::MenuItem { danger } => self.c_menu_item(n, danger, cx),
-            K::Foot => self.c_foot(m, n, cx),
+            K::PanelTabs => self.c_foot(m, n, cx),
             K::Step(st) => self.c_step(m, n, st, boxed, cx),
             K::Kv => self.c_kv(m, n, boxed, cx),
             K::Files => self.c_files(m, n, boxed, cx),
@@ -1356,8 +1259,6 @@ impl Draw<'_> {
             K::KvRow => div().flex().gap(px(12.)),
             // `.det`: a finished step's detail, under its head.
             K::Det => div().flex().flex_col().mt(px(8.)).px(px(12.)).py(px(4.)).rounded(px(9.)).bg(t.col).border_1().border_color(t.border).text_size(px(13.)),
-            // `.meta-row`: 140px name, value, 32px remove.
-            K::MetaRow => div().flex().items_center().gap(px(8.)),
             // `.note-body p`: lines joined by line breaks.
             K::MdP => div().flex().flex_col().min_w_0(),
             // Linked, MdP
@@ -1400,7 +1301,7 @@ impl Draw<'_> {
                 .child(div().text_size(px(9.)).child(if open { "▼" } else { "▶" }))
                 .child(label),
         };
-        let head = head.on_click(toggle);
+        let head = focus::stop(t, head).on_click(toggle);
         let mut col = div().flex().flex_col().min_w_0().child(head);
         if open {
             let gap = 6.;
@@ -1439,27 +1340,30 @@ impl Draw<'_> {
             .into_any_element()
     }
 
-    /// `.needs-banner`: full width under the chips (bleeding past the sheet's 24px sides), 14px 24px,
-    /// a line above and below.
+    /// The need box on top of the Timeline: the one thing the owner can do, in its tone (orange when
+    /// it waits on them, red when something broke, green when it looks finished, grey when nothing's
+    /// needed), rounded with a line round it.
     #[inline(never)]
     fn c_banner(&mut self, m: &MainWindow, n: &Node, tone: BoxTone, cx: &mut Context<MainWindow>) -> AnyElement {
         let t = self.t;
         let (bg, line) = match tone {
             BoxTone::Lost => (t.down_soft, t.down_line),
             BoxTone::Quiet => (t.seg, t.border),
-            _ => (t.warn_soft, t.warn_line),
+            BoxTone::Done => (t.up_soft, t.border),
+            BoxTone::Info => (accent_tint(t), t.accent_line),
+            BoxTone::Ask => (t.warn_soft, t.warn_line),
         };
         let kids = self.kids(m, n, Some(tone), cx);
         div()
             .flex()
             .flex_col()
-            .gap(px(12.))
-            .mx(px(-24.))
-            .px(px(24.))
+            .gap(px(10.))
+            .mb(px(16.))
+            .px(px(16.))
             .py(px(14.))
+            .rounded(px(12.))
             .bg(bg)
-            .border_t_1()
-            .border_b_1()
+            .border_1()
             .border_color(line)
             .text_size(px(14.))
             .children(kids)
@@ -1555,7 +1459,7 @@ impl Draw<'_> {
         match href {
             Some(h) => {
                 let g = Go::Url(h);
-                row.cursor_pointer().on_click(cx.listener(move |m, _, _, cx| go(m, &g, cx))).into_any_element()
+                focus::stop(t, row).cursor_pointer().on_click(cx.listener(move |m, _, _, cx| go(m, &g, cx))).into_any_element()
             }
             None => row.into_any_element(),
         }
@@ -1592,14 +1496,11 @@ impl Draw<'_> {
     fn c_steps(&mut self, m: &MainWindow, n: &Node, boxed: Option<BoxTone>, cx: &mut Context<MainWindow>) -> AnyElement {
         let t = self.t;
         let kids = self.kids(m, n, boxed, cx);
-        let mut row = div().flex().items_start().pt(px(4.)).pb(px(2.));
+        let mut col = div().flex().flex_col().min_w_0().rounded(px(10.)).border_1().border_color(t.border);
         for (i, e) in kids.into_iter().enumerate() {
-            if i > 0 {
-                row = row.child(div().flex_1().min_w(px(14.)).h(px(2.)).mt(px(10.)).rounded(px(1.)).bg(t.border_2));
-            }
-            row = row.child(e);
+            col = col.child(div().when(i > 0, |d| d.border_t_1().border_color(t.divider)).child(e));
         }
-        row.into_any_element()
+        col.into_any_element()
     }
 
     /// `.tline`: the stops top to bottom, a rail joining each to the next.
@@ -1695,8 +1596,7 @@ impl Draw<'_> {
             cx.notify();
         });
         let head = self.kid(m, n, 0, boxed, cx);
-        let button = div()
-            .id(self.id("step"))
+        let button = focus::stop(t, div().id(self.id("step")))
             .flex()
             .items_center()
             .gap(px(10.))
@@ -1759,7 +1659,7 @@ impl Draw<'_> {
         let mut at = div().relative().ml_auto();
         for (kid, e) in nodes.iter().zip(kids) {
             match kid {
-                Node::Btn { act: a, .. } if a.act == "term-menu" => at = at.child(e),
+                Node::Btn { act: a, .. } if a.act.ends_with("-menu") => at = at.child(e),
                 Node::El { k: K::TermMenu, .. } => at = at.child(div().absolute().right_0().top(px(34.)).child(deferred(e).with_priority(2))),
                 _ => row = row.child(e),
             }
@@ -1786,8 +1686,8 @@ impl Draw<'_> {
             .occlude()
             .on_mouse_down_out(cx.listener(|_, _, _, cx| {
                 // The ⋯ button toggles it itself: closing here first would reopen it.
-                if ui(|u| std::mem::replace(&mut u.term_menu, false)) {
-                    MENU_CLOSED.with(|c| c.set(Some(std::time::Instant::now())));
+                if let Some(which) = ui(close_menus) {
+                    MENU_CLOSED.with(|c| c.set(Some((std::time::Instant::now(), which))));
                     cx.notify();
                 }
             }))
@@ -1803,8 +1703,7 @@ impl Draw<'_> {
         let Node::El { kids, .. } = n else { return div().into_any_element() };
         let Some(Node::Btn { label, act: a, .. }) = kids.first() else { return div().into_any_element() };
         let a = a.clone();
-        let name = div()
-            .id(self.id("rev-name"))
+        let name = focus::stop(t, div().id(self.id("rev-name")))
             .px(px(6.))
             .mx(px(-6.))
             .rounded(px(6.))
@@ -1952,8 +1851,7 @@ impl Draw<'_> {
             _ => String::new(),
         };
         let tint = t.tint;
-        div()
-            .id(self.id("menu-item"))
+        focus::stop(t, div().id(self.id("menu-item")))
             .flex()
             .flex_col()
             .gap(px(2.))
@@ -1968,13 +1866,13 @@ impl Draw<'_> {
             .into_any_element()
     }
 
-    /// `.panel-foot`: What to do, Context and Full log (with its count), pinned under the sheet.
+    /// The tabs (Full log with its count), pinned under the header on one line.
     #[inline(never)]
     fn c_foot(&mut self, m: &MainWindow, n: &Node, cx: &mut Context<MainWindow>) -> AnyElement {
         let t = self.t;
         let Node::El { kids: nodes, .. } = n else { return div().into_any_element() };
         let kids = self.kids(m, n, None, cx);
-        let mut row = div().flex().flex_none().items_center().gap(px(22.)).px(px(24.)).pt(px(14.)).pb(px(16.)).border_t_1().border_color(t.border).bg(t.card);
+        let mut row = div().flex().flex_none().items_end().gap(px(22.)).px(px(24.)).border_b_1().border_color(t.border);
         let mut prev: Option<AnyElement> = None;
         for (kid, e) in nodes.iter().zip(kids) {
             match kid {
@@ -1995,11 +1893,12 @@ impl Draw<'_> {
     #[inline(never)]
     fn c_step(&mut self, m: &MainWindow, n: &Node, st: StepSt, boxed: Option<BoxTone>, cx: &mut Context<MainWindow>) -> AnyElement {
         let t = self.t;
+        // Orange is only for what waits on the owner; red for a failure.
         let (name_c, sub_c) = match st {
-            StepSt::Done => (t.text_2, t.up),
-            StepSt::Fail => (t.down, t.down),
-            StepSt::Ask => (t.warn, t.warn),
-            StepSt::Wait | StepSt::Now => (t.text_2, t.accent_fg),
+            StepSt::Done => (t.text, t.up_fg),
+            StepSt::Fail => (t.text, t.down),
+            StepSt::Ask => (t.text, t.warn_fg),
+            StepSt::Wait | StepSt::Now => (t.text, t.accent_fg),
             StepSt::Todo => (t.muted, t.faint),
         };
         let bold = matches!(st, StepSt::Fail | StepSt::Ask);
@@ -2008,13 +1907,14 @@ impl Draw<'_> {
         let (name, sub) = (kids.next(), kids.next());
         div()
             .flex()
-            .flex_col()
-            .flex_none()
             .items_center()
-            .gap(px(4.))
+            .gap(px(10.))
+            .px(px(12.))
+            .py(px(8.))
+            .text_size(px(13.))
             .child(dot)
-            .child(div().text_color(name_c).when(bold, |d| d.font_weight(FontWeight::BOLD)).children(name))
-            .children(sub.map(|s| div().text_color(sub_c).child(s)))
+            .child(div().flex_1().min_w_0().text_color(name_c).children(name))
+            .children(sub.map(|s| div().flex_none().max_w(px(240.)).text_color(sub_c).when(bold, |d| d.font_weight(FontWeight::SEMIBOLD)).child(s)))
             .into_any_element()
     }
 
@@ -2180,20 +2080,13 @@ fn pr_label(t: &Theme, s: &str) -> Div {
 
 fn on_key(m: &mut MainWindow, key: &str, ev: &KeyDownEvent, cx: &mut Context<MainWindow>) {
     let ks = &ev.keystroke;
-    // ⌘↩ in an answer sends it (the web's keydown handler); ↩ in a Details field commits it.
+    // ⌘↩ in an answer sends it (the web's keydown handler).
     if ks.key == "enter" && (ks.modifiers.platform || ks.modifiers.control) {
         if let Some(r) = key.strip_prefix("answer:") {
             let a = build(m).and_then(|tree| view::find_act(&tree, "answer", Some("")).cloned()).unwrap_or_else(|| Act::new("answer", "", r, format!("ask:{r}")));
             act(m, &a, cx);
             cx.stop_propagation();
         }
-    } else if ks.key == "enter" && key.starts_with("meta:") {
-        if let Some(r) = key.split(':').nth(1).map(str::to_string) {
-            if ui(|u| u.meta_edit.contains_key(&r)) {
-                save_meta(m, &r, "Saved", cx);
-            }
-        }
-        cx.stop_propagation();
     }
 }
 
@@ -2283,25 +2176,9 @@ fn danger(t: &Theme, id: SharedString, label: String) -> Stateful<Div> {
     raw(t, id, label).text_color(t.down).border_color(t.down_line)
 }
 
-/// `.tab`: 14px semibold, 42px, an accent underline when selected.
+/// A panel tab: the shared underlined tab.
 fn tab_btn(t: &Theme, id: SharedString, label: &str, on: bool) -> Stateful<Div> {
-    let hover = t.text;
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .min_h(px(42.))
-        .px(px(10.))
-        .mb(px(-1.))
-        .border_b_2()
-        .border_color(if on { t.accent } else { transparent_black() })
-        .text_size(px(14.))
-        .font_weight(FontWeight::SEMIBOLD)
-        .cursor_pointer()
-        .whitespace_nowrap()
-        .text_color(if on { t.text } else { t.muted })
-        .hover(move |s| s.text_color(hover))
-        .child(label.to_string())
+    kit::tab(t, id, label, on)
 }
 
 /// `.fchip`: a round 32px filter chip; the pressed one inverted.
@@ -2393,7 +2270,23 @@ fn button(t: &Theme, id: SharedString, label: &str, look: Look) -> Stateful<Div>
     match look {
         Look::Plain => base(t, id, label),
         Look::Chip { on } => chip(t, div().id(id), on).child(label),
-        Look::Foot { on } => div().id(id).flex().items_center().gap(px(6.)).text_size(px(13.)).text_color(if on { t.text } else { t.text_2 }).cursor_pointer().hover(|d| d.text_color(t.text)).child(label),
+        // The open tab: bold, on a 2px accent line.
+        Look::PanelTab { on } => div()
+            .id(id)
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .pt(px(4.))
+            .pb(px(8.))
+            .mb(px(-1.))
+            .border_b_2()
+            .border_color(if on { t.accent } else { gpui::transparent_black() })
+            .text_size(px(13.))
+            .text_color(if on { t.text } else { t.text_2 })
+            .when(on, |d| d.font_weight(FontWeight::SEMIBOLD))
+            .cursor_pointer()
+            .hover(|d| d.text_color(t.text))
+            .child(label),
         Look::Primary | Look::PrimaryWide => {
             let b = raw(t, id, label).bg(t.accent_btn).border_color(transparent_black()).text_color(t.on_accent).font_weight(FontWeight::SEMIBOLD).hover(|d| d.opacity(0.94));
             // `.lg.wide`: 42px, 14px, sharing the row.
@@ -2418,7 +2311,7 @@ fn button(t: &Theme, id: SharedString, label: &str, look: Look) -> Stateful<Div>
         // `.btn.link.inline`
         Look::Ref => div().id(id).flex_none().cursor_pointer().text_color(t.accent_fg).underline().child(label),
         Look::Menu => kit::menu_item(t, id, label, false),
-        // Segmented buttons (the attachment kind picker).
+        // Segmented buttons (the log filters).
         Look::Tab { on } => {
             let hover = t.text;
             div()
@@ -2793,16 +2686,37 @@ pub(crate) fn chevron(open: bool, color: Hsla) -> impl IntoElement {
 }
 
 /// `.pr-step-dot` in each state.
+/// Closes whichever ⋯ menu is open, saying which.
+fn close_menus(u: &mut view::Ui) -> Option<&'static str> {
+    let open = if u.term_menu {
+        Some("term-menu")
+    } else if u.box_menu {
+        Some("box-menu")
+    } else if u.pr_menu {
+        Some("pr-menu")
+    } else {
+        None
+    };
+    (u.term_menu, u.box_menu, u.pr_menu) = (false, false, false);
+    open
+}
+
+fn menu_flag<'a>(u: &'a mut view::Ui, which: &str) -> &'a mut bool {
+    match which {
+        "box-menu" => &mut u.box_menu,
+        "pr-menu" => &mut u.pr_menu,
+        _ => &mut u.term_menu,
+    }
+}
+
 fn step_dot(t: &Theme, st: StepSt) -> AnyElement {
-    let d = div().flex_none().size(px(22.)).rounded_full().flex().items_center().justify_center();
-    // `box-shadow: 0 0 0 2px`: a 2px ring outside the dot.
-    let ring = |c: Hsla, inner: Div| div().flex_none().size(px(26.)).m(px(-2.)).p(px(2.)).rounded_full().bg(c).child(inner).into_any_element();
+    let d = div().flex_none().size(px(16.)).rounded_full().flex().items_center().justify_center();
     match st {
-        StepSt::Done => d.bg(t.up_soft).child(paint(Ic::Check, 12., 3., t.up)).into_any_element(),
-        StepSt::Fail => ring(t.down, d.bg(t.down_soft).child(paint(Ic::X, 11., 3., t.down))),
-        StepSt::Ask => ring(t.warn, d.bg(t.warn_soft).child(paint(Ic::Comment, 11., 2.6, t.warn))),
-        StepSt::Wait => d.border_1().border_color(t.accent).child(paint(Ic::Clock, 12., 2.6, t.accent_fg)).into_any_element(),
-        StepSt::Now => d.child(spinner(22., 2., t.accent)).into_any_element(),
+        StepSt::Done => d.bg(t.up_soft).child(paint(Ic::Check, 9., 3., t.up)).into_any_element(),
+        StepSt::Fail => d.bg(t.down_soft).border_1().border_color(t.down).child(paint(Ic::X, 8., 3., t.down)).into_any_element(),
+        StepSt::Ask => d.bg(t.warn_soft).border_1().border_color(t.warn).child(paint(Ic::Comment, 8., 2.6, t.warn)).into_any_element(),
+        StepSt::Wait => d.border_1().border_color(t.accent).child(paint(Ic::Clock, 9., 2.6, t.accent_fg)).into_any_element(),
+        StepSt::Now => d.child(spinner(16., 2., t.accent)).into_any_element(),
         StepSt::Todo => d.border_1().border_color(t.border_2).into_any_element(),
     }
 }

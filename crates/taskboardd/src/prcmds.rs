@@ -608,19 +608,25 @@ pub fn merge_blockers(app: &App, t: &Row, rec: &Value, owner_approved: bool) -> 
 
 /// One thing that holds the merge. `overridable`: the owner's override (`tb pr merge --override`, or
 /// Merge now in the app) merges past it (#876); the rest (a PR that isn't open, conflicts, the stack's
-/// order) would merge the wrong thing or fail on the host.
+/// order) would merge the wrong thing or fail on the host. `waits`: it clears on its own as the host
+/// catches up (checks running or not posted yet, a push it doesn't show yet), and the board watches
+/// for that and brings the agent back to merge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gate {
     pub why: String,
     pub overridable: bool,
+    pub waits: bool,
 }
 
 impl Gate {
     fn hard(why: String) -> Self {
-        Gate { why, overridable: false }
+        Gate { why, overridable: false, waits: false }
     }
     fn soft(why: String) -> Self {
-        Gate { why, overridable: true }
+        Gate { why, overridable: true, waits: false }
+    }
+    fn wait(why: String) -> Self {
+        Gate { why, overridable: true, waits: true }
     }
 }
 
@@ -636,11 +642,20 @@ pub fn merge_gates(app: &App, t: &Row, rec: &Value, owner_approved: bool) -> Res
     if prflow::conflicting(&f, rec) {
         out.push(Gate::hard(format!("it conflicts with its base branch {}: rebase onto it and push first", rec["base"].as_str().unwrap_or("main"))));
     }
+    // Checks read on a head older than the branch's last push are that head's, not what would merge (#933).
+    if let Some(pushed) = prflow::newer_push(app, t, rec) {
+        out.push(Gate::wait(format!(
+            "its branch was pushed at {} but {} still shows {}: wait for that push's checks (tb pr wait)",
+            prflow::short_sha(&pushed),
+            PrRef::of(t).map_or("the host".to_string(), |p| prhost::limit::label(&p.host)),
+            prflow::short_sha(rec["head"].as_str().unwrap_or("")),
+        )));
+    }
     // A failure holds the merge unless the owner's hook skipped it; `tb pr skip-checks` doesn't cover one.
     // A build the board stopped isn't a failure (`prflow::failing`): it reads as failed on the host. While
     // PR builds are stopped (`prbuilds.rs`) checks count as passed, as the stage counts them.
     let builds_stopped = crate::prbuilds::stopped(app);
-    let failing = prflow::failing(app, &f, rec);
+    let failing = prflow::failing(app, t, &f, rec);
     if !failing.is_empty() && !prflow::skip_hides_failures(&f, rec) {
         out.push(Gate::soft(format!("checks failed: {}", failing.join(", "))));
     }
@@ -648,7 +663,7 @@ pub fn merge_gates(app: &App, t: &Row, rec: &Value, owner_approved: bool) -> Res
         let checks = rec["checks"].as_array().cloned().unwrap_or_default();
         let running = running_checks(t, rec);
         if !running.is_empty() {
-            out.push(Gate::soft(format!("checks are still running: {}", running.join(", "))));
+            out.push(Gate::wait(format!("checks are still running: {}", running.join(", "))));
         }
         let stopped = prflow::stopped_checks(rec);
         if !stopped.is_empty() {
@@ -663,10 +678,10 @@ pub fn merge_gates(app: &App, t: &Row, rec: &Value, owner_approved: bool) -> Res
                 } else {
                     "expected checks haven't posted"
                 };
-                out.push(Gate::soft(format!("{what}: {} (it waits up to {} min for them)", missing.join(", "), prflow::missing_wait_mins(app, t, rec))));
+                out.push(Gate::wait(format!("{what}: {} (it waits up to {} min for them)", missing.join(", "), prflow::missing_wait_mins(app, t, rec))));
             }
             None if checks.is_empty() && !prflow::no_checks_wait_over(app, &f, rec) => {
-                out.push(Gate::soft(format!("no checks have posted on this push yet (waits up to {} min)", app.cfg.pr.no_checks_after_mins)));
+                out.push(Gate::wait(format!("no checks have posted on this push yet (waits up to {} min)", app.cfg.pr.no_checks_after_mins)));
             }
             _ => {}
         }
@@ -867,6 +882,7 @@ pub fn merge(app: &App, id: i64, body: &Value) -> Result<Value> {
     let gates = merge_gates(app, &t, &rec, !forced && (!override_why.is_empty() || word.as_ref().is_some_and(|w| w.approved)))?;
     let (passed, held): (Vec<Gate>, Vec<Gate>) = gates.into_iter().partition(|g| forced && g.overridable);
     let passed: Vec<String> = passed.into_iter().map(|g| g.why).collect();
+    let only_waits = held.iter().all(|g| g.waits);
     let blockers: Vec<String> = held.into_iter().map(|g| g.why).collect();
     if !blockers.is_empty() {
         let running = running_checks(&t, &rec);
@@ -876,7 +892,9 @@ pub fn merge(app: &App, id: i64, body: &Value) -> Result<Value> {
         let why = blockers.join("; ");
         prflow::note_merge_refused(app, id, &rec, &why)?;
         let past = if forced { " (an override doesn't merge past these)" } else { "" };
-        return err(409, format!("PR #{} can't merge yet: {why}{past}.", pr.num));
+        // Running the merge again won't help while the host catches up; the board watches for it.
+        let next = if only_waits { WAITS_NEXT } else { "" };
+        return err(409, format!("PR #{} can't merge yet: {why}{past}.{next}", pr.num));
     }
     if let Some(carried) = carried_prs(app, &t, &pr)? {
         prflow::note_merge_refused(app, id, &rec, &carried)?;
@@ -887,9 +905,11 @@ pub fn merge(app: &App, id: i64, body: &Value) -> Result<Value> {
     // the PRs stacked on it onto its base first.
     move_stacked_off(app, &t, &rec, pr.num)?;
     let rules = crate::projects::pr_rules(app, t.s("project"));
-    let opts = MergeOpts { strategy: rules.merge_strategy.clone().filter(|s| !s.trim().is_empty()), close_source_branch: true };
+    // Pinned to the head whose checks and reviews were just judged: a push since then makes the host refuse.
+    let judged = rec["head"].as_str().filter(|h| !h.is_empty()).map(str::to_string);
+    let opts = MergeOpts { strategy: rules.merge_strategy.clone().filter(|s| !s.trim().is_empty()), close_source_branch: true, head: judged };
     let h = host(app, &pr)?;
-    if let Err(e) = on_host(&pr, "merging", || h.merge(&pr, &opts)) {
+    if let Err(e) = merge_on_host(app, &pr, h.as_ref(), &opts) {
         // The host found a conflict the record didn't show yet: send the PR to the rebase stage, not to
         // merge retries.
         if merge_conflict_error(&e.to_string()) {
@@ -908,6 +928,14 @@ pub fn merge(app: &App, id: i64, body: &Value) -> Result<Value> {
                     prflow::KEEP_BASE
                 ),
             );
+        }
+        // A push landed after the read: what was judged isn't what would merge. The poll reads the new
+        // head and its checks, and the board brings the agent back once they clear.
+        if head_moved_error(&e.to_string()) {
+            let short = prflow::short_sha(rec["head"].as_str().unwrap_or(""));
+            let why = format!("its branch was pushed after the board judged it at {short}, so {site} kept the merge to that head: wait for the new push's checks");
+            prflow::note_merge_refused(app, id, &rec, &why)?;
+            return err(409, format!("PR #{} can't merge yet: {why}.{WAITS_NEXT}", pr.num));
         }
         prflow::note_merge_refused(app, id, &rec, &format!("{site} wouldn't merge it: {e}"))?;
         return Err(prflow::wait_out_limit(app, id, &pr, body, "merge", ApiError::new(502, format!("Couldn't merge PR #{}: {e}.", pr.num))));
@@ -929,6 +957,86 @@ pub fn merge(app: &App, id: i64, body: &Value) -> Result<Value> {
     crate::reports::give_back_slot(app, id);
     let t = board::get_task(app, id)?;
     Ok(json!({"task": rf("task", id), "merged": true, "pr": board::pr_card(app, &t)}))
+}
+
+/// The refusal's last sentence when only what the host hasn't caught up on holds the merge.
+const WAITS_NEXT: &str = " The board watches it and brings you back to merge once that clears, so don't run tb pr merge again or poll for it: run tb pr wait and stop here.";
+
+/// Merges `pr` on its host, trying again when the host refuses for a moment's reason: its base moved
+/// under the merge (GitHub: "Base branch was modified"), or the call failed in a way that leaves the
+/// merge maybe done ("Merge already in progress", a 502, a dropped connection). Before each new try
+/// it reads the PR, and one the host shows merged counts as merged. Other refusals answer at once.
+fn merge_on_host(app: &App, pr: &PrRef, h: &dyn prhost::PrHost, opts: &MergeOpts) -> prhost::HostResult<()> {
+    let site = prhost::limit::label(&pr.host);
+    let mut waits = app.cfg.pr.merge_retry_secs.iter();
+    loop {
+        let e = match on_host(pr, "merging", || h.merge(pr, opts)) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let Some(why) = passing_merge_error(&e) else { return Err(e) };
+        let Some(&wait) = waits.next() else { return Err(e) };
+        progress::stage(&format!("{site} {why}; trying again in {}s", wait.round()));
+        progress::waiting(&format!("{site} (trying PR #{} again)", pr.num), progress::WAITING_EVERY, || app.sleep(wait));
+        if app.stopping() {
+            return Err(e);
+        }
+        match on_host(pr, "reading", || h.read(pr)) {
+            Ok(rec) if rec.state.eq_ignore_ascii_case("MERGED") => {
+                progress::stage(&format!("{site} shows PR #{} merged", pr.num));
+                return Ok(());
+            }
+            Ok(rec) if !rec.state.eq_ignore_ascii_case("OPEN") => return Err(e),
+            _ => {}
+        }
+    }
+}
+
+/// What a host's merge refusal that passes on its own means, for the progress line; `None` for one
+/// that a new try won't fix (conflicts, branch rules, missing approvals, a rate limit).
+fn passing_merge_error(e: &str) -> Option<&'static str> {
+    let e = e.to_lowercase();
+    if e.contains("base branch was modified") {
+        return Some("says the base branch moved under the merge");
+    }
+    if e.contains("merge already in progress") {
+        return Some("is still merging it");
+    }
+    let dropped = ["502 bad gateway", "503 service unavailable", "504 gateway time", "connection reset"];
+    let eof = e.split(|c: char| !c.is_alphanumeric()).any(|w| w == "eof");
+    (eof || dropped.iter().any(|d| e.contains(d))).then_some("didn't answer the merge cleanly")
+}
+
+/// Ask the agent to rebase, in the app's merge dialog once the host refused the merge: tells the task's
+/// terminal when it's open, or brings its PR conversation back to rebase onto the base and push.
+pub fn ask_rebase(app: &App, id: i64, body: &Value) -> Result<Value> {
+    let t = board::get_task(app, id)?;
+    let pr = pr_of(&t)?;
+    if !board::pr_still_open(&t) {
+        return err(409, format!("PR #{} isn't open, so there's nothing to rebase.", pr.num));
+    }
+    let tb = board::tb_cmd(app);
+    let r = rf("task", id);
+    let rec = prflow::flow(&t).get("rec").cloned().unwrap_or(json!({}));
+    let base = rec["base"].as_str().filter(|b| !b.is_empty()).unwrap_or("its base branch");
+    let why = one_line(&body_str(body, "why"), 300);
+    let refused = if why.is_empty() { String::new() } else { format!(" ({why})") };
+    let text = format!(
+        "[task-board:{r}] {owner} asked you to rebase PR #{num}: {site} wouldn't merge it{refused}. Rebase onto {base} ({tb} pr status {r} lists the \
+         commands), resolve any conflicts, and run the tests covering the files you changed (not the whole suite).{keep}",
+        owner = app.cfg.owner,
+        num = pr.num,
+        site = prhost::limit::label(&pr.host),
+        keep = prflow::KEEP_BASE,
+    );
+    if board::live_session(app, &t)?.is_some() || prflow::live_job(app, &t)?.is_some() {
+        app.db.tx(|| crate::deliver::add(app, "rebase", &format!("{text} Then push with git push --force-with-lease."), id, None, None))?;
+    } else if prflow::follow_wake(app, &t, &text)?.is_none() {
+        return err(409, format!("Couldn't reach {r}'s agent: its PR is already being worked on, or there's no free worktree. Try again in a minute."));
+    }
+    let who = who_of(app, body);
+    app.db.tx(|| board::log_event(app, id, &who, "handoff", &format!("Asked the agent to rebase PR #{} onto {base}", pr.num)))?;
+    Ok(json!({"task": r, "asked": true}))
 }
 
 /// Records on task `id` that the owner merged PR #`num` past `gates`, what held it then: in its log and
@@ -1019,6 +1127,11 @@ pub fn review_not_needed(app: &App, id: i64) -> Result<Value> {
 
 /// The host refused a merge because the PR conflicts with its base (GitHub: "the merge commit cannot be
 /// cleanly created"; Bitbucket: "resolve all merge conflicts").
+/// The host refused a merge pinned to a head the branch has moved past (GitHub: "Head branch was modified").
+fn head_moved_error(e: &str) -> bool {
+    e.to_lowercase().contains("head branch was modified")
+}
+
 fn merge_conflict_error(e: &str) -> bool {
     let e = e.to_lowercase();
     e.contains("cleanly created") || e.contains("merge conflict")
@@ -1178,7 +1291,7 @@ pub fn needs_owner(app: &App, id: i64, body: &Value) -> Result<Value> {
     let (t, rec) = fresh(app, id)?;
     let pr = pr_of(&t)?;
     let head = rec["head"].as_str().unwrap_or("").to_string();
-    let failed = prflow::failing(app, &flow(&t), &rec);
+    let failed = prflow::failing(app, &t, &flow(&t), &rec);
     if failed.is_empty() || head.is_empty() {
         return err(409, format!("Nothing fails on PR #{}'s current push, so there's nothing for the owner to fix.", pr.num));
     }
@@ -1253,6 +1366,9 @@ pub fn status(app: &App, id: i64) -> Result<Value> {
                             row["tests"] = json!(fl.tests);
                             if let Some(e) = &fl.tests_error {
                                 row["tests_error"] = json!(e);
+                            }
+                            if !fl.stages.is_empty() {
+                                row["stages"] = json!(fl.stages);
                             }
                             mine = Some(fl);
                         }

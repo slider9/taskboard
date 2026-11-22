@@ -47,6 +47,7 @@ pub fn update_task(app: &App, id: i64, mut f: Vec<(&str, Value)>) -> Result<()> 
         }
         crate::midna::task_changed(app, &before, &after)?;
         crate::midna::panel_changed(app, &before, &after)?;
+        crate::fixes::on_change(app, &before, &after)?;
         if let (Some(g), false) = (goal, goal_was_finished) {
             if goal_finished(app, g)? {
                 on_goal_finished(app, g, Some(&after))?;
@@ -145,9 +146,15 @@ pub fn miss_resolved(app: &App, a: &Value) -> Result<bool> {
 /// The goal's open misses on its own done-when: issues filed with `--misses-goal` still in the backlog, or
 /// made into a task that isn't done yet. One the owner sent to Jira or closed no longer holds the goal.
 pub fn open_misses(app: &App, goal_id: i64) -> Result<i64> {
-    app.db.count(
-        "SELECT COUNT(*) FROM issues i WHERE i.goal_id = ? AND i.misses_goal = 1 AND (i.state = 'open' \
-         OR (i.state = 'task' AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = i.task_id AND (t.status != 'done' OR t.failed = 1))))",
+    Ok(open_miss_rows(app, goal_id)?.len() as i64)
+}
+
+/// The issues [`open_misses`] counts, oldest first.
+pub fn open_miss_rows(app: &App, goal_id: i64) -> Result<Vec<Row>> {
+    app.db.q(
+        "SELECT i.* FROM issues i WHERE i.goal_id = ? AND i.misses_goal = 1 AND (i.state = 'open' \
+         OR (i.state = 'task' AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = i.task_id AND (t.status != 'done' OR t.failed = 1)))) \
+         ORDER BY i.id",
         p![goal_id],
     )
 }
@@ -279,7 +286,7 @@ pub fn pr_card(app: &App, t: &Row) -> Value {
     let builds_stopped = crate::prbuilds::stopped(app);
     let checks = rec.as_ref().map(|r| {
         // Failures cleared with `tb pr not-ours` don't count against the PR (the panel's box says why).
-        if !prflow::failing(app, &flow, r).is_empty() {
+        if !prflow::failing(app, t, &flow, r).is_empty() {
             "fail"
         } else if !builds_stopped && r["running"].as_i64().unwrap_or(0) > 0 {
             "pending"
@@ -388,6 +395,10 @@ pub fn task_card(app: &App, t: &Row) -> Result<Value> {
             if crate::stack::parent_id(t) == Some(n) {
                 w["stack"] = json!(true);
             }
+            // The other task's PR, so a wait on its merge can link to it.
+            if let Some(o) = other.as_ref().filter(|o| has(o.s("pr_url"))) {
+                w["pr"] = json!({"num": o.v("pr_num"), "url": o.v("pr_url"), "state": o.s("pr_state").unwrap_or("OPEN").to_uppercase()});
+            }
             Ok(w)
         }).collect::<Result<Vec<_>>>()?,
         "locks": crate::locks::names(t),
@@ -420,7 +431,13 @@ pub fn task_card(app: &App, t: &Row) -> Result<Value> {
         // When this run began, which the Working time counts from; the first pickup on an older task.
         o.insert("picked_up_at".into(), opt_str(t.s("picked_up_at").or(t.s("started_at"))));
         // Whether Focus shows a terminal or opens a new one.
-        o.insert("terminal_open".into(), json!(live_session(app, t)?.is_some()));
+        let live = live_session(app, t)?;
+        o.insert("terminal_open".into(), json!(live.is_some()));
+        // When its terminal closed, while none is open.
+        o.insert("terminal_closed_at".into(), match live {
+            Some(_) => Value::Null,
+            None => get_session(app, t.s("session_id"))?.filter(|s| s.s("status") == Some("gone")).map_or(Value::Null, |s| s.v("gone_at")),
+        });
         o.insert("no_evidence".into(), t.v("no_evidence"));
         // The task's model and effort and what its terminal runs with [models].
         o.insert("model".into(), t.v("model"));
@@ -432,11 +449,15 @@ pub fn task_card(app: &App, t: &Row) -> Result<Value> {
         o.insert("pr_base".into(), t.v("pr_base"));
         o.insert("start_retry_at".into(), start_retry_at(t, &status));
         o.insert("start_at".into(), t.v("start_at"));
+        // The terminal its start opened, while no agent has checked in from it (`startwatch.rs`).
+        o.insert("start_terminal".into(), crate::startwatch::card(app, t)?);
         o.insert("looks_finished".into(), crate::lost_done::card(t));
         o.insert("closed_by_hand".into(), json!(closed_by_hand(app, t)?));
         o.insert("ask".into(), crate::ask::card(t));
         o.insert("stack_on".into(), crate::stack::card(app, t)?);
         o.insert("same_pr".into(), json!(crate::samepr::anchor_id(t)));
+        // The anchor a member shares its PR with, or the members sharing an anchor's (`samepr.rs`).
+        o.insert("pr_group".into(), crate::samepr::card(app, t)?);
         // `human` for a task only the owner does (`human.rs`), with the note they left on Done.
         o.insert("kind".into(), json!(t.s("kind").unwrap_or("agent")));
         o.insert("owner_note".into(), json!(crate::human::note(t)));
@@ -812,6 +833,13 @@ fn counts_in(app: &App, goal_id: i64, rows: &[Row], order: Option<&GoalOrder>) -
             held += 1;
         }
     }
+    // A terminal closed by hand on work that doesn't look finished asks nothing and runs nothing: Stopped.
+    let mut hand_closed = 0;
+    for r in rows {
+        if closed_quietly(app, r)? {
+            hand_closed += 1;
+        }
+    }
     let bits_waiting = crate::bits::goal_waiting(app, goal_id)?;
     let prs_open: Vec<i64> = rows.iter().filter(|r| in_review(r)).filter_map(|r| r.i("pr_num")).collect();
     // The PR plan: tasks that end in a PR, how many have one, and how many finished without (`--no-pr`).
@@ -833,8 +861,9 @@ fn counts_in(app: &App, goal_id: i64, rows: &[Row], order: Option<&GoalOrder>) -
     Ok(json!({
         "done": done, "total": total,
         "review": prs_open.len(),
-        "active": n(&|r| matches!(r.s("status"), Some("working") | Some("needs"))),
-        "needs": n(&|r| r.s("status") == Some("needs")),
+        "active": n(&|r| matches!(r.s("status"), Some("working") | Some("needs"))) - hand_closed,
+        "needs": n(&|r| r.s("status") == Some("needs")) - hand_closed,
+        "hand_closed": hand_closed,
         "queued": n(&|r| r.s("status") == Some("queued")),
         "starting": n(&|r| r.s("status") == Some("queued") && r.i("start_job").is_some()),
         "blocked": blocked,
@@ -1011,6 +1040,14 @@ fn read_goal_dict(app: &App, g: &Row) -> Result<(Value, Option<Vec<i64>>)> {
     let c = counts_in(app, g.id(), &rows, Some(&order))?;
     // A goal stopped at a wave for the owner (a review stop, or a failed task): one line.
     let stopped = crate::waves::stopped_line(order.waves()?);
+    // The same stop with its kind (review, failed or held), so every page shows one stop state.
+    let stop = crate::waves::stop(order.waves()?);
+    // The tasks other goals share into this one, each with the goal it came from.
+    let mut shared = vec![];
+    for t in rows.iter().filter(|t| t.i("goal_id") != Some(g.id())) {
+        shared.push(json!({"id": t.id(), "ref": crate::human::task_ref(t), "title": t.v("title"), "status": t.v("status"),
+                           "failed": t.b("failed"), "from": goal_ref(find_goal(app, t.i("goal_id"))?.as_ref())}));
+    }
     let mut d = json!({
         "id": g.id(), "ref": rf("goal", g.id()), "name": g.v("name"), "outcome": g.v("outcome"),
         "tldr": g.s("tldr").unwrap_or(""), "hours_until": g.v("hours_until"), "start_at": crate::scheduled::goal_card(g),
@@ -1027,6 +1064,8 @@ fn read_goal_dict(app: &App, g: &Row) -> Result<(Value, Option<Vec<i64>>)> {
         "state": goal_state_line(&c),
         "peek": goal_peek(app, &rows)?,
         "stopped": stopped,
+        "stop": stop,
+        "shared_tasks": shared,
     });
     if let (Some(o), Some(c)) = (d.as_object_mut(), c.as_object()) {
         for (k, v) in c {
@@ -1067,6 +1106,7 @@ fn goal_peek(app: &App, rows: &[Row]) -> Result<Vec<Value>> {
             Some("done") if !t.b("failed") => continue,
             Some("done") => "failed".to_string(),
             Some("planned") => continue,
+            Some("needs") if closed_quietly(app, t)? => "stopped".into(),
             Some("queued") => {
                 if t.i("start_job").is_some() {
                     "starting".into()
@@ -1102,6 +1142,13 @@ pub fn attachments(app: &App, task_id: Option<i64>, goal_id: Option<i64>) -> Res
         .collect())
 }
 
+/// The goal's attachments the task doesn't already carry: one attached to both (same URL)
+/// shows once, as the task's.
+pub fn goal_attachments(app: &App, task_atts: &[Value], goal_id: i64) -> Result<Vec<Value>> {
+    let own: std::collections::HashSet<&str> = task_atts.iter().filter_map(|a| a["url"].as_str()).collect();
+    Ok(attachments(app, None, Some(goal_id))?.into_iter().filter(|a| !a["url"].as_str().is_some_and(|u| own.contains(u))).collect())
+}
+
 static ATT_TAG_RE: Lazy<Regex> = Lazy::new(|| {
     let tag = r"(?:\d{4}-\d{2}-\d{2}|[TG]\d+)";
     Regex::new(&format!(r"\s*[\(\[]\s*{tag}(?:\s*[,;·]\s*{tag})*\s*[\)\]]\s*$")).unwrap()
@@ -1133,6 +1180,76 @@ fn is_artifact_link(url: &str) -> bool {
 }
 
 static URL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^https?://\S+$").unwrap());
+
+/// The most of a link's copy the board keeps, in characters.
+const COPY_MAX: usize = 60_000;
+
+static HIDDEN_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<!--.*?-->|<script\b.*?</script\s*>|<style\b.*?</style\s*>|<noscript\b.*?</noscript\s*>").unwrap());
+static ITEM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)<li\b[^>]*>").unwrap());
+static BREAK_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)</?(?:p|div|h[1-6]|ul|ol|li|tr|br|hr|section|article|header|footer|main|nav|aside|table|pre|blockquote|dl|dt|dd|title|figure|figcaption|details|summary)\b[^>]*>").unwrap()
+});
+static ANY_TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"</?[a-zA-Z!][^<>]*>").unwrap());
+static ENTITY_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"&(#[0-9]+|#[xX][0-9a-fA-F]+|[a-zA-Z]+);").unwrap());
+
+/// What a page says: an HTML page's text with its scripts, styles and tags taken out, a line for each
+/// block and `- ` before each list item; Markdown or plain text as it is. Blank lines collapse to one.
+pub fn page_text(raw: &str) -> String {
+    let text = if ANY_TAG_RE.is_match(raw) && raw.contains("</") {
+        let t = HIDDEN_RE.replace_all(raw, "");
+        let t = ITEM_RE.replace_all(&t, "\n- ");
+        let t = BREAK_RE.replace_all(&t, "\n");
+        let t = ANY_TAG_RE.replace_all(&t, "");
+        ENTITY_RE
+            .replace_all(&t, |c: &regex::Captures| {
+                let e = &c[1];
+                let ch = match e {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    "nbsp" => Some(' '),
+                    _ if e.starts_with("#x") || e.starts_with("#X") => u32::from_str_radix(&e[2..], 16).ok().and_then(char::from_u32),
+                    _ if e.starts_with('#') => e[1..].parse().ok().and_then(char::from_u32),
+                    _ => None,
+                };
+                ch.map(String::from).unwrap_or_else(|| c[0].to_string())
+            })
+            .into_owned()
+    } else {
+        raw.to_string()
+    };
+    let mut out: Vec<String> = vec![];
+    for line in text.lines() {
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() && out.last().is_none_or(|l| l.is_empty()) {
+            continue;
+        }
+        out.push(line);
+    }
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
+/// Keep `raw` (a page or Markdown, as read by the agent who attached the link) as the attachment's copy,
+/// as text clipped to [`COPY_MAX`]. One with no text in it leaves the copy the attachment has.
+pub fn set_attachment_copy(app: &App, aid: i64, raw: &str) -> Result<()> {
+    let text = page_text(raw);
+    if text.is_empty() {
+        return Ok(());
+    }
+    app.db.x("UPDATE attachments SET copy = ? WHERE id = ?", p![clip(&text, COPY_MAX), aid])?;
+    Ok(())
+}
+
+/// The attachment's copy (see [`set_attachment_copy`]); None when it has none.
+pub fn attachment_copy(app: &App, aid: i64) -> Result<Option<String>> {
+    Ok(app.db.q1("SELECT copy FROM attachments WHERE id = ?", p![aid])?.and_then(|r| r.s("copy").map(str::to_string)).filter(|c| !c.is_empty()))
+}
 
 /// The refused extension (as configured) a file path ends with. Links aren't files, so they pass.
 pub fn refused_extension(refuse: &[String], url: &str) -> Option<String> {
@@ -1178,7 +1295,7 @@ pub fn add_attachment(
         _ => attachment_title(title, url),
     };
     if title == attachment_title("", url) && is_artifact_link(url) {
-        return err(400, "Give it --title: the artifact's own title. The board can't open a private artifact to read it.");
+        return err(400, "Give it --title: the artifact's own title. The board can't open a private artifact to read it (give its text with --copy <file>).");
     }
     let aid = if let Some(cur) = cur {
         // Attaching it again without a summary keeps the one it has.
@@ -1308,6 +1425,15 @@ fn blocks_now<'a>(app: &App, b: &'a Row) -> Result<&'a str> {
     Ok(if holds { b.s("blocks").unwrap_or(crate::blocks::NONE) } else { crate::blocks::NONE })
 }
 
+/// How a closed issue was closed: `fixed` or `wont_do`; null while it isn't closed.
+fn closed_as(b: &Row) -> Value {
+    match (b.s("state"), b.s("closed_as")) {
+        (Some("drop"), Some("fixed")) => json!("fixed"),
+        (Some("drop"), _) => json!("wont_do"),
+        _ => Value::Null,
+    }
+}
+
 pub fn issue_card(app: &App, b: &Row) -> Result<Value> {
     let g = find_goal(app, b.i("goal_id"))?;
     let blocks = blocks_now(app, b)?;
@@ -1321,6 +1447,7 @@ pub fn issue_card(app: &App, b: &Row) -> Result<Value> {
         "jira_key": b.v("jira_key"), "jira_url": jira_url(app, b.s("jira_key").unwrap_or("")),
         "task_id": b.v("task_id"), "task_ref": rf_opt("task", b.i("task_id")),
         "from": issue_from_line(b),
+        "closed_as": closed_as(b), "fixed_by": b.v("fixed_by"), "fixed_by_ref": rf_opt("task", b.i("fixed_by")), "fixed_pr": b.v("fixed_pr"),
     }))
 }
 
@@ -1601,6 +1728,12 @@ pub fn closed_by_hand(app: &App, t: &Row) -> Result<bool> {
     Ok(ended.as_str().and_then(end_reason).is_some_and(|r| DELIBERATE_EXITS.contains(&r)))
 }
 
+/// A terminal closed by hand on work that doesn't look finished: it asks nothing of the owner and
+/// waits to be restarted with its goal, so goal counts call it stopped, not needing you.
+pub fn closed_quietly(app: &App, t: &Row) -> Result<bool> {
+    Ok(closed_by_hand(app, t)? && crate::lost_done::card(t).is_null())
+}
+
 /// The reason in a `Terminal ended (<reason>: <detail>) …` event.
 fn end_reason(text: &str) -> Option<&str> {
     text.strip_prefix("Terminal ended (")?.split([':', ')']).next()
@@ -1640,7 +1773,7 @@ pub fn mark_lost_with(app: &App, t: &Row, reason: &str, detail: Option<&str>) ->
                     "pickup" => pickup, "pickup_session" => null, "retry_at" => iso(now_ts() + LOST_RESTART_GRACE_SECS),
                     "latest" => format!("{closed} It starts again from its handoff.")],
         )?;
-        log_event(app, t.id(), MIDNA, "status", &format!("Terminal ended ({why}) before the task was done; queued to start again from its handoff"))?;
+        log_event(app, t.id(), MIDNA, "status", &format!("Terminal ended ({why}) before the task was done{QUEUED_AGAIN}"))?;
         app.info(format!("task {} lost ({why}): queued to start again", rf("task", t.id())));
         return Ok(());
     }
@@ -1656,8 +1789,27 @@ pub fn mark_lost_with(app: &App, t: &Row, reason: &str, detail: Option<&str>) ->
                 "latest" => format!("{closed}{saved_line}"), "looks_finished" => crate::lost_done::lost_now()],
     )?;
     log_event(app, t.id(), MIDNA, "status", &format!("Terminal ended ({why}) before the task was done"))?;
+    // Whether it was closed by hand is read from that line, logged after the update queued the panel.
+    crate::midna::queue_panel(app, t.id());
     app.info(format!("task {} lost: {why}", rf("task", t.id())));
     Ok(())
+}
+
+/// How a `Terminal ended` line ends when the task was queued to start again in a new terminal.
+const QUEUED_AGAIN: &str = "; queued to start again from its handoff";
+
+/// The task terminal `sid` was on until its Claude ended and the board queued it to start again,
+/// when that same conversation (`claude`) is back in the terminal before a new one opened for it:
+/// Midna restarts Claude in place (for an update) and resumes the conversation.
+pub fn restarting_here(app: &App, sid: &str, claude: Option<&str>) -> Result<Option<Row>> {
+    let Some(claude) = claude.filter(|c| !c.is_empty()) else { return Ok(None) };
+    let Some(t) = find_task(app, get_session(app, Some(sid))?.and_then(|s| s.i("last_task")))? else { return Ok(None) };
+    if t.s("status") != Some("queued") || has(t.s("session_id")) || has(t.s("start_job")) || t.s("claude_session_id") != Some(claude) {
+        return Ok(None);
+    }
+    let last = app.db.val("SELECT text FROM events WHERE task_id = ? AND kind = 'status' ORDER BY id DESC LIMIT 1", p![t.id()])?;
+    let queued = last.as_str().is_some_and(|l| l.starts_with("Terminal ended (") && l.ends_with(QUEUED_AGAIN));
+    Ok(queued.then_some(t))
 }
 
 pub fn session_gone(app: &App, sid: &str, reason: &str) -> Result<()> {

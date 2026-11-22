@@ -22,6 +22,10 @@ It's built like Midna: a daemon that owns the work, a CLI for agents, and a GPUI
 | `crates/taskboard-app` | `Taskboard.app`: the native window (GPUI via `gpui-kit`): board, goals, backlog, sessions, task and issue panels, forms, work hours. |
 | `packaging/`, `scripts/` | `build-app.sh` assembles and signs `Taskboard.app`; `install-app.sh` installs it to /Applications; `dev-app.sh` installs a separate "Taskboard Dev". On Windows, `packaging/windows/build.sh` builds the install folder, update zip and installer, and the two scripts install to `%LOCALAPPDATA%\Programs`. |
 | `docs/API.md` | The JSON API the app (and `tb`) rely on. |
+| `docs/HOOKS.md` | Your own commands, run at each step of the board's flow (`hooks.json`): they can stop or skip a step. |
+| `docs/STREAM.md` | The work event stream a relay posts PR, build, push and Jira events to (`POST /stream/events`). |
+| `docs/REVIEW-PROTOCOL.md` | The contract between the board and a project's pre-PR code reviewer (`[code_review]`). |
+| `docs/RELEASING.md` | Cutting a release with `tb release cut`, and what to do when one fails. |
 | `docs/CUTOVER.md` | Moving over from the old Python board: stop it, `taskboardd import` its `tasks.db`, swap the plugin, start. |
 | `docs/PARITY.md` | The audit of the app against the web board it replaced, with the tests that hold each behaviour. |
 | `plugin/` | The Claude Code plugin: hooks, the `bin/tb` shim and the `task-board` skill. |
@@ -51,8 +55,10 @@ checkout, `scripts/install-app.sh` in Git Bash builds and installs the same fold
 Coming from the old board? Follow `docs/CUTOVER.md` first: it holds the same port, and
 `taskboardd import` brings its tasks, goals and backlog over with their numbers.
 
-Without the app: `./install.sh` builds and copies `taskboardd` and `tb` into `~/.local/bin`; run
-`taskboardd serve` yourself (or `taskboardd launchd` prints a LaunchAgent plist).
+Without the app: `./install.sh` builds and copies `taskboardd` and `tb` into `~/.local/bin` (from
+`$CARGO_TARGET_DIR` when it's set), then `tb install-hooks` installs the task-board plugin and the
+Claude Code hooks that run that `tb`; run `taskboardd serve` yourself (or `taskboardd launchd` prints
+a LaunchAgent plist).
 
 Optional: point Claude Code's status line at `~/.local/bin/tb statusline`, so the board knows when
 the 5-hour usage runs out (Midna's own usage reading works too). See `plugin/README.md`.
@@ -72,9 +78,11 @@ the 5-hour usage runs out (Midna's own usage reading works too). See `plugin/REA
 - **Your answers** reach the terminal through its next hook (or Midna types them in once it's idle at its
   prompt). If its terminal is gone, the board starts a new one with the answer in the handoff.
 - **Check-ins**: once a task's turn has run 20 minutes (and every 20 after), Haiku reads its terminal's last lines
-  and the processes under it and says whether it's still getting somewhere. A stuck verdict turns the task amber
-  ("Maybe stuck", with why and the last lines) until the turn ends or a later check-in says it's moving. `[checkin]`
-  in config.toml sets the times and model.
+  and the processes under it and says whether the time fits the work, the turn is far slower than its work
+  warrants (and what it waits on: a lock, a queue, Midna's busy hold, a hung command), or it's stuck. A slow or
+  stuck verdict turns the task amber ("Slow" or "Maybe stuck", with why and the last lines) and raises an alert
+  ("Slow: waiting on …") until the turn ends or a later check-in says it's moving, and leaves the agent a message
+  for its next prompt or stop, once per turn. `[checkin]` in config.toml sets the times, model and nudge.
 - **Lost terminals**: a task whose terminal closes goes back in the queue and restarts from its handoff
   (twice an hour at most), then waits for you.
 - **Pull requests**: any GitHub, GitLab or Bitbucket PR link an agent reports is linked to its task. GitHub
@@ -129,9 +137,25 @@ scripts/dev-app.sh --seed                                    # install "Taskboar
 ```
 
 A board on any data folder but the default runs without its runner (it never opens or closes terminals,
-moves tickets or sends notifications) unless you pass `--runner`. Screenshots without a screen:
-`cargo build -p taskboard-app --features snapshot`, then run with `TASKBOARD_BACKEND=fake TASKBOARD_SNAPSHOT=out.png`
-(`TASKBOARD_PAGE=backlog|sessions|G1`, `TASKBOARD_OPEN=T3|B1`, `TASKBOARD_SEARCH=pass`, `TASKBOARD_THEME=dark`).
+moves tickets or sends notifications) unless you pass `--runner`.
+
+Screenshots and driving the app go through [Slate](https://github.com/mrgnhnt96/slate): the app's window
+opens below the desktop and never takes focus, so nothing shows on screen and the app you're using keeps
+the keyboard. `scripts/slate.sh` builds this checkout's app, installs the `slate` command and runs the
+app on the sample board:
+
+```sh
+scripts/slate.sh shoot --out shot.png --size 1360x860 --wait 2500
+scripts/slate.sh drive --steps steps.json --out shots/ --wait 2500    # keys, typing, clicks, scrolls, shots
+TASKBOARD_PAGE=backlog TASKBOARD_OPEN=B1 TASKBOARD_THEME=light scripts/slate.sh shoot --out backlog.png
+```
+
+The steps file is Slate's (its README lists the steps), for example
+`[{"click": {"x": 64, "y": 219}}, {"key": "cmd-k"}, {"type": "pass"}, {"shot": "search"}]`.
+`TASKBOARD_PAGE=backlog|settings|G1`, `TASKBOARD_OPEN=T3|B1`, `TASKBOARD_SEARCH=pass`,
+`TASKBOARD_THEME=dark` and the other variables at the top of `crates/taskboard-app/src/main.rs` pass
+through; `TASKBOARD_PAGE=settings` shoots the Settings window. `--url http://127.0.0.1:18792` runs it
+against a daemon you started instead of the sample board (never the real board's).
 
 main only takes PRs (a GitHub ruleset; force-pushes and deletes are refused too). Releases are the
 exception: `scripts/release.sh` pushes its version commit with a deploy key the ruleset lets past,

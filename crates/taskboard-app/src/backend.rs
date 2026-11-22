@@ -20,6 +20,8 @@ pub struct CallError {
     #[cfg_attr(not(test), allow(dead_code))]
     pub status: u16,
     pub message: String,
+    /// The board is up (it answered a quick check) but didn't answer this call in time.
+    pub slow: bool,
 }
 
 impl std::fmt::Display for CallError {
@@ -59,12 +61,21 @@ pub struct Daemon {
     /// Why the board was last out of reach (None: it answered). Logged when it changes, not on
     /// every poll.
     down: std::sync::Mutex<Option<String>>,
+    /// For the quick check that tells a slow board from a down one (`GET /info`, no database).
+    probe: ureq::Agent,
+}
+
+/// How long the quick check waits: the board's cheapest call, so a live board answers well inside it.
+const PROBE: Duration = Duration::from_secs(3);
+
+fn probe_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout_connect(PROBE).timeout(PROBE).build()
 }
 
 impl Daemon {
     #[cfg(test)]
     pub fn at(base: &str) -> Daemon {
-        Daemon { base: base.into(), agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_millis(300)).build(), token: None, socket: None, down: Default::default() }
+        Daemon { base: base.into(), agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_millis(300)).timeout(Duration::from_millis(500)).build(), token: None, socket: None, down: Default::default(), probe: probe_agent() }
     }
 
     pub fn new() -> Daemon {
@@ -78,6 +89,7 @@ impl Daemon {
             agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(2)).timeout(Duration::from_secs(20)).build(),
             token: cfg.as_ref().map(taskboardd::apptoken::path),
             down: Default::default(),
+            probe: probe_agent(),
         }
     }
 
@@ -90,7 +102,7 @@ impl Daemon {
             Ok(resp) => Ok(resp.into_json::<Value>().unwrap_or(Value::Null)),
             Err(ureq::Error::Status(code, resp)) => {
                 let msg = resp.into_json::<Value>().ok().and_then(|v| v["error"].as_str().map(str::to_string));
-                Err(CallError { status: code, message: msg.unwrap_or_else(|| format!("The board answered {code}.")) })
+                Err(CallError { status: code, message: msg.unwrap_or_else(|| format!("The board answered {code}.")), slow: false })
             }
             Err(ureq::Error::Transport(t)) => {
                 let mut why = t.kind().to_string();
@@ -100,9 +112,29 @@ impl Daemon {
                 if let Some(s) = std::error::Error::source(&t) {
                     why += &format!(": {s}");
                 }
-                Err(self.unreachable(path, why))
+                Err(if self.alive() { self.slow(path, why) } else { self.unreachable(path, why) })
             }
         }
+    }
+
+    /// The quick check: the board answers `GET /info` (any answer: it's serving).
+    fn alive(&self) -> bool {
+        match self.probe.get(&format!("{}/tasks/api/info", self.base)).call() {
+            Ok(_) | Err(ureq::Error::Status(..)) => true,
+            Err(ureq::Error::Transport(_)) => false,
+        }
+    }
+
+    /// The board is up but this call timed out (or its connection broke): busy, not gone, so it
+    /// isn't registered again as a down one would be.
+    fn slow(&self, path: &str, why: String) -> CallError {
+        let why = format!("slow: {why}");
+        let mut down = self.down.lock().unwrap_or_else(|e| e.into_inner());
+        if down.as_deref() != Some(why.as_str()) {
+            crate::log::info(format!("the board at {} is up but slow to answer ({path}): {why}", self.base));
+            *down = Some(why);
+        }
+        CallError { status: 0, message: "The board is running but slow to answer.".into(), slow: true }
     }
 
     /// The UI's "can't reach" error; the real reason goes to `app.log` when it's new.
@@ -113,7 +145,7 @@ impl Daemon {
             *down = Some(why);
         }
         crate::install::daemon_unreachable();
-        CallError { status: 0, message: "Can’t reach the task board server.".into() }
+        CallError { status: 0, message: "Can’t reach the board.".into(), slow: false }
     }
 
     fn reached(&self) {
@@ -157,7 +189,10 @@ impl Backend for Daemon {
                     return socket_answer(status, &answer);
                 }
                 Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {}
-                Err(e) => return Err(self.unreachable(path, format!("app socket {}: {e}", sock.display()))),
+                Err(e) => {
+                    let why = format!("app socket {}: {e}", sock.display());
+                    return Err(if self.alive() { self.slow(path, why) } else { self.unreachable(path, why) });
+                }
             }
         }
         let mut req = self.agent.post(&format!("{}/tasks/api/{path}", self.base)).set("X-Task-Board", "1").set("X-Task-Board-From", "app");
@@ -175,7 +210,7 @@ fn socket_answer(status: u16, body: &[u8]) -> CallResult {
         return Ok(v.unwrap_or(Value::Null));
     }
     let msg = v.and_then(|v| v["error"].as_str().map(str::to_string));
-    Err(CallError { status, message: msg.unwrap_or_else(|| format!("The board answered {status}.")) })
+    Err(CallError { status, message: msg.unwrap_or_else(|| format!("The board answered {status}.")), slow: false })
 }
 
 // ------------------------------------------------------------------ fake
@@ -197,6 +232,11 @@ impl Fake {
         std::fs::create_dir_all(&dir).expect("fake board folder");
         let mut cfg = Config::for_tests(&dir);
         cfg.owner = "Alex".into();
+        let jira = std::env::var("TASKBOARD_FAKE_JIRA").is_ok();
+        if jira {
+            cfg.jira.site = "acme.atlassian.net".into();
+            cfg.jira.project = "WEB".into();
+        }
         let board = Board::new(cfg, false).expect("fake board");
         if let Err(e) = taskboardd::seed::seed(&board) {
             eprintln!("taskboard-app: seeding the fake board failed: {}", e.message);
@@ -206,6 +246,13 @@ impl Fake {
         if std::env::var("TASKBOARD_FAKE_RELEASES").is_ok() {
             seed_releases(&board);
         }
+        // Dev: `TASKBOARD_FAKE_PLAN=B2,B3` plans the Backlog's new goal for those issues (waves by rule).
+        if let Ok(ids) = std::env::var("TASKBOARD_FAKE_PLAN") {
+            let ids: Vec<&str> = ids.split(',').map(str::trim).filter(|r| !r.is_empty()).collect();
+            if let Err(e) = api::dispatch(&board, "POST", "backlog/plan", &Query::new(), &json!({"ids": ids})) {
+                eprintln!("taskboard-app: planning the fake backlog failed: {}", e.message);
+            }
+        }
         if std::env::var("TASKBOARD_FAKE_PLAN_REVIEW").is_ok() {
             seed_plan_review(&board);
         }
@@ -214,6 +261,21 @@ impl Fake {
         }
         if std::env::var("TASKBOARD_FAKE_NEEDS").is_ok() {
             seed_needs(&board);
+        }
+        if std::env::var("TASKBOARD_FAKE_STOPS").is_ok() {
+            seed_stops(&board);
+        }
+        if std::env::var("TASKBOARD_FAKE_RECAPS").is_ok() {
+            seed_recaps(&board);
+        }
+        if std::env::var("TASKBOARD_FAKE_PANEL").is_ok() {
+            seed_panel(&board);
+        }
+        if std::env::var("TASKBOARD_FAKE_SLOTS").is_ok() {
+            seed_slots(&board);
+        }
+        if jira {
+            seed_jira(&board);
         }
         if std::env::var("TASKBOARD_FAKE_QUIET").is_ok() {
             let _ = taskboardd::dispatch::add_alert_keyed(&board, "T5: no update for 40 minutes", Some(5), None, "quiet:T5");
@@ -244,12 +306,12 @@ impl Backend for Fake {
 
     fn get(&self, path: &str, query: &[(&str, String)]) -> CallResult {
         let q: Query = query.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
-        api::dispatch(&self.board, "GET", path, &q, &json!({})).map_err(|e| CallError { status: e.status, message: e.message })
+        api::dispatch(&self.board, "GET", path, &q, &json!({})).map_err(|e| CallError { status: e.status, message: e.message, slow: false })
     }
 
     fn post(&self, path: &str, body: Value) -> CallResult {
         let q: Query = [(api::FROM.to_string(), "app".to_string())].into_iter().collect();
-        api::dispatch(&self.board, "POST", path, &q, &body).map_err(|e| CallError { status: e.status, message: e.message })
+        api::dispatch(&self.board, "POST", path, &q, &body).map_err(|e| CallError { status: e.status, message: e.message, slow: false })
     }
 }
 
@@ -328,6 +390,70 @@ fn seed_stopped(board: &Board) {
     }
 }
 
+/// GitHub, Slack and Jira connected (the sandbox's sample answers), with QA comments on.
+fn seed_jira(board: &Board) {
+    let _ = board.db.set_setting("qa_on", Some("1"));
+    for (id, body) in [("github", json!({"token": "ghp_sample"})), ("slack", json!({"token": "xoxp-sample"})), ("jira", json!({"email": "sample@example.com", "token": "ATATT-sample"}))] {
+        if let Err(e) = api::dispatch(board, "POST", &format!("accounts/{id}"), &Query::new(), &body) {
+            eprintln!("taskboard-app: connecting the fake {id} account failed: {}", e.message);
+        }
+    }
+}
+
+/// Dev (`TASKBOARD_FAKE_SLOTS=1`): webapp's worktree pool, keeping 1 to 4 slots: slot-1 held by
+/// T2, slot-2 and slot-3 free.
+fn seed_slots(board: &Board) {
+    let now = taskboardd::util::now_iso();
+    for (n, task) in [(1, Some(2i64)), (2, None), (3, None)] {
+        let _ = board.db.insert(
+            "worktree_slots",
+            taskboardd::fields!["repo" => "/tmp/webapp", "n" => n, "path" => format!("/tmp/webapp/.claude/worktrees/slot-{n}"), "project" => "webapp", "task_id" => task, "made_at" => now.clone(), "used_at" => now.clone()],
+        );
+    }
+    let _ = api::dispatch(board, "POST", "/projects/webapp", &Query::new(), &json!({"min_slots": 1, "max_slots": 4, "idle_trim_days": 3, "idle_remove_days": 7}));
+}
+
+/// Dev (`TASKBOARD_FAKE_PANEL=1`): the task panel's need boxes: a lost task that looks finished,
+/// PRs waiting on your review, rebasing and stopped, one merged without its note for testers, and a human task waiting on a task with a PR.
+fn seed_panel(board: &Board) {
+    use taskboardd::{board as b, fields, human, util};
+    let post = |body: Value| api::dispatch(board, "POST", "/tasks", &Query::new(), &body).ok().and_then(|v| v["id"].as_i64());
+    let mk = |title: &str| post(json!({"title": title, "detail": "Sample work.", "project": "webapp", "pickup": "new"}));
+    let now = util::now_iso();
+    let ago = |mins: i64| (chrono::Utc::now() - chrono::Duration::minutes(mins)).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    if let Some(t) = mk("Release v0.2.0") {
+        let found = json!({"lost_at": ago(20), "found": [{"what": "Tag v0.2.0", "at": ago(30)},
+                                                       {"what": "Release v0.2.0 published", "at": ago(25), "url": "https://github.com/acme/webapp/releases/tag/v0.2.0"}]});
+        let _ = b::update_task(board, t, fields!["status" => "needs", "needs_reason" => "lost", "lost" => 1, "started_at" => ago(90),
+                                                 "latest" => "Published the release notes.", "looks_finished" => found.to_string()]);
+    }
+    let checks = json!({"checks": [{"name": "ci", "state": "SUCCESS"}], "running": 0});
+    let pr = |title: &str, num: i64, phase: &str, flow: Value| {
+        let t = mk(title)?;
+        let _ = b::update_task(board, t, fields!["status" => "done", "started_at" => ago(180), "finished_at" => ago(40), "summary" => "Ready for review.",
+                                                 "pr_repo" => "acme/webapp", "pr_num" => num, "pr_url" => format!("https://github.com/acme/webapp/pull/{num}"),
+                                                 "pr_state" => "OPEN", "pr_title" => title, "pr_phase" => phase, "pr_flow" => flow.to_string()]);
+        Some(t)
+    };
+    pr("Passkey sign-in button", 44, "review", json!({"rec": checks}));
+    pr("Rename the auth helpers", 45, "rebase", json!({"rec": checks}));
+    pr("Fix the flaky login test", 46, "fix", json!({"rec": {"checks": [{"name": "e2e", "state": "FAILURE"}], "failed": ["e2e"], "running": 0},
+                                                       "stopped": {"at": ago(8), "message": "Tests still fail on CI only. Should I skip the e2e suite for this PR?", "asked": true}}));
+    // Merged without a note for testers, its ticket waiting for one: the panel offers Write the note.
+    if let Some(t) = pr("Passkey sign-in on the account page", 48, "merged", json!({})) {
+        let _ = b::update_task(board, t, fields!["pr_state" => "MERGED", "merged_note_wait" => ago(30)]);
+    }
+    let signing = mk("Set up signing");
+    if let Some(s) = signing {
+        let _ = b::update_task(board, s, fields!["status" => "working", "started_at" => ago(50), "pr_repo" => "acme/webapp", "pr_num" => 47,
+                                                 "pr_url" => "https://github.com/acme/webapp/pull/47", "pr_state" => "OPEN", "pr_title" => "Set up signing"]);
+    }
+    if let (Some(h), Some(s)) = (mk("Upload the signing certificate"), signing) {
+        let _ = b::update_task(board, h, fields!["kind" => human::KIND, "status" => "queued",
+                                                 "detail" => "1. Open the developer account.\n2. Upload the certificate.", "waits_for" => json!([s]).to_string(), "updated_at" => now]);
+    }
+}
+
 /// Dev (`TASKBOARD_FAKE_NEEDS=1`): Needs you's Decide and Your to-dos filled, and two items on Later.
 fn seed_needs(board: &Board) {
     use taskboardd::{board as b, dispatch, fields, human, util};
@@ -341,7 +467,9 @@ fn seed_needs(board: &Board) {
     };
     let todo = |title: &str, goal: Option<i64>| {
         let t = post("/tasks".into(), json!({"title": title, "detail": "1. Open the account page.\n2. Copy the key.", "project": "webapp", "pickup": "new"}))["id"].as_i64()?;
-        let _ = b::update_task(board, t, taskboardd::fields!["kind" => human::KIND, "status" => "needs", "needs_reason" => human::NEEDS, "goal_id" => goal]);
+        let _ = b::update_task(board, t, taskboardd::fields!["kind" => human::KIND, "status" => "queued", "goal_id" => goal]);
+        // The fake runs no runner, so it does the runner's turn that puts a to-do on Needs you.
+        let _ = human::ready(board, &b::get_task(board, t).ok()?);
         Some(t)
     };
     let replay = "Picto: every error replay shows the 30 s before it";
@@ -362,10 +490,61 @@ fn seed_needs(board: &Board) {
         let _ = b::update_task(board, t, fields!["waits_for" => json!([h]).to_string()]);
     }
     for title in ["Renew the Apple certificate", "Sign the data agreement"] {
-        if let Some(t) = todo(title, None) {
-            post(format!("/alerts/task:T{t}/snooze"), json!({"until": "next_week"}));
+        let alert = todo(title, None).and_then(|t| dispatch::alerts(board).into_iter().find(|a| a["task_id"].as_i64() == Some(t)));
+        if let Some(id) = alert.as_ref().and_then(|a| a["id"].as_str()) {
+            post(format!("/alerts/{id}/snooze"), json!({"until": "next_week"}));
         }
     }
+}
+
+/// Dev (`TASKBOARD_FAKE_STOPS=1`): a goal at each wave stop (failed, held, review), a paused goal,
+/// one chained after another and one whose outcome missed, for the stop state on the sidebar, Goals and the goal page.
+fn seed_stops(board: &Board) {
+    use taskboardd::{board as b, fields, ops, util, waves};
+    let ago = |s: f64| util::iso(util::now_ts() - s);
+    let goal = |name: &str, extra: Value| {
+        let mut body = json!({"name": name, "project": "webapp", "outcome": "it works end to end", "run_in_order": false});
+        if let (Some(o), Some(x)) = (body.as_object_mut(), extra.as_object()) {
+            o.extend(x.clone());
+        }
+        ops::new_goal(board, &body).ok().and_then(|g| g["id"].as_i64()).unwrap_or(0)
+    };
+    let task = |g: i64, title: &str, wave: i64, status: &str| {
+        let c = ops::new_task(board, &json!({"title": title, "detail": "Sample work.", "project": "webapp", "goal_id": g, "wave": wave,
+                                             "status": "queued", "pickup": {"mode": "queue"}, "not_backlog": true}), b::OWNER, None);
+        let id = c.ok().and_then(|c| c["id"].as_i64()).unwrap_or(0);
+        if status == "done" {
+            let _ = b::update_task(board, id, fields!["status" => "done", "started_at" => ago(7200.0), "finished_at" => ago(3600.0), "summary" => "Done."]);
+        }
+        id
+    };
+    let failed = goal("Offline drafts", json!({}));
+    task(failed, "Store drafts in IndexedDB", 1, "done");
+    let f = task(failed, "Sync drafts on reconnect", 1, "done");
+    let _ = b::update_task(board, f, fields!["failed" => 1, "summary" => "Tests failed on reconnect."]);
+    task(failed, "Show a drafts badge", 2, "queued");
+    let held = goal("Billing emails", json!({}));
+    task(held, "Template the receipt", 1, "done");
+    task(held, "Send the receipt on payment", 2, "queued");
+    let _ = waves::set_wave(board, held, 2, fields!["held_at" => ago(1800.0)]);
+    let review = goal("Search filters", json!({}));
+    task(review, "Filter by date", 1, "done");
+    task(review, "Filter by owner", 1, "done");
+    task(review, "Save a filter", 2, "queued");
+    let _ = waves::set_wave(board, review, 1, fields!["name" => "Filters", "stop_after" => 1]);
+    let paused = goal("Dark mode", json!({}));
+    task(paused, "Theme tokens", 1, "done");
+    task(paused, "Dark palette", 1, "queued");
+    task(paused, "Settings switch", 1, "queued");
+    let _ = board.db.update("goals", &json!(paused), fields!["paused" => 1]);
+    let chained = goal("Billing reports", json!({"after": [held]}));
+    task(chained, "Monthly totals", 1, "queued");
+    let missed = goal("Export to CSV", json!({}));
+    task(missed, "Write the CSV export", 1, "done");
+    let now = util::now_iso();
+    let _ = board.db.insert("issues", fields!["project" => "webapp", "goal_id" => missed, "kind" => "gap", "title" => "Dates export in UTC, not local time",
+                                              "said" => "Dates export in UTC.", "how" => "Found while checking the goal.", "source" => "terminal", "state" => "open",
+                                              "misses_goal" => 1, "created_at" => now.clone(), "updated_at" => now]);
 }
 
 /// Dev (`TASKBOARD_FAKE_PLAN_REVIEW=1`): a finished review of the passkeys goal's plan (G1) with
@@ -390,6 +569,30 @@ fn seed_plan_review(board: &Board) {
         taskboardd::fields!["goal_id" => 1, "reason" => "new", "source" => "Alex", "model" => "small", "started_at" => at.clone(),
                             "finished_at" => at, "findings" => findings.to_string()],
     );
+}
+
+/// Dev (`TASKBOARD_FAKE_RECAPS=1`): this week's and this month's recaps, unseen. The week's page
+/// holds every component its facts can fill; the month's is the default page.
+fn seed_recaps(board: &Board) {
+    use taskboardd::{recap, recap_page};
+    let today = chrono::Local::now().date_naive();
+    if let Ok(month) = recap::save(board, "monthly", today) {
+        let _ = recap_page::compose(board, month, None);
+    }
+    let Ok(week) = recap::save(board, "weekly", today) else { return };
+    let Ok(writing) = recap_page::compose(board, week, None) else { return };
+    let Ok(one) = api::dispatch(board, "GET", &format!("/recaps/{week}"), &Query::new(), &json!({})) else { return };
+    let facts = &one["facts"];
+    let mut components = Vec::new();
+    for c in recap_page::CATALOG {
+        let spec = json!({"summary": "-", "components": [{"component": c.id, "why": "Every component."}]});
+        if let Ok(p) = recap_page::check(&spec, facts) {
+            components.extend(p["components"].as_array().cloned().unwrap_or_default());
+        }
+    }
+    let mut writing = writing;
+    writing["page"]["components"] = json!(components);
+    let _ = board.db.x("UPDATE recaps SET writing = ? WHERE id = ?", taskboardd::p![writing.to_string(), week]);
 }
 
 /// Dev (`TASKBOARD_FAKE_RELEASES=1`): releases on for both projects, two months of webapp releases
@@ -470,7 +673,7 @@ mod tests {
         // Nothing listens on port 9 (discard) on a dev machine.
         let d = Daemon::at("http://127.0.0.1:9");
         let e = d.get("state", &[]).unwrap_err();
-        assert_eq!(e.message, "Can’t reach the task board server.");
+        assert_eq!(e.message, "Can’t reach the board.");
         assert_eq!(e.status, 0);
     }
 
@@ -487,6 +690,35 @@ mod tests {
         assert_eq!(d.down.lock().unwrap().as_deref(), Some(why.as_str()));
         d.reached();
         assert!(d.down.lock().unwrap().is_none());
+    }
+
+    /// A board that takes the connection and answers the quick check but not the call in time is
+    /// slow, not down.
+    #[::core::prelude::v1::test]
+    fn a_timeout_on_a_live_board_is_slow() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = vec![];
+            for s in l.incoming() {
+                let mut s = s.unwrap();
+                let mut buf = [0u8; 2048];
+                let n = s.read(&mut buf).unwrap_or(0);
+                if String::from_utf8_lossy(&buf[..n]).starts_with("GET /tasks/api/info ") {
+                    s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}").unwrap();
+                } else {
+                    held.push(s);
+                }
+            }
+        });
+        let d = Daemon::at(&format!("http://127.0.0.1:{port}"));
+        let e = d.get("state", &[]).unwrap_err();
+        assert!(e.slow, "{e:?}");
+        assert_eq!(e.status, 0);
+        assert!(d.down.lock().unwrap().as_deref().is_some_and(|w| w.starts_with("slow:")));
+        let dead = Daemon::at("http://127.0.0.1:9").get("state", &[]).unwrap_err();
+        assert!(!dead.slow);
     }
 
     /// Posts go to the app socket when there's one, saying they're the app's and carrying the token
@@ -531,5 +763,24 @@ mod tests {
         // No socket: the port, which isn't there.
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(d.post("tasks/T1/start", json!({})).unwrap_err().status, 0);
+    }
+
+    /// `TASKBOARD_FAKE_NEEDS`: the owner's to-dos are on Needs you, and two of them are on Later.
+    #[::core::prelude::v1::test]
+    fn needs_seed_fills_to_dos_and_later() {
+        let f = Fake::new();
+        seed_needs(f.app());
+        let home = f.get("home", &[]).unwrap();
+        let titles = |k: &str| -> Vec<String> {
+            home[k].as_array().unwrap().iter().filter_map(|i| i["title"].as_str().or(i["text"].as_str()).map(str::to_string)).collect()
+        };
+        let (needs, later) = (titles("needs"), titles("later"));
+        for t in ["Create the Oracle Cloud account", "Send the signing key to the build machine"] {
+            assert!(needs.iter().any(|n| n.contains(t)), "{t} in {needs:?}");
+        }
+        for t in ["Renew the Apple certificate", "Sign the data agreement"] {
+            assert!(later.iter().any(|n| n.contains(t)), "{t} in {later:?}");
+            assert!(!needs.iter().any(|n| n.contains(t)), "{t} not in {needs:?}");
+        }
     }
 }

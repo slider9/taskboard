@@ -55,23 +55,134 @@ fn untriaged(app: &App, project: &str) -> Result<Vec<Row>> {
     Ok(rows.into_iter().filter(|b| project == "all" || b.s("project") == Some(project)).collect())
 }
 
+/// The Backlog page's ways of grouping issues.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lens {
+    Similar,
+    Area,
+    Impact,
+    Priority,
+}
+
+impl Lens {
+    fn of(s: &str) -> Option<Lens> {
+        Some(match s {
+            "similar" => Lens::Similar,
+            "area" => Lens::Area,
+            "impact" => Lens::Impact,
+            "priority" => Lens::Priority,
+            _ => return None,
+        })
+    }
+
+    fn key(self, b: &Row) -> String {
+        let f = fields(b);
+        let k = match self {
+            Lens::Similar => "group",
+            Lens::Area => "area",
+            Lens::Impact => "impact",
+            Lens::Priority => "priority",
+        };
+        f[k].as_str().unwrap_or("").to_string()
+    }
+
+    /// The groups' keys in the order the page shows them: the biggest first (Similar), by name
+    /// (Area), or by rank (Impact, Priority). `count` is each key's issues.
+    fn order(self, keys: &mut [String], count: impl Fn(&str) -> usize) {
+        match self {
+            Lens::Similar => keys.sort_by(|a, b| count(b).cmp(&count(a))),
+            Lens::Area => keys.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b))),
+            Lens::Impact => keys.sort_by_key(|k| IMPACTS.iter().position(|x| x == k).unwrap_or(9)),
+            Lens::Priority => keys.sort(),
+        }
+    }
+}
+
+/// The lens's groups over `rows` (all the issues the page could show), in the page's order, each
+/// with its true total and every issue in it, and each issue's place in that order.
+fn lens_groups(lens: Lens, rows: &[&Row], with: Option<&str>) -> (Vec<Value>, HashMap<String, usize>) {
+    let mut keys: Vec<String> = vec![];
+    let mut members: HashMap<String, Vec<&Row>> = HashMap::new();
+    for b in rows {
+        let k = lens.key(b);
+        if !members.contains_key(&k) {
+            keys.push(k.clone());
+        }
+        members.entry(k).or_default().push(b);
+    }
+    if let Some(w) = with.filter(|w| !members.contains_key(*w)) {
+        keys.push(w.to_string());
+    }
+    lens.order(&mut keys, |k| members.get(k).map_or(0, Vec::len));
+    let rank: HashMap<String, usize> = keys.iter().enumerate().map(|(i, k)| (k.clone(), i)).collect();
+    let groups = keys
+        .iter()
+        .filter_map(|k| members.get(k).map(|m| (k, m)))
+        .map(|(k, m)| {
+            let about = if lens == Lens::Similar { fields(m[0])["group_about"].clone() } else { json!("") };
+            json!({"key": k, "about": about, "total": m.len(), "refs": m.iter().map(|b| rf("issue", b.id())).collect::<Vec<_>>()})
+        })
+        .collect();
+    (groups, rank)
+}
+
 /// `GET /backlog/triage`: the untriaged issues with their grouping, and how much of the backlog is triaged.
 /// `limit` caps the page (newest first), `before` (an issue id) starts after that issue and `ids`
 /// keeps those issues only; a page says where the next starts (`next`). `untriaged` counts them all.
+/// With one `project`, `areas` counts its issues in each of its areas and `area` keeps one area's.
+/// `kinds` (comma-separated) keeps those kinds only, and `q` the issues whose ref or title holds
+/// it; `kind_counts` counts each kind among the issues `q` keeps. With `lens` (similar, area, impact or priority)
+/// the issues come in the page's order, group by group and newest first in each, and `groups` holds
+/// every group's true total and issues, so a group's count and Select all cover the issues not
+/// loaded yet.
 pub fn list(app: &App, query: &crate::api::Query) -> Result<Value> {
     ensure_grouped(app);
     let project = crate::api::q(query, "project", "all");
     let page = crate::api::Paging::of(query);
-    let all = untriaged(app, project)?;
+    let mut all = untriaged(app, project)?;
+    // A picked project's areas, each with its untriaged issues; `area` (one of them) keeps that one's.
+    let areas = if project == "all" { vec![] } else { area_counts(&all, &crate::areas::of_project(app, project)?) };
+    if let Some(a) = query.get("area").map(|a| a.trim()).filter(|a| !a.is_empty() && project != "all") {
+        all.retain(|b| b.s("area").is_some_and(|x| x.eq_ignore_ascii_case(a)));
+    }
     let ids: Option<Vec<i64>> = query.get("ids").map(|s| s.split(',').filter_map(|x| parse_ref_str(x.trim(), "issue").ok().flatten()).collect());
-    let mut rows: Vec<&Row> = all.iter().filter(|b| ids.as_ref().is_none_or(|ids| ids.contains(&b.id()))).collect();
-    // In `untriaged`'s order: an issue's place stays put even once the cursor's issue is triaged.
+    let kinds: Option<Vec<&str>> = query.get("kinds").map(|s| s.split(',').map(str::trim).filter(|k| !k.is_empty()).collect());
+    let lens = query.get("lens").and_then(|l| Lens::of(l));
+    let words = query.get("q").map(|q| q.trim().to_lowercase()).filter(|q| !q.is_empty());
+    let found: Vec<&Row> = all
+        .iter()
+        .filter(|b| ids.as_ref().is_none_or(|ids| ids.contains(&b.id())))
+        .filter(|b| words.as_ref().is_none_or(|w| matches(b, w)))
+        .collect();
+    let mut kind_counts = serde_json::Map::new();
+    for b in &found {
+        let n = kind_counts.entry(b.st("kind")).or_insert(json!(0));
+        *n = json!(n.as_u64().unwrap_or(0) + 1);
+    }
+    let mut rows: Vec<&Row> = found
+        .into_iter()
+        .filter(|b| kinds.as_ref().is_none_or(|k| k.contains(&b.st("kind").as_str())))
+        .collect();
+    let cursor = match page.before.as_deref().and_then(|b| parse_ref_str(b, "issue").ok().flatten()) {
+        Some(b) => app.db.q1("SELECT * FROM issues WHERE id = ?", p![b])?,
+        None => None,
+    };
+    // In `untriaged`'s order (by group first, with a lens): an issue's place stays put even once
+    // the cursor's issue is triaged.
     let at = |b: &Row| (b.st("created_at"), b.id());
-    if let Some(b) = page.before.as_deref().and_then(|b| parse_ref_str(b, "issue").ok().flatten()) {
-        if let Some(c) = app.db.q1("SELECT * FROM issues WHERE id = ?", p![b])? {
-            let c = at(&c);
-            rows.retain(|b| at(b) < c);
+    let mut groups = Value::Null;
+    if let Some(lens) = lens {
+        let (g, rank) = lens_groups(lens, &rows, cursor.as_ref().map(|c| lens.key(c)).as_deref());
+        groups = json!(g);
+        let place = |b: &Row| (rank.get(&lens.key(b)).copied().unwrap_or(usize::MAX), std::cmp::Reverse(at(b)));
+        rows.sort_by_key(|b| place(b));
+        if let Some(c) = &cursor {
+            let c = place(c);
+            rows.retain(|b| place(b) > c);
         }
+    } else if let Some(c) = &cursor {
+        let c = at(c);
+        rows.retain(|b| at(b) < c);
     }
     let more = page.cut(&mut rows);
     let next = rows.last().filter(|_| more).map(|b| b.id().to_string());
@@ -98,8 +209,26 @@ pub fn list(app: &App, query: &crate::api::Query) -> Result<Value> {
     let sh = app.shared.lock();
     Ok(json!({
         "issues": out, "untriaged": all.len(), "triaged": total - all.len() as i64, "total": total, "next": next,
-        "projects": projects, "grouping": sh.grouping, "ai": ai_on(app),
+        "projects": projects, "grouping": sh.grouping, "ai": ai_on(app), "groups": groups,
+        "kind_counts": kind_counts, "areas": areas,
     }))
+}
+
+/// The areas `.taskboard.toml` lists, in its order, each with how many of `issues` are in it.
+/// Areas with none are left out.
+fn area_counts(issues: &[Row], areas: &crate::areas::Areas) -> Vec<Value> {
+    areas
+        .list
+        .iter()
+        .map(|a| (a, issues.iter().filter(|b| b.s("area").is_some_and(|x| x.eq_ignore_ascii_case(&a.name))).count()))
+        .filter(|(_, n)| *n > 0)
+        .map(|(a, n)| json!({"name": a.name, "count": n}))
+        .collect()
+}
+
+/// Whether the issue's ref or title holds `words` (already lower case).
+fn matches(b: &Row, words: &str) -> bool {
+    rf("issue", b.id()).to_lowercase().contains(words) || b.st("title").to_lowercase().contains(words)
 }
 
 // ------------------------------------------------------------------ asking Claude
@@ -129,6 +258,26 @@ pub(crate) fn ask_model_limited(
     app: &App, model: &str, prompt: String, schema: Value, repo: Option<&std::path::Path>, extra: &[&str], timeout_secs: u64,
     budget_usd: &str, max_turns: Option<u32>,
 ) -> std::result::Result<Value, String> {
+    ask_stoppable(app, model, prompt, schema, repo, extra, timeout_secs, budget_usd, max_turns, None)
+}
+
+/// [`ask_in_with`] that gives up as soon as `stop` says so, killing Claude: the answer is then an
+/// error, [`STOPPED`].
+pub(crate) fn ask_in_until(
+    app: &App, prompt: String, schema: Value, repo: Option<&std::path::Path>, extra: &[&str], timeout_secs: u64, stop: &dyn Fn() -> bool,
+) -> std::result::Result<Value, String> {
+    let (model, budget) = (&app.cfg.backlog.model, &app.cfg.backlog.budget_usd);
+    ask_stoppable(app, model, prompt, schema, repo, extra, timeout_secs, budget, None, Some(stop))
+}
+
+/// What [`ask_in_until`] answers when it was stopped.
+pub(crate) const STOPPED: &str = "stopped before Claude answered";
+
+#[allow(clippy::too_many_arguments)]
+fn ask_stoppable(
+    app: &App, model: &str, prompt: String, schema: Value, repo: Option<&std::path::Path>, extra: &[&str], timeout_secs: u64,
+    budget_usd: &str, max_turns: Option<u32>, stop: Option<&dyn Fn() -> bool>,
+) -> std::result::Result<Value, String> {
     let claude = proc::which(&app.cfg.claude).ok_or("claude isn't installed")?;
     let read: &[&str] = if repo.is_some() { &["Read", "Grep", "Glob"] } else { &[] };
     let tools = read.iter().chain(extra).copied().collect::<Vec<_>>().join(",");
@@ -157,7 +306,16 @@ pub(crate) fn ask_model_limited(
         args.extend(["--max-turns".into(), n.to_string()]);
     }
     let cwd = repo.unwrap_or(app.cfg.data.as_path());
-    let out = proc::run(&claude, &args, Some(cwd), timeout_secs as f64).map_err(|_| "claude didn't answer in time".to_string())?;
+    let late = |_| "claude didn't answer in time".to_string();
+    let out = match stop {
+        None => proc::run(&claude, &args, Some(cwd), timeout_secs as f64).map_err(late)?,
+        Some(stop) => {
+            if stop() {
+                return Err(STOPPED.into());
+            }
+            proc::run_until(&claude, &args, Some(cwd), timeout_secs as f64, &[], None, stop).map_err(late)?.ok_or_else(|| STOPPED.to_string())?
+        }
+    };
     let d: Value = serde_json::from_str(out.stdout.trim()).map_err(|_| "claude's answer wasn't JSON".to_string())?;
     d.get("structured_output")
         .cloned()
@@ -504,6 +662,25 @@ fn merge(mut a: Value, b: Value) -> Value {
         a[k] = v;
     }
     a
+}
+
+/// `POST /backlog/plan/add {ids}`: issues picked after the plan join its last wave, waiting on
+/// nothing, so the goal can be made without planning again. Issues already in the plan stay put.
+pub fn plan_add(app: &App, body: &Value) -> Result<Value> {
+    let rows = picked(app, body)?;
+    let mut sh = app.shared.lock();
+    let Some(plan) = sh.plan.as_mut().filter(|p| p["state"] == "ready" && p["waves"].as_array().is_some_and(|w| !w.is_empty())) else {
+        return err(409, "There's no plan to add to yet. Plan the waves first.");
+    };
+    let have: Vec<String> = plan["waves"].as_array().into_iter().flatten().flat_map(|w| w["items"].as_array().cloned().unwrap_or_default()).filter_map(|i| i["ref"].as_str().map(str::to_string)).collect();
+    let new: Vec<String> = rows.iter().map(|b| rf("issue", b.id())).filter(|r| !have.contains(r)).collect();
+    if let Some(items) = plan["waves"].as_array_mut().and_then(|w| w.last_mut()).and_then(|w| w["items"].as_array_mut()) {
+        items.extend(new.iter().map(|r| json!({"ref": r, "after": []})));
+    }
+    let mut ids: Vec<Value> = plan["ids"].as_array().cloned().unwrap_or_default();
+    ids.extend(new.iter().filter(|r| !ids.contains(&json!(r))).map(|r| json!(r)).collect::<Vec<_>>());
+    plan["ids"] = json!(ids);
+    Ok(plan.clone())
 }
 
 /// `GET /backlog/plan`: the latest plan (`state`: none, planning or ready).

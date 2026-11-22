@@ -561,6 +561,49 @@ fn the_desk_opens_once_while_midna_syncs_and_keeps_one_desk() {
 }
 
 #[test]
+fn a_busy_extra_desk_waits_to_be_closed_gently_and_isn_t_retried_forever() {
+    let b = board_with(|c, _| c.jira.desk = true);
+    let desk_jobs = || b.jobs("kind = 'agent' AND purpose = 'jira_desk'");
+    let cwd = b.dir.path().to_string_lossy().to_string();
+    let desk = |sid: &str, state: &str| json!({"id": sid, "name": "TB Jira desk", "agent": "claude", "cwd": cwd, "status": {"state": state}});
+    b.new_task(json!({"jira": "create"}));
+    b.tick();
+    let old = taskboardd::util::iso(taskboardd::util::now_ts() - jira_desk::SYNC_WAIT_SECS - 5.0);
+    b.app.db.x("UPDATE jobs SET state = 'done', updated_at = ?, target = ? WHERE id = ?", taskboardd::p![old, json!({"session": "s9"}).to_string(), desk_jobs()[0].id()]).unwrap();
+    b.tick();
+    b.app.db.x("UPDATE jobs SET state = 'done', target = ? WHERE id = ?", taskboardd::p![json!({"session": "s10"}).to_string(), desk_jobs()[1].id()]).unwrap();
+
+    // The extra desk is still working (on its intro): a force close would ask the owner, so it waits.
+    midna::sync(&b.app, &[desk("s9", "idle"), desk("s10", "working")], &[]).unwrap();
+    b.tick();
+    assert!(b.jobs("kind = 'close'").is_empty(), "a busy extra desk isn't closed yet");
+
+    midna::sync(&b.app, &[desk("s9", "idle"), desk("s10", "idle")], &[]).unwrap();
+    b.tick();
+    let closes = b.jobs("kind = 'close'");
+    assert_eq!(closes.len(), 1, "closed once it's idle");
+    assert_eq!(board::job_args(&closes[0]).st("session"), "s10");
+    assert_eq!(board::job_args(&closes[0])["force"], false);
+
+    // A close that failed (Midna timed out) is tried again a little later, a few times at most.
+    let fail_all = |at: &str| {
+        b.app.db.x("UPDATE jobs SET state = 'failed', updated_at = ? WHERE kind = 'close' AND state = 'pending'", taskboardd::p![at]).unwrap();
+    };
+    fail_all(&taskboardd::util::now_iso());
+    b.tick();
+    assert_eq!(b.jobs("kind = 'close'").len(), 1, "not sent again right after it failed");
+    for tries in 2..=4 {
+        b.app.db.x("UPDATE jobs SET updated_at = '2000-01-01T00:00:00Z' WHERE kind = 'close'", taskboardd::p![]).unwrap();
+        b.tick();
+        assert_eq!(b.jobs("kind = 'close'").len(), tries, "tried again a little later");
+        fail_all("2000-01-01T00:00:00Z");
+    }
+    b.tick();
+    assert_eq!(b.jobs("kind = 'close'").len(), 4, "gives up after four tries");
+    assert!(b.jobs("kind = 'close'").iter().all(|j| board::job_args(j)["force"] == false), "never forced");
+}
+
+#[test]
 fn a_cold_desk_is_swapped_for_a_fresh_one_instead_of_sent_compact() {
     let b = board_with(|c, _| c.jira.desk = true);
     let desk_jobs = || b.jobs("kind = 'agent' AND purpose = 'jira_desk'");
@@ -1103,4 +1146,50 @@ fn with_a_guide_an_agent_writes_the_ticket_text() {
     b.post(&format!("/tasks/{id}"), json!({"jira_key": "new", "who": "agent-1", "ticket_text": "As a user, I sign in."}));
     assert_eq!(board::job_args(&b.jobs("kind = 'jira'").pop().unwrap()).st("description"), "As a user, I sign in.");
     assert_eq!(b.task(id).st("ticket_text"), "As a user, I sign in.");
+}
+
+#[test]
+fn setting_no_pr_or_no_jira_drops_the_pending_find_or_make_job() {
+    let b = board_with(|_, _| {});
+    let pending = |t: i64| b.jobs(&format!("kind = 'jira' AND state = 'pending' AND json_extract(target, '$.task') = {t}")).len();
+    let t = b.new_task(json!({"jira": "create"}));
+    assert_eq!(pending(t), 1);
+    b.post(&format!("/tasks/T{t}"), json!({"ships_pr": "no"}));
+    assert_eq!(pending(t), 0, "a task that ends without a PR needs no ticket");
+
+    let u = b.new_task(json!({"jira": "create"}));
+    assert_eq!(pending(u), 1);
+    b.post(&format!("/tasks/T{u}"), json!({"jira_key": "none"}));
+    assert_eq!(pending(u), 0, "--jira none drops the ask");
+    assert!(b.task(u).b("jira_none"));
+
+    let keep = b.new_task(json!({"jira": "create"}));
+    assert_eq!(pending(keep), 1, "another task's job stays");
+}
+
+#[test]
+fn a_planned_item_with_pr_no_queues_no_jira_job() {
+    let b = board_with(|_, _| {});
+    let g = b.post("/goals", json!({"name": "Login", "project": "webapp"}))["id"].as_i64().unwrap();
+    let repo = b.dir.path().join("webapp").to_string_lossy().to_string();
+    midna::sync(&b.app, &[json!({"id": "s1", "name": "Term s1", "agent": "claude", "cwd": repo, "status": {"state": "working"}})], &[]).unwrap();
+    let r = taskboardd::reports::handle(
+        &b.app,
+        json!({"event": "tb.propose", "session": "s1", "claude_session": "c-s1", "cwd": "", "git": {}, "goal": format!("G{g}"),
+               "tasks": [{"title": "Plain", "detail": "d", "jira": "create"}, "Notes::write them::pr=no"]}),
+        false,
+    )
+    .unwrap();
+    let r2 = taskboardd::reports::handle(
+        &b.app,
+        json!({"event": "tb.propose", "session": "s1", "claude_session": "c-s1", "cwd": "", "git": {}, "goal": format!("G{g}"),
+               "tasks": [{"title": "Notes two", "detail": "d", "jira": "create", "ships_pr": "no"}]}),
+        false,
+    )
+    .unwrap();
+    let id = |r: &Value, i: usize| -> i64 { r["created"][i].as_str().unwrap()[1..].parse().unwrap() };
+    let notes = id(&r, 1);
+    assert_eq!(b.task(notes).i("ships_pr"), Some(0));
+    assert_eq!(b.task(id(&r2, 0)).i("ships_pr"), Some(0));
+    assert!(b.jobs("kind = 'jira'").iter().all(|j| j.s("target").is_none_or(|t| !t.contains(&format!("\"task\":{notes}")))));
 }

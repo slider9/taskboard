@@ -367,6 +367,9 @@ mod tests {
                 let _ = writeln!(c, "{line}");
                 let _ = c.flush();
             }
+            // Hang up now, not when the socket's last handle closes: on Windows a process another test
+            // starts meanwhile can inherit it, and its exit then resets the connection instead.
+            let _ = c.shutdown(std::net::Shutdown::Write);
         });
         Config::from_file(taskboardd::config::FileConfig { port: Some(port), ..Default::default() }, std::env::temp_dir().join("tb-client-test.toml"))
     }

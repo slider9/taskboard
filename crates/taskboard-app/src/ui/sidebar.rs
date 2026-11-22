@@ -1,10 +1,11 @@
 //! The sidebar on every page: search, the pages with their counts, the goals in flight with a
-//! status bar and last update each, and the board's health (Midna, work hours, usage, hooks,
-//! accounts, updates, settings) at the foot. Its top is the window's title bar, clear of the traffic lights.
+//! status bar and last update each, and the board's health at the foot: one line of what's
+//! wrong, the usage reading, work hours and Settings. Its top is the window's title bar, clear of the traffic lights.
 use crate::app::{MainWindow, Page};
 use crate::fmt::{self, arr, b, i, s};
 use crate::theme::{Theme, ThemeMode};
 use crate::ui::goals_page::{GoalGroup, Tally, goal_group};
+use crate::ui::stop::{self, Kind};
 use crate::ui::{kit, status};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -19,11 +20,12 @@ pub fn pinned_goals(goals: &[Value]) -> Vec<&Value> {
     v
 }
 
-/// The goals in the sidebar: every one in progress, running or not, newest first. Up next, paused
-/// and finished ones are on the Goals page.
+/// The goals in the sidebar: every one in progress, running or not. Those stopped for the owner
+/// come first, the worst stop first; then the rest, newest first. Up next, paused and finished
+/// ones are on the Goals page.
 pub fn active_goals(goals: &[Value]) -> Vec<&Value> {
     let mut v: Vec<&Value> = goals.iter().filter(|g| goal_group(g) == GoalGroup::Active).collect();
-    v.sort_by_key(|g| std::cmp::Reverse(i(g, "id")));
+    v.sort_by_key(|g| (stop::of(g).map_or(Kind::Missed as u8 + 1, |x| x.kind as u8), std::cmp::Reverse(i(g, "id"))));
     v
 }
 
@@ -33,31 +35,33 @@ const STALE_RUNNING_MINS: i64 = 30;
 const STALE_WAITING_MINS: i64 = 120;
 
 /// The goal hasn't moved for longer than its work should take to show something. A goal waiting
-/// on you is never stale: it's yours to move.
+/// on you, or stopped with terminals you closed, is never stale: it's yours to move.
 pub fn stale(g: &Value) -> bool {
     let Some(mins) = fmt::opt_s(g, "last_update").and_then(fmt::minutes_since) else { return false };
-    if i(g, "needs") > 0 {
+    if i(g, "needs") > 0 || i(g, "hand_closed") > 0 || stop::of(g).is_some() {
         return false;
     }
     mins > if i(g, "active") > 0 { STALE_RUNNING_MINS } else { STALE_WAITING_MINS }
 }
 
-/// The goal's line under its name: "2 of 7 · 1 needs you", "Paused", "After G22".
+/// The goal's line under its name: "2 of 7 · ‖ Held", "‖ Paused · 2 of 7", "Starts after G22".
 pub fn goal_sub(g: &Value) -> String {
     let count = format!("{} of {}", i(g, "done"), i(g, "total"));
     if b(g, "paused") {
-        return format!("Paused · {count}");
+        return format!("‖ Paused · {count}");
     }
-    if let Some(after) = arr(g, "after").first().and_then(Value::as_str).filter(|_| fmt::opt_s(g, "after_blocker").is_some()) {
-        return format!("After {after}");
+    if let Some(after) = crate::ui::goals_page::after_ref(g).or_else(|| arr(g, "after").first().and_then(Value::as_str).filter(|_| fmt::opt_s(g, "after_blocker").is_some()).map(str::to_string)) {
+        return format!("Starts after {after}");
     }
-    if i(g, "needs") > 0 {
-        return format!("{count} · {} you", fmt::plural(i(g, "needs"), "needs", "need"));
+    match stop::of(g) {
+        Some(st) => format!("{count} · {}", st.kind.label()),
+        None => count,
     }
-    if fmt::opt_s(g, "stopped").is_some() {
-        return format!("{count} · stopped for you");
-    }
-    count
+}
+
+/// How many goals in the sidebar wait on the owner.
+pub fn stopped_count(goals: &[&Value]) -> usize {
+    goals.iter().filter(|g| stop::of(g).is_some()).count()
 }
 
 /// The sidebar's background: a step darker than the page in light, a step lighter in dark.
@@ -65,10 +69,10 @@ pub fn bg(t: &Theme) -> Hsla {
     if t.mode == ThemeMode::Dark { t.tint } else { t.col }
 }
 
-fn nav_item(t: &Theme, id: &'static str, label: &'static str, mark: Div, count: Option<(String, bool)>, on: bool) -> Stateful<Div> {
+/// `aside`: a quiet orange word beside the count, "2 stopped".
+fn nav_item(t: &Theme, id: &'static str, label: &'static str, mark: Div, count: Option<(String, bool)>, aside: Option<String>, on: bool) -> Stateful<Div> {
     let (text, muted) = (t.text, t.text_2);
-    div()
-        .id(id)
+    crate::ui::focus::stop(t, div().id(id))
         .flex()
         .items_center()
         .gap(px(10.))
@@ -81,6 +85,7 @@ fn nav_item(t: &Theme, id: &'static str, label: &'static str, mark: Div, count: 
         .when(!on, |d| d.text_color(muted).hover(move |s| s.text_color(text)))
         .child(mark)
         .child(div().flex_1().min_w_0().truncate().child(label))
+        .children(aside.map(|x| div().flex_none().text_size(px(11.)).text_color(t.warn_text).child(x)))
         .children(count.map(|(n, loud)| {
             div().text_size(px(12.)).text_color(if loud { t.warn_fg } else { t.muted }).when(loud, |d| d.font_weight(FontWeight::BOLD)).child(n)
         }))
@@ -100,10 +105,17 @@ pub fn render(m: &mut MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> An
     let all_goals = m.data.goals.clone();
     let goals = active_goals(&all_goals);
     let active_goals = goals.len();
+    let stopped = stopped_count(&goals);
     let untriaged = i(counts, "untriaged");
+    let recaps = i(counts, "recaps_unseen");
 
+    let nav_aside = |id: &'static str, label: &'static str, mark: Div, count: Option<(String, bool)>, aside: Option<String>, to: Page, on: bool, cx: &mut Context<MainWindow>| {
+        nav_item(t, id, label, mark, count, aside, on).on_click(cx.listener(move |m, _, _, cx| {
+            m.go(to.clone(), cx);
+        }))
+    };
     let nav = |id: &'static str, label: &'static str, mark: Div, count: Option<(String, bool)>, to: Page, on: bool, cx: &mut Context<MainWindow>| {
-        nav_item(t, id, label, mark, count, on).on_click(cx.listener(move |m, _, _, cx| {
+        nav_item(t, id, label, mark, count, None, on).on_click(cx.listener(move |m, _, _, cx| {
             m.go(to.clone(), cx);
         }))
     };
@@ -127,10 +139,10 @@ pub fn render(m: &mut MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> An
         .child(div().h(px(6.)))
         .child(nav("nav-needs", "Needs you", kit::dot(t.warn, 8.), (needs > 0).then(|| (needs.to_string(), true)), Page::Board, on(Page::Board), cx))
         .child(nav("nav-projects", "Projects", square(t.text, true), (projects > 0).then(|| (projects.to_string(), false)), Page::Projects, on(Page::Projects), cx))
-        .child(nav("nav-goals", "Goals", square(t.goal, false), (active_goals > 0).then(|| (active_goals.to_string(), false)), Page::Goals, on(Page::Goals) || matches!(page, Page::Goal(_)), cx))
+        .child(nav_aside("nav-goals", "Goals", square(t.goal, false), (active_goals > 0).then(|| (active_goals.to_string(), false)), (stopped > 0).then(|| format!("{stopped} stopped")), Page::Goals, on(Page::Goals) || matches!(page, Page::Goal(_)), cx))
         .child(nav("nav-backlog", "Backlog", kit::dot(t.backlog_dot, 8.), (untriaged > 0).then(|| (untriaged.to_string(), false)), Page::Backlog, on(Page::Backlog), cx))
         .child(nav("nav-ideas", "Ideas", kit::dot(t.goal, 8.), None, Page::Ideas, on(Page::Ideas) || matches!(page, Page::Idea(_)), cx))
-        .child(nav("nav-days", "Days", square(t.results, false), None, Page::Days, on(Page::Days) || page == Page::Review, cx));
+        .child(nav("nav-days", "Days", square(t.results, false), (recaps > 0).then(|| (recaps.to_string(), true)), Page::Days, on(Page::Days) || page == Page::Review || page == Page::Recap, cx));
     if !crate::ui::releases::projects_on(&st).is_empty() {
         col = col.child(nav("nav-releases", "Releases", square(t.up, true), None, Page::Releases, on(Page::Releases) || matches!(page, Page::ReleasesOf(_)), cx));
     }
@@ -148,6 +160,7 @@ pub fn render(m: &mut MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> An
             let text = t.text;
             let open = r.clone();
             let stale = stale(g);
+            let stop = stop::of(g).filter(|_| !b(g, "paused"));
             let updated = fmt::opt_s(g, "last_update").map(|at| {
                 div()
                     .id(SharedString::from(format!("side-goal-at-{r}")))
@@ -158,8 +171,7 @@ pub fn render(m: &mut MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> An
                     .child(fmt::ago(at))
             });
             list = list.child(
-                div()
-                    .id(SharedString::from(format!("side-goal-{r}")))
+                crate::ui::focus::stop(t, div().id(SharedString::from(format!("side-goal-{r}"))))
                     .flex()
                     .flex_col()
                     .gap(px(6.))
@@ -178,7 +190,7 @@ pub fn render(m: &mut MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> An
                             .gap(px(8.))
                             .child(div().flex_none().text_size(px(12.)).font_family(t.mono_font.clone()).font_weight(FontWeight::SEMIBOLD).text_color(t.goal).child(r.clone()))
                             .child(div().flex_1().min_w_0().text_size(px(13.)).text_color(text).truncate().child(s(g, "name").to_string()))
-                            .when(i(g, "needs") > 0, |d| d.child(kit::dot(t.warn, 7.))),
+                            .when_some(stop.as_ref(), |d, st| d.child(div().flex_none().text_size(px(12.)).font_weight(FontWeight::BOLD).text_color(st.kind.colors(t).0).child(st.kind.glyph()))),
                     )
                     .child(status::bar(t, &Tally::of(g, None).parts(), 4.))
                     .child(
@@ -187,7 +199,7 @@ pub fn render(m: &mut MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> An
                             .items_center()
                             .gap(px(8.))
                             .text_size(px(11.))
-                            .child(div().flex_1().min_w_0().text_color(t.muted).truncate().child(goal_sub(g)))
+                            .child(div().flex_1().min_w_0().text_color(stop.as_ref().map_or(t.muted, |st| st.kind.colors(t).0)).truncate().child(goal_sub(g)))
                             .children(updated),
                     ),
             );
@@ -201,8 +213,7 @@ pub fn render(m: &mut MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> An
 
 fn search_box(t: &Theme, cx: &mut Context<MainWindow>) -> Stateful<Div> {
     let line = t.border_2;
-    div()
-        .id("sidebar-search")
+    crate::ui::focus::stop(t, div().id("sidebar-search"))
         .flex()
         .flex_none()
         .items_center()
@@ -223,57 +234,14 @@ fn search_box(t: &Theme, cx: &mut Context<MainWindow>) -> Stateful<Div> {
         .child(div().font_family(t.mono_font.clone()).text_size(px(11.)).child(kit::shortcut("K")))
 }
 
-/// The board's health: Midna, work hours and usage, then whatever needs a look (hooks, accounts,
-/// an update, the PR feed), and Settings.
+/// The board's health (see [`crate::ui::health::footer`]).
 fn footer(m: &mut MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> Div {
-    let st = m.state_rc();
-    let mut wrap = div().flex().flex_wrap().gap(px(6.)).pt(px(10.)).border_t_1().border_color(t.border);
-    if let Some(mid) = st.get("midna").filter(|v| v.is_object()) {
-        let p = crate::app::conn_pill(mid);
-        let (fg, bg, dot) = if p.cls == "up" { (t.up_fg, t.up_soft, t.up) } else { (t.warn_fg, t.warn_soft, t.warn) };
-        let label = if p.cls == "up" { "Midna".to_string() } else { p.label };
-        wrap = wrap.child(crate::app::pill_shell(t, "conn-pill", fg, bg).child(kit::dot(dot, 8.)).child(label).tooltip(kit::tip(p.title)));
-    }
-    wrap = wrap.child(crate::ui::hours::pill(m, t, cx));
-    if let Some(u) = st.get("usage").and_then(crate::app::usage_view) {
-        wrap = wrap.child(
-            div().id("usage-pill-go").cursor_pointer().child(crate::app::usage_pill(t, &u)).on_click(cx.listener(|m, _, _, cx| m.go(crate::app::Page::Days, cx))),
-        );
-    }
-    wrap = wrap.children(crate::ui::prwatch::pills(&st, t));
-    if let Some(h) = crate::app::hooks_item(m, t, cx) {
-        wrap = wrap.child(h);
-    }
-    if m.backend.label() == "fake" {
-        wrap = wrap.child(kit::tone_pill(t, "goal", "Sample board"));
-    }
-    if let Some(p) = crate::app::accounts_pill(&st, t) {
-        wrap = wrap.child(p);
-    }
-    if let Some(p) = crate::app::update_pill(t) {
-        wrap = wrap.child(p);
-    }
-    let text = t.text;
-    wrap.child(
-        div()
-            .id("open-settings")
-            .flex()
-            .items_center()
-            .h(px(25.))
-            .px(px(4.))
-            .text_size(px(12.5))
-            .text_color(t.muted)
-            .cursor_pointer()
-            .hover(move |s| s.text_color(text))
-            .tooltip(kit::tip(format!("Settings ({})", kit::shortcut(","))))
-            .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::OpenSettings), cx))
-            .child("Settings"),
-    )
+    crate::ui::health::footer(m, t, cx)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{active_goals, stale};
+    use super::{active_goals, goal_sub, stale, stopped_count};
     use crate::fmt::i;
     use serde_json::{Value, json};
 
@@ -292,7 +260,26 @@ mod tests {
             json!({"id": 6, "done": 3, "total": 8, "active": 0, "needs": 0, "prs_open": [12]}),
         ];
         let ids: Vec<i64> = active_goals(&goals).iter().map(|g| i(g, "id")).collect();
-        assert_eq!(ids, vec![6, 4, 3, 1]);
+        // G3 waits on an answer: it comes first.
+        assert_eq!(ids, vec![3, 6, 4, 1]);
+    }
+
+    #[test]
+    fn stopped_goals_stay_first_and_say_what_stopped_them() {
+        let goals = vec![
+            json!({"id": 1, "done": 2, "total": 6, "active": 1, "needs": 0}),
+            json!({"id": 2, "done": 2, "total": 6, "active": 0, "needs": 0, "stop": {"kind": "held", "wave": 2}}),
+            json!({"id": 3, "done": 1, "total": 4, "active": 1, "needs": 0, "stop": {"kind": "failed", "wave": 1, "tasks": ["T4"]}}),
+            json!({"id": 4, "done": 0, "total": 3, "active": 0, "needs": 0, "after": ["G1"], "after_blocker": "Its goal runs after G1 (One), which isn't finished yet"}),
+        ];
+        let list = active_goals(&goals);
+        assert_eq!(list.iter().map(|g| i(g, "id")).collect::<Vec<_>>(), vec![3, 2, 1]);
+        assert_eq!(stopped_count(&list), 2);
+        assert_eq!(goal_sub(&goals[1]), "2 of 6 · ‖ Held");
+        assert_eq!(goal_sub(&goals[2]), "1 of 4 · × Failed");
+        assert_eq!(goal_sub(&goals[3]), "Starts after G1");
+        assert_eq!(goal_sub(&json!({"done": 1, "total": 3, "paused": true, "stop": {"kind": "held", "wave": 1}})), "‖ Paused · 1 of 3");
+        assert!(!stale(&json!({"active": 0, "needs": 0, "last_update": ago(600), "stop": {"kind": "held", "wave": 1}})));
     }
 
     #[test]
@@ -308,5 +295,6 @@ mod tests {
     fn a_goal_waiting_on_you_or_with_no_update_is_never_stale() {
         assert!(!stale(&json!({"active": 1, "needs": 1, "last_update": ago(600)})));
         assert!(!stale(&json!({"active": 1, "needs": 0})));
+        assert!(!stale(&json!({"active": 0, "needs": 0, "hand_closed": 1, "last_update": ago(600)})), "closed terminals are yours to restart");
     }
 }

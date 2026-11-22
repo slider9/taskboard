@@ -1,5 +1,5 @@
 //! The weekly time review: the report built from spans and task states, its schedule, and the Needs you
-//! item that stays until the review is opened.
+//! item that stays until its fixes are dealt with, or until the review is opened when it filed none.
 
 use chrono::{Local, NaiveDate, TimeZone};
 use serde_json::{json, Value};
@@ -110,7 +110,25 @@ fn report_counts_categories_repeats_timeouts_reruns_and_owner_wait() {
 }
 
 #[test]
-fn a_kept_review_stays_in_needs_you_until_it_is_opened() {
+fn owner_wait_counts_work_hours_once_however_many_tasks_wait() {
+    let (app, _dir) = board();
+    taskboardd::hours::set(&app, &json!({"on": true, "start": "09:00", "end": "17:00", "days": "all"})).unwrap();
+    let day = Local::now().date_naive() - chrono::Duration::days(3);
+    let at = |h: u32| Local.from_local_datetime(&day.and_hms_opt(h, 0, 0).unwrap()).earliest().unwrap().timestamp() as f64;
+    // Both wait from 8 PM the night before until 11 AM: only 9 to 11 is in the work hours.
+    add_state(&app, 7, at(0) - 4.0 * 3600.0, "needs", "question");
+    add_state(&app, 8, at(0) - 4.0 * 3600.0, "needs", "review");
+    add_state(&app, 7, at(11), "working", "");
+    add_state(&app, 8, at(11), "working", "");
+
+    let r = review::report(&app, at(0) - 86400.0, at(0) + 86400.0).unwrap();
+    assert_eq!(r["owner_wait"]["seconds"], 7200.0, "9 to 11 once, not overnight and not once per task");
+    assert_eq!(r["owner_wait"]["reasons"], json!([{"name": "question", "seconds": 7200.0}, {"name": "review", "seconds": 7200.0}]));
+    assert_eq!(r["owner_wait"]["tasks"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn a_review_with_no_fixes_stays_in_needs_you_until_it_is_opened() {
     let (app, _dir) = board();
     week_of_spans(&app, now_ts() - 86400.0);
 
@@ -130,10 +148,60 @@ fn a_kept_review_stays_in_needs_you_until_it_is_opened() {
 
     let seen = post(&app, &format!("reviews/{id}/seen"), json!({})).unwrap();
     assert!(seen["seen_at"].is_string());
-    assert!(dispatch::alerts(&app).iter().all(|x| x["key"] != format!("review:{id}")), "opening it clears Needs you");
+    assert!(dispatch::alerts(&app).iter().all(|x| x["key"] != format!("review:{id}")), "with no fixes, opening it clears Needs you");
     assert_eq!(get(&app, "reviews")["reviews"][0]["id"], id);
     assert_eq!(get(&app, &format!("reviews/{id}"))["data"]["seconds"], 810.0);
     assert_eq!(post(&app, "reviews/999/seen", json!({})).unwrap_err().0, 404);
+}
+
+/// Review `id` with two fixes filed in the Backlog, announced in Needs you; the fixes' issue ids.
+fn review_with_two_fixes(app: &App) -> (i64, Vec<i64>) {
+    let id = review::save(app, now_ts() - 7.0 * 86400.0, now_ts(), true).unwrap();
+    let issue = |title: &str| {
+        app.db.insert("issues", taskboardd::fields!["project" => "webapp", "kind" => "gap", "title" => title, "source" => "review", "review_id" => id,
+                                                    "state" => "open", "created_at" => iso(now_ts()), "updated_at" => iso(now_ts())]).unwrap()
+    };
+    let ids = vec![issue("Share one build cache"), issue("Split cargo test by crate")];
+    let fixes = json!({"state": "done", "filed": ids.iter().map(|b| format!("B{b}")).collect::<Vec<_>>(), "linked": []});
+    app.db.x("UPDATE reviews SET fixes = ? WHERE id = ?", taskboardd::p![fixes.to_string(), id]).unwrap();
+    review::announce(app, id).unwrap();
+    (id, ids)
+}
+
+fn review_row(app: &App, id: i64) -> Option<Value> {
+    get(app, "home")["needs"].as_array().unwrap().iter().find(|a| a["review_id"] == id).cloned()
+}
+
+#[test]
+fn a_review_with_fixes_stays_in_needs_you_until_they_are_dealt_with() {
+    let (app, _dir) = board();
+    let (id, fixes) = review_with_two_fixes(&app);
+    let row = review_row(&app, id).expect("the review is in Needs you");
+    assert_eq!((row["title"].as_str(), row["detail"].as_str(), row["opened"].as_bool()), (Some("2 fixes from this week’s review"), Some("0 h on builds"), Some(false)));
+
+    post(&app, &format!("reviews/{id}/seen"), json!({})).unwrap();
+    let row = review_row(&app, id).expect("opening it doesn't clear it while its fixes wait");
+    assert_eq!((row["detail"].as_str(), row["opened"].as_bool(), row["fixes"].as_i64()), (Some("Opened today"), Some(true), Some(2)));
+
+    app.db.x("UPDATE issues SET state = 'drop' WHERE id = ?", taskboardd::p![fixes[0]]).unwrap();
+    assert_eq!(review_row(&app, id).expect("one fix still waits")["detail"], "Opened today · 1 dealt with");
+
+    let goal = app.db.insert("goals", taskboardd::fields!["name" => "Faster builds", "project" => "webapp"]).unwrap();
+    app.db.x("UPDATE issues SET goal_id = ? WHERE id = ?", taskboardd::p![goal, fixes[1]]).unwrap();
+    assert!(review_row(&app, id).is_none(), "every fix dealt with: Needs you drops it at once");
+    review::settle(&app).unwrap();
+    assert!(dispatch::alerts(&app).iter().all(|x| x["key"] != format!("review:{id}")), "and the board's next settle takes it down");
+}
+
+#[test]
+fn a_review_whose_fixes_are_dealt_with_leaves_even_unopened() {
+    let (app, _dir) = board();
+    let (id, fixes) = review_with_two_fixes(&app);
+    app.db.x("UPDATE issues SET state = 'drop' WHERE review_id = ?", taskboardd::p![id]).unwrap();
+    assert_eq!(fixes.len(), 2);
+    review::settle(&app).unwrap();
+    assert!(dispatch::alerts(&app).iter().all(|x| x["key"] != format!("review:{id}")));
+    assert!(get(&app, &format!("reviews/{id}"))["seen_at"].is_null(), "it's still unread on the Review page");
 }
 
 #[test]
@@ -175,4 +243,53 @@ fn a_board_seeded_before_the_sample_reviews_gets_just_those() {
     assert_eq!(app.db.count("SELECT COUNT(*) FROM tasks", taskboardd::p![]).unwrap(), tasks);
     assert_eq!(get(&app, "/reviews")["reviews"].as_array().unwrap().len(), 2);
     assert!(taskboardd::seed::seed_reviews_only(&app).is_err(), "seeding them twice is refused");
+}
+
+#[test]
+fn the_report_leads_with_what_the_week_shipped() {
+    let (app, _d) = board();
+    let start = now_ts() - 7.0 * 86400.0;
+    let end = now_ts();
+    let at = |days_ago: f64| iso(end - days_ago * 86400.0);
+    let goal = |name: &str| app.db.insert("goals", taskboardd::fields!["name" => name, "project" => "webapp"]).unwrap();
+    let task = |goal: Option<i64>, title: &str, status: &str, failed: bool, finished: Option<String>| {
+        app.db
+            .insert("tasks", taskboardd::fields!["goal_id" => goal, "title" => title, "status" => status, "failed" => failed as i64,
+                                                 "project" => "webapp", "finished_at" => finished.clone(), "updated_at" => finished])
+            .unwrap()
+    };
+    let done = goal("Offline mode");
+    let a = task(Some(done), "Queue writes", "done", false, Some(at(3.0)));
+    let b = task(Some(done), "Send them", "done", false, Some(at(1.0)));
+    let open = goal("Dark mode");
+    task(Some(open), "Colors", "done", false, Some(at(2.0)));
+    task(Some(open), "Toggle", "queued", false, None);
+    let earlier = goal("Search");
+    task(Some(earlier), "Index", "done", false, Some(at(9.0)));
+    task(None, "Broke", "done", true, Some(at(2.0)));
+    let loose = task(None, "Typo", "done", false, Some(at(0.5)));
+    let release = |name: &str, cut: String, failed: bool| {
+        app.db.insert("releases", taskboardd::fields!["project" => "webapp", "name" => name, "cut_at" => cut,
+                                                       "failed_at" => if failed { Some(at(0.1)) } else { None }]).unwrap()
+    };
+    release("v1.2.0", at(2.0), false);
+    release("v1.2.1", at(1.0), true);
+    release("v1.1.0", at(10.0), false);
+
+    let s = &review::report(&app, start, end).unwrap()["shipped"];
+    let refs = |k: &str| s[k].as_array().unwrap().iter().map(|v| v["ref"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(refs("tasks").len(), 4, "done in the week, not failed or earlier: {s}");
+    assert_eq!(refs("tasks")[0], format!("T{loose}"), "newest first");
+    assert!(refs("tasks").contains(&format!("T{a}")) && refs("tasks").contains(&format!("T{b}")));
+    assert_eq!(refs("goals"), [format!("G{done}")], "only the goal that finished in the week");
+    assert_eq!(s["goals"][0]["name"], "Offline mode");
+    let cut: Vec<&str> = s["releases"].as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(cut, ["v1.2.0"], "a failed cut and an earlier one aren't shipped");
+
+    let id = review::save(&app, start, end, false).unwrap();
+    let kept = get(&app, &format!("/reviews/{id}"));
+    assert_eq!(kept["data"]["shipped"], *s);
+    app.db.x("UPDATE reviews SET data = json_remove(data, '$.shipped') WHERE id = ?", taskboardd::p![id]).unwrap();
+    let old = get(&app, &format!("/reviews/{id}"));
+    assert_eq!(old["data"]["shipped"], *s, "a review kept before this lists it too");
 }

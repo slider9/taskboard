@@ -71,8 +71,8 @@ pub struct Recording {
     inner: Fake,
     pub posts: Mutex<Vec<(String, Value)>>,
     pub gets: Mutex<Vec<String>>,
-    /// GET paths that fail with this (status, sentence) until cleared.
-    fail: Mutex<Vec<(String, u16, String)>>,
+    /// GET paths that fail with this error until cleared.
+    fail: Mutex<Vec<(String, crate::backend::CallError)>>,
 }
 
 impl Recording {
@@ -100,7 +100,13 @@ impl Recording {
 
     /// Make `GET <path>` fail with the board's `status` and sentence (empty `msg`: unreachable).
     pub fn fail(&self, path: &str, status: u16, msg: &str) {
-        self.fail.lock().unwrap().push((path.to_string(), status, msg.to_string()));
+        self.fail.lock().unwrap().push((path.to_string(), crate::backend::CallError { status, message: msg.to_string(), slow: false }));
+    }
+
+    /// Make `GET <path>` time out on a board that's up (it answers the quick check).
+    pub fn stall(&self, path: &str) {
+        let e = crate::backend::CallError { status: 0, message: "The board is running but slow to answer.".into(), slow: true };
+        self.fail.lock().unwrap().push((path.to_string(), e));
     }
 
     pub fn heal(&self) {
@@ -119,8 +125,8 @@ impl Backend for Recording {
     }
     fn get(&self, path: &str, query: &[(&str, String)]) -> CallResult {
         self.gets.lock().unwrap().push(path.to_string());
-        if let Some((_, status, msg)) = self.fail.lock().unwrap().iter().find(|(p, _, _)| p == path) {
-            return Err(crate::backend::CallError { status: *status, message: msg.clone() });
+        if let Some((_, e)) = self.fail.lock().unwrap().iter().find(|(p, _)| p == path) {
+            return Err(e.clone());
         }
         self.inner.get(path, query)
     }
@@ -211,6 +217,12 @@ mod tests {
             assert!(m.goal_page.backlog_view);
         })
         .unwrap();
+        // `?wave=2`: the page opens asking to scroll to wave 2's card.
+        w.update(cx, |m, _, cx| {
+            m.open_link("taskboard-dev://tasks#/goals/G1?wave=2", cx);
+            assert_eq!((m.page.clone(), m.goal_page.at_wave, m.goal_page.backlog_view), (Page::Goal("G1".into()), Some(2), false));
+        })
+        .unwrap();
         w.update(cx, |m, _, cx| m.open_link("taskboard-dev://tasks#/?task=T3", cx)).unwrap();
         settle(cx);
         w.update(cx, |m, _, _| {
@@ -248,12 +260,12 @@ mod tests {
         w.update(cx, |m, _, _| assert_eq!(m.data.errs.goal.as_deref(), Some("Boom."))).unwrap();
         // While the board is down, only the banner speaks.
         rec.heal();
-        rec.fail("state", 0, "Can’t reach the task board server.");
+        rec.fail("state", 0, "Can’t reach the board.");
         rec.fail("goals/G1", 500, "should not be asked");
         w.update(cx, |m, _, cx| m.refresh(cx)).unwrap();
         settle(cx);
         w.update(cx, |m, _, _| {
-            assert_eq!(m.down.as_deref(), Some("Can’t reach the task board server."));
+            assert_eq!(m.down.as_deref(), Some("Can’t reach the board."));
             assert_eq!(m.data.errs.goal.as_deref(), Some("Boom."), "unchanged: nothing else was fetched");
         })
         .unwrap();
@@ -304,24 +316,6 @@ mod tests {
             assert_eq!(m.data.goal.as_ref().map(|g| g["ref"].clone()), Some(json!("G1")));
         })
         .unwrap();
-    }
-
-    #[gpui_kit::test]
-    fn filters_persist_like_the_web(cx: &mut gpui_kit::TestAppContext) {
-        let (w, _rec) = window(cx);
-        w.update(cx, |m, _, cx| {
-            let f = crate::app::Filters { project: "webapp".into(), goal: "G1".into(), done: "7d".into() };
-            m.set_filters(f, cx);
-        })
-        .unwrap();
-        let saved = crate::prefs::get("taskboard.filter").unwrap();
-        assert_eq!(saved, json!({"project": "webapp", "goal": "G1", "done": "7d"}));
-        let f = crate::app::Filters::load();
-        assert_eq!((f.project.as_str(), f.goal.as_str(), f.done.as_str()), ("webapp", "G1", "7d"));
-        // Invalid saved values fall back field by field (loadFilter).
-        crate::prefs::set("taskboard.filter", json!({"project": 3, "goal": "nope", "done": "1y"}));
-        let f = crate::app::Filters::load();
-        assert_eq!((f.project.as_str(), f.goal.as_str(), f.done.as_str()), ("all", "all", "24h"));
     }
 
     /// The task panel's "N open in the goal’s backlog" opens that goal on its Backlog tab.

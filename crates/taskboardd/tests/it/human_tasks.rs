@@ -8,7 +8,7 @@ use taskboardd::api::{self, Query, FROM};
 use taskboardd::app::App;
 use taskboardd::config::Config;
 use taskboardd::util::{Row, RowExt};
-use taskboardd::{board, dispatch, midna, p, reports, runner};
+use taskboardd::{board, dispatch, human, midna, p, reports, runner};
 
 struct Board {
     app: Arc<App>,
@@ -25,6 +25,34 @@ fn new_board() -> Board {
         .set_setting("midna_projects", Some(&json!([{"name": "webapp", "path": repo.to_string_lossy()}]).to_string()))
         .unwrap();
     Board { app, dir }
+}
+
+/// A board whose screener is a script that saves the prompt it's given and prints `out` (what claude
+/// would print); `s1` is on T1.
+fn screening_board(out: &str) -> Board {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_tests(dir.path());
+    let repo = dir.path().join("webapp");
+    std::fs::create_dir_all(&repo).unwrap();
+    let script = dir.path().join("claude");
+    let saved = dir.path().join("prompt.txt");
+    std::fs::write(&script, format!("#!/bin/sh\nprintf '%s' \"$2\" > '{}'\necho '{out}'\n", saved.display())).unwrap();
+    taskboardd::proc::make_runnable(&script).unwrap();
+    cfg.claude = script.to_string_lossy().to_string();
+    cfg.questions.screen = true;
+    let app = App::for_tests(cfg);
+    app.db
+        .set_setting("midna_projects", Some(&json!([{"name": "webapp", "path": repo.to_string_lossy()}]).to_string()))
+        .unwrap();
+    let b = Board { app, dir };
+    b.session("s1");
+    b.task("Review the marketing site");
+    b.report("tb.take", "s1", json!({"task": "T1"})).unwrap();
+    b
+}
+
+fn verdict(v: Value) -> String {
+    json!({"structured_output": v}).to_string()
 }
 
 const STEPS: &str = "1. Sign up at https://signup.cloud.oracle.com.\n2. Pick the home region.\n3. Note the tenancy name.";
@@ -133,6 +161,63 @@ fn only_the_app_marks_it_done() {
     assert!(dispatch::alerts(&b.app).iter().all(|a| a["key"] != format!("human-{}", id_of(&h))), "its alert is cleared");
 }
 
+/// The owner's word that a task is done, for every task in `said`.
+fn said(said: &[i64]) -> impl Fn(&str, i64) -> taskboardd::util::Result<Option<String>> + '_ {
+    move |_, id| Ok(said.contains(&id).then(|| "mark them done".to_string()))
+}
+
+#[test]
+fn an_agent_marks_human_tasks_done_only_on_the_owners_word_all_or_none() {
+    let b = new_board();
+    b.session("s1");
+    let (one, two) = (b.human("s1", json!({})), b.human("s1", json!({"title": "Sign the agreement"})));
+    let (a, z) = (id_of(&one), id_of(&two));
+    runner::start_queued(&b.app).unwrap();
+    let body = json!({"tasks": [one, two], "via_session": "s1", "note": "Both handled"});
+
+    let (status, msg) = b.post("humans/done", json!({"tasks": [one]})).unwrap_err();
+    assert_eq!(status, 403, "no terminal is no one's word: {msg}");
+    let (status, msg) = b.post("humans/done", body.clone()).unwrap_err();
+    assert_eq!(status, 403, "nobody said so in s1: {msg}");
+    assert!(msg.contains(&format!("{one}, {two} are done")) && msg.contains("none was marked"), "{msg}");
+    let (status, msg) = human::done_on_word(&b.app, &body, said(&[a])).map_err(|e| (e.status, e.message)).unwrap_err();
+    assert_eq!(status, 403);
+    assert!(msg.contains(&format!("said {two} is done")) && !msg.contains(&format!("{one},")), "it names only the one not said: {msg}");
+    let task = b.task("Deploy");
+    let (status, _) = human::done_on_word(&b.app, &json!({"tasks": [one, format!("T{task}")], "via_session": "s1"}), said(&[a, task])).map_err(|e| (e.status, e.message)).unwrap_err();
+    assert_eq!(status, 409, "an agent task isn't the owner's to-do");
+    assert!([a, z].iter().all(|&id| b.row(id).st("status") == "needs"), "none was marked done");
+
+    let done = human::done_on_word(&b.app, &body, said(&[a, z])).unwrap();
+    assert_eq!(done, vec![one.clone(), two.clone()]);
+    for id in [a, z] {
+        let card = b.get(&format!("tasks/H{id}"));
+        assert_eq!(card["status"], "done");
+        assert_eq!(card["owner_note"], "Both handled");
+        assert!(dispatch::alerts(&b.app).iter().all(|x| x["key"] != format!("human-{id}")), "its alert is cleared");
+    }
+    let (status, msg) = human::done_on_word(&b.app, &body, said(&[a, z])).map_err(|e| (e.status, e.message)).unwrap_err();
+    assert_eq!(status, 409);
+    assert!(msg.contains("already done"), "{msg}");
+}
+
+#[test]
+fn a_task_waiting_on_one_an_agent_marked_done_carries_on() {
+    let b = new_board();
+    let two = b.task("Deploy to Oracle Cloud");
+    b.session("s2");
+    b.report("tb.take", "s2", json!({"task": format!("T{two}")})).unwrap();
+    let h = b.human("s2", json!({}));
+    assert_eq!(b.report("tb.wait_for", "s2", json!({"tasks": [h.clone()], "why": "Needs the account"})).unwrap()["parked"], true);
+    b.session("s3");
+
+    human::done_on_word(&b.app, &json!({"tasks": [h], "via_session": "s3", "note": "Tenancy acme-dev"}), said(&[id_of(&h)])).unwrap();
+    assert_eq!(runner::start_queued(&b.app).unwrap(), vec![two]);
+    assert!(!b.starts(two).is_empty());
+    let prompt = taskboardd::handoff::build_starting(&b.app, two).unwrap();
+    assert!(prompt.contains(&format!("{h} “Create an Oracle Cloud account” is done")) && prompt.contains("Tenancy acme-dev"), "{prompt}");
+}
+
 #[test]
 fn a_parked_task_resumes_with_the_owners_note() {
     let b = new_board();
@@ -183,7 +268,8 @@ fn in_a_goal_it_holds_later_tasks_but_takes_no_terminal_slot() {
 
     b.from_app(&format!("tasks/{h}/did"), json!({"note": "Tenancy acme-dev"})).unwrap();
     assert_eq!(runner::start_queued(&b.app).unwrap(), vec![id_of(&next)], "a done human task frees the goal");
-    let prompt = board::job_args(&b.starts(id_of(&next))[0]).st("prompt");
+    assert!(!b.starts(id_of(&next)).is_empty());
+    let prompt = taskboardd::handoff::build_starting(&b.app, id_of(&next)).unwrap();
     assert!(prompt.contains("Tenancy acme-dev"), "the handoff names what the owner did: {prompt}");
 }
 
@@ -268,4 +354,81 @@ fn talking_it_over_opens_claude_in_its_checkout_with_its_steps() {
     let (code, msg) = b.post(&format!("/tasks/{h}/talk"), json!({})).unwrap_err();
     assert_eq!(code, 409);
     assert!(msg.contains("done already"), "{msg}");
+}
+
+#[test]
+fn a_human_task_an_agent_can_do_is_refused_and_noted_on_the_agent_s_task() {
+    let b = screening_board(&verdict(json!({"verdict": "agent", "why": "The Amplitude MCP reads the retention."})));
+    let (status, msg) = b
+        .report("tb.new_task", "s1", json!({"title": "Find how long Amplitude keeps events", "detail": "1. Open Amplitude settings.", "project": "webapp", "kind": "human"}))
+        .unwrap_err();
+    assert_eq!(status, 409);
+    assert!(msg.contains("Not a human task") && msg.contains("Amplitude MCP") && msg.contains("--no-pr"), "{msg}");
+    let humans = b.app.db.q("SELECT id FROM tasks WHERE kind = 'human'", p![]).unwrap();
+    assert!(humans.is_empty(), "nothing reaches the owner");
+    assert!(dispatch::alerts(&b.app).is_empty());
+    let notes = b.app.db.q("SELECT text FROM events WHERE task_id = 1 AND kind = 'note'", p![]).unwrap();
+    assert!(notes.iter().any(|n| n.st("text").contains("refused a human task")), "the refusal is kept on T1");
+}
+
+#[test]
+fn a_human_task_the_rules_settle_is_refused_with_the_answer() {
+    let b = screening_board(&verdict(json!({"verdict": "answered", "answer": "Use MRGNHNT, LLC.", "source": "legal.md"})));
+    let (status, msg) = b.report("tb.new_task", "s1", json!({"title": "Confirm the company name", "detail": STEPS, "project": "webapp", "kind": "human"})).unwrap_err();
+    assert_eq!(status, 409);
+    assert!(msg.contains("legal.md") && msg.contains("Use MRGNHNT, LLC."), "{msg}");
+}
+
+#[test]
+fn a_human_task_only_the_owner_can_do_goes_through_and_the_screen_reads_the_owner_s_prompts() {
+    let b = screening_board(&verdict(json!({"verdict": "owner"})));
+    b.report("hook.prompt", "s1", json!({"prompt": "Make me a human task to sign the Oracle agreement"})).unwrap();
+    let h = b.human("s1", json!({}));
+    assert!(taskboardd::human::is(&b.row(id_of(&h))));
+    let prompt = std::fs::read_to_string(b.dir.path().join("prompt.txt")).unwrap();
+    assert!(prompt.contains("Create an Oracle Cloud account") && prompt.contains("Sign up at"), "it reads the task");
+    assert!(prompt.contains("Make me a human task to sign the Oracle agreement"), "it reads the owner's prompts");
+}
+
+#[test]
+fn a_screen_that_fails_lets_the_human_task_through() {
+    let b = screening_board("not json");
+    let h = b.human("s1", json!({}));
+    assert!(taskboardd::human::is(&b.row(id_of(&h))));
+}
+
+#[test]
+fn an_agent_task_isn_t_screened() {
+    let b = screening_board(&verdict(json!({"verdict": "agent", "why": "x"})));
+    let out = b.report("tb.new_task", "s1", json!({"title": "Fix the footer", "detail": "Do it.", "project": "webapp"})).unwrap();
+    assert!(out["created"][0].as_str().unwrap().starts_with('T'));
+    assert!(!b.dir.path().join("prompt.txt").exists(), "claude isn't run");
+}
+
+#[test]
+fn reopen_takes_back_done_and_it_waits_on_the_owner_again() {
+    let b = new_board();
+    b.session("s1");
+    let h = b.human("s1", json!({}));
+    let id = id_of(&h);
+    runner::start_queued(&b.app).unwrap();
+    assert_eq!(b.from_app(&format!("tasks/{h}/owner-reopen"), json!({})).unwrap_err().0, 409, "nothing to reopen while it's open");
+    b.from_app(&format!("tasks/{h}/did"), json!({"note": "Tenancy acme-dev"})).unwrap();
+
+    let (status, _) = b.post(&format!("tasks/{h}/owner-reopen"), json!({})).unwrap_err();
+    assert_eq!(status, 403, "only the app reopens it");
+    let card = b.from_app(&format!("tasks/{h}/owner-reopen"), json!({})).unwrap();
+    assert_eq!((&card["status"], &card["owner_answer"], &card["owner_note"]), (&json!("needs"), &Value::Null, &Value::Null));
+    let t = b.row(id);
+    assert_eq!((t.s("needs_reason"), t.s("finished_at")), (Some("human"), None));
+    assert!(dispatch::alerts(&b.app).iter().any(|a| a["key"] == format!("human-{id}")), "its alert is back");
+    assert!(runner::start_queued(&b.app).unwrap().is_empty() && b.starts(id).is_empty(), "still no terminal");
+
+    let card = b.from_app(&format!("tasks/{h}/owner-answer"), json!({"answer": "not_needed"}));
+    assert_eq!(card.unwrap()["status"], "done");
+    assert_eq!(b.from_app(&format!("tasks/{h}/owner-reopen"), json!({})).unwrap()["owner_answer"], Value::Null, "Not needed reopens too");
+
+    let t = b.task("Deploy");
+    board::update_task(&b.app, t, vec![("status", json!("done"))]).unwrap();
+    assert_eq!(b.from_app(&format!("tasks/T{t}/owner-reopen"), json!({})).unwrap_err().0, 409, "only a human task");
 }

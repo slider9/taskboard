@@ -96,18 +96,31 @@ fn the_projects_list_shows_its_areas_and_follows_the_file() {
 }
 
 #[test]
-fn the_tasks_page_counts_a_projects_cards_by_area() {
+fn the_backlog_counts_a_projects_issues_by_area_and_keeps_one() {
     let b = new_board();
     for (title, area) in [("Brush", "Art"), ("Pen", "quill"), ("Ink", "Quill"), ("Plain", "none")] {
-        let id = b.post("tasks", json!({"title": title, "project": "rune", "area": area}))["id"].as_i64().unwrap();
-        taskboardd::board::update_task(&b.app, id, vec![("status", json!("queued"))]).unwrap();
+        b.post("backlog", json!({"title": title, "kind": "bug", "project": "rune", "area": area}));
     }
-    let lanes = b.get("lanes");
-    let rune = lanes["projects"].as_array().unwrap().iter().find(|p| p["name"] == "rune").unwrap();
-    assert_eq!(rune["count"], 4);
+    b.post("backlog", json!({"title": "Elsewhere", "kind": "bug", "project": "plain"}));
+    let triage = |q: &[(&str, &str)]| {
+        let q: Query = q.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        api::dispatch(&b.app, "GET", "backlog/triage", &q, &json!({})).unwrap()
+    };
+    let titles = |v: &Value| v["issues"].as_array().unwrap().iter().map(|i| i["title"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+
+    let rune = triage(&[("project", "rune")]);
+    assert_eq!(rune["untriaged"], 4);
     // In the file's order (Quill, then Art); the one with no area counts only toward the project.
     assert_eq!(rune["areas"], json!([{"name": "Quill", "count": 2}, {"name": "Art", "count": 1}]));
-    assert_eq!(lanes["queued"][0]["area"], "Art", "each card carries its area");
+
+    let quill = triage(&[("project", "rune"), ("area", "quill")]);
+    assert_eq!(quill["untriaged"], 2, "the header counts the area's issues");
+    assert_eq!(titles(&quill), ["Ink", "Pen"]);
+    assert_eq!(quill["areas"], rune["areas"], "the chips keep every area's count");
+
+    let all = triage(&[("project", "all"), ("area", "Quill")]);
+    assert_eq!(all["untriaged"], 5, "an area means nothing across every project");
+    assert_eq!(all["areas"], json!([]));
 }
 
 #[test]

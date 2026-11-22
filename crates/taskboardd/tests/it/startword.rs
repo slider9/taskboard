@@ -218,6 +218,28 @@ fn an_ask_naming_two_backlog_items_starts_both() {
 }
 
 #[test]
+fn start_those_covers_backlog_items_the_reply_named() {
+    let b = board();
+    let item = |title: &str| api::dispatch(&b.app, "POST", "/backlog", &Query::new(), &json!({"title": title, "project": "webapp", "kind": "bug"})).unwrap()["id"].as_i64().unwrap();
+    let (i1, i2, other) = (item("Footer"), item("Header"), item("Sidebar"));
+    let t = b.new_task();
+    b.said("what's left?");
+    b.replied(&format!("**Needs you**\n- **T{t}:** waits for Start.\n- **B{i1}:** the footer cuts off.\n- **B{i2}:** the header needs a check."));
+    b.said("start all three of those tasks");
+    // The agent moves the items to the board in reply, then starts what they became.
+    let task_of = |i: i64| {
+        let v = api::dispatch(&b.app, "POST", "/backlog/bulk", &Query::new(), &json!({"action": "task", "ids": [format!("B{i}")], "where": "goal", "pickup": {"mode": "manual"}})).unwrap();
+        v["tasks"][0]["ref"].as_str().unwrap().trim_start_matches('T').parse::<i64>().unwrap()
+    };
+    let (a, c, o) = (task_of(i1), task_of(i2), task_of(other));
+    assert!(b.tb_start(t).unwrap()["starting"] == true);
+    assert!(b.tb_start(a).unwrap()["starting"] == true);
+    assert!(b.tb_start(c).unwrap()["starting"] == true);
+    // An item the reply didn't name isn't one of "those".
+    assert_eq!(b.tb_start(o).unwrap_err().0, 403);
+}
+
+#[test]
 fn a_later_prompt_that_takes_the_start_back_wins() {
     let b = board();
     let id = b.new_task();
@@ -327,6 +349,86 @@ fn a_plural_unnamed_ask_covers_every_task_made_in_reply_to_it() {
     b.said("[task-board:G2] Plan the goal.");
     let planned = b.new_task();
     assert_eq!(b.tb_start(planned).unwrap_err().0, 403);
+}
+
+#[test]
+fn start_them_covers_each_task_talked_over() {
+    let b = board();
+    let (a, c, other) = (b.new_task(), b.new_task(), b.new_task());
+    b.said(&format!("what's left on T{a}?"));
+    b.replied(&format!("T{a} adds the login form and T{c} the reset link. Both are ready to go."));
+    b.said("ok, start them");
+    // Each task the conversation named; never one it didn't.
+    assert_eq!(b.tb_start(other).unwrap_err().0, 403);
+    assert!(b.tb_start(a).unwrap()["starting"] == true);
+    assert!(b.tb_start(c).unwrap()["starting"] == true);
+
+    // "Start those" too, and a hold in the same prompt keeps its task back.
+    let b = board();
+    let (a, c) = (b.new_task(), b.new_task());
+    b.said(&format!("T{a} and T{c} look good"));
+    b.said(&format!("start those, but not T{c}"));
+    assert!(b.tb_start(a).unwrap()["starting"] == true);
+    assert_eq!(b.tb_start(c).unwrap_err().0, 403);
+
+    // Only in the latest prompt: one after it ends the word.
+    let b = board();
+    let a = b.new_task();
+    b.said(&format!("T{a} is next"));
+    b.said("start them");
+    b.said("thanks");
+    assert_eq!(b.tb_start(a).unwrap_err().0, 403);
+
+    // A prompt that makes tasks means the ones it makes, not the ones talked over before.
+    let b = board();
+    let a = b.new_task();
+    b.said(&format!("T{a} is done"));
+    b.said("make tasks for the header and the footer and start them");
+    let (h, f) = (b.new_task(), b.new_task());
+    assert_eq!(b.tb_start(a).unwrap_err().0, 403);
+    assert!(b.tb_start(h).unwrap()["starting"] == true);
+    assert!(b.tb_start(f).unwrap()["starting"] == true);
+
+    // A task named only in the board's prompt or in pasted text wasn't talked over.
+    let b = board();
+    let (a, c) = (b.new_task(), b.new_task());
+    b.said(&format!("[task-board:T{a}] You are picking up the login form."));
+    b.said(&format!("here's the log:\n```\nT{c} failed\n```"));
+    b.said("start them");
+    assert_eq!(b.tb_start(a).unwrap_err().0, 403);
+    assert_eq!(b.tb_start(c).unwrap_err().0, 403);
+}
+
+#[test]
+fn several_tasks_start_together_or_not_at_all() {
+    let b = board();
+    let start = |ids: &[i64], via: &str| {
+        let refs: Vec<String> = ids.iter().map(|id| format!("T{id}")).collect();
+        api::dispatch(&b.app, "POST", "/tasks/start", &Query::new(), &json!({"tasks": refs, "mode": "queue", "via_session": via})).map_err(|e| (e.status, e.message))
+    };
+    let (a, c, other, done) = (b.new_task(), b.new_task(), b.new_task(), b.new_task());
+    board::update_task(&b.app, done, vec![("status", json!("done"))]).unwrap();
+    b.said(&format!("T{a}, T{c} and T{done} are the ones left"));
+    b.said("start them");
+
+    // One nobody asked for refuses them all.
+    let (code, why) = start(&[a, other], "s1").unwrap_err();
+    assert_eq!(code, 403);
+    assert!(why.contains(&format!("nobody asked for T{other}")) && why.contains("none of them started"), "{why}");
+    // One that can't start refuses them all.
+    let (code, why) = start(&[a, done], "s1").unwrap_err();
+    assert_eq!(code, 409);
+    assert!(why.contains(&format!("Started none of T{a} and T{done}")), "{why}");
+    // Not from a terminal: no one's word.
+    assert_eq!(start(&[a, c], "").unwrap_err().0, 403);
+    assert_eq!((b.status(a), b.status(c)), ("queued".to_string(), "queued".to_string()));
+
+    let v = start(&[a, c, a], "s1").unwrap();
+    assert_eq!(v["tasks"].as_array().unwrap().len(), 2);
+    let by = format!("Started by {} via Term", b.app.cfg.owner);
+    for id in [a, c] {
+        assert!(b.log(id).contains(&by), "T{id}: {:?}", b.log(id));
+    }
 }
 
 #[test]
@@ -1743,6 +1845,32 @@ fn a_wait_on_the_goal_it_follows_is_no_hold() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// "If there's more than one, you can create a goal and start it": the agent meets the count by making
+/// the goal, so the run is the owner's word. A condition on anything else still puts the run off.
+#[test]
+fn a_count_of_what_the_goal_holds_is_no_hold() {
+    let cases: Vec<(&str, bool)> = vec![
+        ("Go look for GitHub issues, and address them and new tasks. If there's more than one, you can create a goal and start it", true),
+        ("if there are several, make a goal and run it", true),
+        ("If you find more than one bug, create a goal and start it", true),
+        ("If there are multiple issues, put them in a goal and start it", true),
+        ("If the tests pass, create a goal and start it", false),
+        ("If there's more than one, create a goal and start it tomorrow", false),
+        ("If there's more than one, create a goal but don't start it", false),
+    ];
+    let mut wrong = vec![];
+    for (prompt, runs) in cases {
+        let b = board();
+        b.typed(prompt);
+        let g = b.goal_new();
+        let got = b.tb_run(g);
+        if got.is_ok() != runs {
+            wrong.push(format!("{prompt}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// #844: "You can queue it after G107, that is allowed", "queue it" and "queue G109" after the agent
 /// made the goal and its run was refused: "it" is the goal it just made or just tried to run.
 #[test]
@@ -1824,4 +1952,76 @@ fn a_wait_on_a_followed_goal_isnt_called_no_start_word() {
     assert!(!said.contains("not a start word"), "{said}");
     let said = b.told("If the tests pass, create a goal for the mobile app and start it");
     assert!(said.contains("not a start word"), "{said}");
+}
+
+impl Board {
+    /// What `tb start G<g> --at <at>` sends from terminal s1.
+    fn tb_run_at(&self, g: i64, at: &str) -> Result<Value, (u16, String)> {
+        api::dispatch(&self.app, "POST", &format!("/goals/G{g}/run"), &Query::new(), &json!({"at": at, "via_session": "s1"})).map_err(|e| (e.status, e.message))
+    }
+}
+
+/// T1639: the owner moved a goal they'd scheduled for 9am to 6am three times, and each prompt was told
+/// "not a start word", so the agent never ran `tb start --at`. A start at a clock time, named or a reply
+/// that moves the one this conversation scheduled, is told to schedule it with the time as `--at` reads it.
+#[test]
+fn a_start_at_a_time_or_a_move_of_one_is_told_to_schedule_it() {
+    let b = board();
+    b.typed("Yeah, let's do the second one on 1. And then we can fix 2. Create tasks for this within a goal and lets start the goal tomorrow");
+    let g = b.goal_new();
+    assert!(b.tb_run_at(g, "tomorrow 9am").is_ok());
+    let schedule = format!("tb start G{g} --at \"tomorrow 6am\"");
+
+    let said = b.told("Do it tomorrow for 6am");
+    assert!(said.contains(&schedule), "{said}");
+    assert!(!said.contains("not a start word"), "{said}");
+    assert!(b.told("Yes, add that one to the goal too").is_empty());
+    for prompt in [format!("Start G{g} tomorrow at 6 a.m"), format!("start G{g} tomorrow 6am"), format!("Start G{g} tomorrow for 6am")] {
+        let said = b.told(&prompt);
+        assert!(said.contains(&schedule), "{prompt}: {said}");
+    }
+    let said = b.told("make it 6am");
+    assert!(said.contains(&format!("tb start G{g} --at \"6am\"")), "{said}");
+    let said = b.told("do it at 6 a.m. instead");
+    assert!(said.contains(&format!("tb start G{g} --at \"6am\"")), "{said}");
+
+    b.told(&format!("Start G{g} tomorrow at 6 a.m"));
+    let card = b.tb_run_at(g, "tomorrow at 6 a.m").unwrap();
+    assert!(card.to_string().contains("T06:00"), "{card}");
+}
+
+#[test]
+fn a_named_start_at_a_time_is_told_to_schedule_it_in_a_fresh_conversation() {
+    let b = board();
+    let id = b.new_task();
+    let said = b.told(&format!("start T{id} at 6am"));
+    assert!(said.contains(&format!("tb start T{id} --at \"6am\"")), "{said}");
+
+    let b = board();
+    let g = b.goal();
+    let said = b.told(&format!("Start G{g} tomorrow at 6 a.m"));
+    assert!(said.contains(&format!("tb start G{g} --at \"tomorrow 6am\"")), "{said}");
+}
+
+#[test]
+fn a_time_alone_or_a_no_is_not_told_to_schedule() {
+    let b = board();
+    let g = b.goal();
+    let said = b.told("make it 6am");
+    assert!(!said.contains("--at"), "nothing scheduled or named here: {said}");
+    let said = b.told(&format!("don't start G{g} tomorrow at 6am"));
+    assert!(!said.contains("--at"), "{said}");
+    assert!(said.contains("not a start word"), "{said}");
+    assert!(said.contains(&format!("\"start G{g} tomorrow 6am\" schedules it")), "the refusal says what wording works: {said}");
+    let said = b.told(&format!("should we start G{g} tomorrow at 6am?"));
+    assert!(!said.contains("--at"), "{said}");
+}
+
+#[test]
+fn the_time_said_is_as_start_at_reads_it() {
+    assert_eq!(startword::time_said("Start G154 tomorrow at 6 a.m").as_deref(), Some("tomorrow 6am"));
+    assert_eq!(startword::time_said("Do it tomorrow for 6am").as_deref(), Some("tomorrow 6am"));
+    assert_eq!(startword::time_said("make it 6 A.M.").as_deref(), Some("6am"));
+    assert_eq!(startword::time_said("start it at 17:30").as_deref(), Some("17:30"));
+    assert_eq!(startword::time_said("start it tomorrow").as_deref(), None);
 }

@@ -22,6 +22,8 @@ pub struct Failures {
     pub tests: Vec<String>,
     /// Why its failed tests couldn't be read, when its steps could.
     pub tests_error: Option<String>,
+    /// Each stage and job the build ran, with its result: read instead when its tests can't be.
+    pub stages: Vec<String>,
 }
 
 /// One CI system the board can ask about a failed check.
@@ -29,6 +31,50 @@ pub trait CiProvider {
     /// For people: "GitHub Actions", "Azure Pipelines", "the project's failures_cmd".
     fn name(&self) -> &'static str;
     fn failures(&self, pr: &PrRef, head: &str, check: &Check) -> HostResult<Failures>;
+    /// Each stage and job the check's build ran, with its result, for a project's required stages
+    /// (#928). None: this CI can't list them.
+    fn stages(&self, _pr: &PrRef, _head: &str, _check: &Check) -> HostResult<Option<Vec<Stage>>> {
+        Ok(None)
+    }
+}
+
+/// One stage or job of a build, with its result ("succeeded", "failed", "canceled", "skipped", or its
+/// state while it hasn't finished).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stage {
+    pub job: bool,
+    pub name: String,
+    /// The stage a job ran in, when the pipeline has stages.
+    pub stage: Option<String>,
+    pub result: String,
+}
+
+impl Stage {
+    pub fn passed(&self) -> bool {
+        matches!(self.result.as_str(), "succeeded" | "succeededWithIssues")
+    }
+
+    /// "stage Build: succeeded", "job Build › Unit tests: failed", "job Build: failed".
+    pub fn line(&self) -> String {
+        match (self.job, &self.stage) {
+            (false, _) => format!("stage {}: {}", self.name, self.result),
+            (true, Some(s)) => format!("job {s} › {}: {}", self.name, self.result),
+            (true, None) => format!("job {}: {}", self.name, self.result),
+        }
+    }
+
+    pub fn json(&self) -> Value {
+        serde_json::json!({"job": self.job, "name": self.name, "stage": self.stage, "result": self.result})
+    }
+
+    pub fn from_json(v: &Value) -> Option<Stage> {
+        Some(Stage {
+            job: v["job"].as_bool().unwrap_or(false),
+            name: v["name"].as_str()?.to_string(),
+            stage: v["stage"].as_str().map(str::to_string),
+            result: v["result"].as_str().unwrap_or("unknown").to_string(),
+        })
+    }
 }
 
 /// Which provider reads a check.
@@ -64,7 +110,7 @@ pub fn provider_for(app: &App, project: &PrProject, check: &Check) -> HostResult
         Some(Kind::Command) => Some(Box::new(CommandCi { cmd: project.failures_cmd.clone().unwrap_or_default() })),
         Some(Kind::GithubActions) => {
             let gh = crate::proc::which(&app.cfg.pr.gh).ok_or_else(|| "the gh command isn't installed".to_string())?;
-            Some(Box::new(GithubActions { host: GithubHost::new(Box::new(GhCli { bin: gh, env: crate::accounts::gh_env(&app.cfg) })) }))
+            Some(Box::new(GithubActions { host: GithubHost::new(Box::new(GhCli::for_board(app, gh))) }))
         }
         Some(Kind::BitbucketPipelines) => {
             let (email, token) = crate::accounts::board_credentials(app, crate::accounts::Provider::Bitbucket)
@@ -116,6 +162,93 @@ pub fn azure_build(url: &str) -> Option<(String, String)> {
     Some((format!("https://{}/{}", &c[1], &c[2]), c[3].to_string()))
 }
 
+/// An Azure DevOps project's API base (`https://dev.azure.com/<org>/<project>`) from `org/project`
+/// or a link into the project.
+pub fn azure_project_base(s: &str) -> Option<String> {
+    let s = s.trim().trim_end_matches('/');
+    let rest = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")).unwrap_or(s);
+    let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
+    let (org, project) = match parts.as_slice() {
+        ["dev.azure.com", org, project, ..] => (org.to_string(), project.to_string()),
+        [host, project, ..] if host.ends_with(".visualstudio.com") => return Some(format!("https://{host}/{project}")),
+        [org, project] => (org.to_string(), project.to_string()),
+        _ => return None,
+    };
+    (!org.starts_with('_') && !project.starts_with('_')).then(|| format!("https://dev.azure.com/{org}/{project}"))
+}
+
+/// One Azure Pipelines build of a PR's head, as the board reads it before the PR host shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AzureRun {
+    pub id: i64,
+    /// The board's check state: running (queued or started), passed, failed or stopped.
+    pub state: String,
+    /// Azure's own status: notStarted, inProgress, completed, …
+    pub status: String,
+    pub url: Option<String>,
+    pub at: Option<String>,
+}
+
+impl AzureRun {
+    fn of(b: &Value) -> Option<AzureRun> {
+        let status = b["status"].as_str().unwrap_or("").to_string();
+        let state = match (status.as_str(), b["result"].as_str().unwrap_or("")) {
+            ("completed", "succeeded" | "partiallySucceeded") => "passed",
+            ("completed", "failed") => "failed",
+            ("completed", _) => "stopped",
+            _ => "running",
+        };
+        let at = ["finishTime", "startTime", "queueTime"].iter().find_map(|k| b[*k].as_str()).map(str::to_string);
+        Some(AzureRun { id: b["id"].as_i64()?, state: state.into(), status, url: b["_links"]["web"]["href"].as_str().map(str::to_string), at })
+    }
+
+    pub fn json(&self) -> Value {
+        serde_json::json!({"id": self.id, "state": self.state, "status": self.status, "url": self.url, "at": self.at})
+    }
+}
+
+/// The same commit, either one possibly short (Bitbucket reads a 12-character head).
+fn same_commit(a: &str, b: &str) -> bool {
+    !a.is_empty() && !b.is_empty() && (a.starts_with(b) || b.starts_with(a))
+}
+
+/// A query value with the characters a URL can't carry as they are escaped.
+fn query_value(s: &str) -> String {
+    s.bytes()
+        .map(|c| match c {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => (c as char).to_string(),
+            _ => format!("%{c:02X}"),
+        })
+        .collect()
+}
+
+/// The newest build of pipeline `definition` for the commit `head`: one run on the PR's branch, else
+/// a pull-request build (`refs/pull/<n>/merge`, whose `pr.sourceSha` is the head). None: Azure has none.
+pub fn azure_run(http: &dyn Http, base: &str, definition: i64, branch: &str, pr_num: i64, head: &str) -> HostResult<Option<AzureRun>> {
+    let mut refs = vec![];
+    if !branch.is_empty() {
+        refs.push(format!("refs/heads/{branch}"));
+    }
+    if pr_num > 0 {
+        refs.push(format!("refs/pull/{pr_num}/merge"));
+    }
+    for r in refs {
+        let url = format!(
+            "{base}/_apis/build/builds?definitions={definition}&branchName={}&queryOrder=queueTimeDescending&$top=20&api-version=7.1",
+            query_value(&r)
+        );
+        let v = http.call("GET", &url, None).map_err(|e| azure_error(e, "the pipeline's builds", "Build (read)"))?;
+        let builds = v["value"].as_array().cloned().unwrap_or_default();
+        let ours = builds.iter().find(|b| {
+            same_commit(b["sourceVersion"].as_str().unwrap_or(""), head) || same_commit(b["triggerInfo"]["pr.sourceSha"].as_str().unwrap_or(""), head)
+        });
+        if let Some(run) = ours.and_then(AzureRun::of) {
+            return Ok(Some(run));
+        }
+    }
+    Ok(None)
+}
+
 pub struct AzurePipelines {
     pub http: Box<dyn Http>,
 }
@@ -125,10 +258,9 @@ impl CiProvider for AzurePipelines {
         "Azure Pipelines"
     }
     fn failures(&self, _pr: &PrRef, _head: &str, check: &Check) -> HostResult<Failures> {
-        let (base, id) = azure_build(check.url.as_deref().unwrap_or("")).ok_or_else(|| "its link isn't an Azure Pipelines build".to_string())?;
-        let tl = self.http.call("GET", &format!("{base}/_apis/build/builds/{id}/timeline?api-version=7.1"), None).map_err(|e| azure_error(e, "the build's steps", "Build (read)"))?;
+        let (base, id, records) = self.timeline(check)?;
         let mut steps = vec![];
-        for r in tl["records"].as_array().cloned().unwrap_or_default() {
+        for r in records.iter() {
             if r["type"] != "Task" || r["result"] != "failed" {
                 continue;
             }
@@ -139,16 +271,26 @@ impl CiProvider for AzurePipelines {
                 None => name,
             });
         }
-        // Test results need their own scope: a token without it still shows the steps.
-        let (tests, tests_error) = match self.failed_tests(&base, &id) {
-            Ok(t) => (t, None),
-            Err(e) => (vec![], Some(azure_error(e, "the build's test results", "Test Management (read)"))),
-        };
-        Ok(Failures { steps, tests, tests_error })
+        // Test results need their own scope: a token without it still shows the steps, and each stage's
+        // and job's result says whether the tests or a later stage failed.
+        match self.failed_tests(&base, &id) {
+            Ok(tests) => Ok(Failures { steps, tests, ..Default::default() }),
+            Err(e) => Ok(Failures { steps, tests_error: Some(tests_error(e)), stages: stage_results(&records), ..Default::default() }),
+        }
+    }
+    fn stages(&self, _pr: &PrRef, _head: &str, check: &Check) -> HostResult<Option<Vec<Stage>>> {
+        Ok(Some(stage_list(&self.timeline(check)?.2)))
     }
 }
 
 impl AzurePipelines {
+    fn timeline(&self, check: &Check) -> HostResult<(String, String, Vec<Value>)> {
+        let (base, id) = azure_build(check.url.as_deref().unwrap_or("")).ok_or_else(|| "its link isn't an Azure Pipelines build".to_string())?;
+        let tl = self.http.call("GET", &format!("{base}/_apis/build/builds/{id}/timeline?api-version=7.1"), None).map_err(|e| azure_error(e, "the build's steps", "Build (read)"))?;
+        let records = tl["records"].as_array().cloned().unwrap_or_default();
+        Ok((base, id, records))
+    }
+
     fn failed_tests(&self, base: &str, id: &str) -> HostResult<Vec<String>> {
         let mut tests = vec![];
         let runs = self.http.call("GET", &format!("{base}/_apis/test/runs?buildUri=vstfs:///Build/Build/{id}&api-version=7.1"), None)?;
@@ -172,6 +314,58 @@ fn azure_error(e: String, what: &str, scope: &str) -> String {
     format!("{e} reading {what}")
 }
 
+/// Why a build's test results couldn't be read; a 401 or 403 means the token lacks the Test Management scope.
+fn tests_error(e: String) -> String {
+    if e.contains("answered 401") || e.contains("answered 403") {
+        return format!("the Azure DevOps token lacks Test Management (read): {e} (a new token goes in Taskboard ▸ Settings ▸ Accounts)");
+    }
+    format!("{e} reading the build's test results")
+}
+
+/// A build timeline's stages in order, each followed by its jobs: "stage Build: succeeded",
+/// "job Build › Unit tests: failed". A pipeline without stages lists its jobs alone.
+fn stage_results(records: &[Value]) -> Vec<String> {
+    stage_list(records).iter().map(Stage::line).collect()
+}
+
+/// [`stage_results`], as stages and jobs.
+fn stage_list(records: &[Value]) -> Vec<Stage> {
+    let by_id: std::collections::HashMap<&str, &Value> = records.iter().filter_map(|r| Some((r["id"].as_str()?, r))).collect();
+    let stage_of = |r: &Value| -> Option<String> {
+        let mut at = by_id.get(r["parentId"].as_str()?).copied();
+        for _ in 0..8 {
+            let p = at?;
+            if p["type"] == "Stage" {
+                return p["id"].as_str().map(str::to_string);
+            }
+            at = by_id.get(p["parentId"].as_str()?).copied();
+        }
+        None
+    };
+    let outcome = |r: &Value| r["result"].as_str().or(r["state"].as_str()).unwrap_or("unknown").to_string();
+    let named = |r: &Value| r["name"].as_str().unwrap_or("?").to_string();
+    let ordered = |kind: &str| {
+        let mut v: Vec<&Value> = records.iter().filter(|r| r["type"] == kind).collect();
+        v.sort_by_key(|r| r["order"].as_i64().unwrap_or(i64::MAX));
+        v
+    };
+    let jobs: Vec<(Option<String>, &Value)> = ordered("Job").into_iter().map(|j| (stage_of(j), j)).collect();
+    let job = |j: &Value, stage: Option<String>| Stage { job: true, name: named(j), stage, result: outcome(j) };
+    let mut out = vec![];
+    for s in ordered("Stage") {
+        let sid = s["id"].as_str().map(str::to_string);
+        let shown = s["name"] != "__default";
+        if shown {
+            out.push(Stage { job: false, name: named(s), stage: None, result: outcome(s) });
+        }
+        for (_, j) in jobs.iter().filter(|(st, _)| *st == sid && sid.is_some()) {
+            out.push(job(j, shown.then(|| named(s))));
+        }
+    }
+    out.extend(jobs.iter().filter(|(st, _)| st.is_none()).map(|(_, j)| job(j, None)));
+    out
+}
+
 /// A project's own command (`failures_cmd`).
 pub struct CommandCi {
     pub cmd: String,
@@ -182,6 +376,15 @@ impl CiProvider for CommandCi {
         "the project's failures_cmd"
     }
     fn failures(&self, pr: &PrRef, head: &str, check: &Check) -> HostResult<Failures> {
+        Ok(parse_command_output(&self.run(pr, head, check)?))
+    }
+    fn stages(&self, pr: &PrRef, head: &str, check: &Check) -> HostResult<Option<Vec<Stage>>> {
+        Ok(command_stages(&self.run(pr, head, check)?))
+    }
+}
+
+impl CommandCi {
+    fn run(&self, pr: &PrRef, head: &str, check: &Check) -> HostResult<String> {
         let cmd = crate::util::expand_home(self.cmd.trim()).to_string_lossy().to_string();
         let env: Vec<(String, String)> = [
             ("TB_PR_URL", pr.url.clone()),
@@ -198,11 +401,18 @@ impl CiProvider for CommandCi {
         if o.code != Some(0) {
             return Err(format!("failures_cmd failed: {}", o.stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no output")));
         }
-        Ok(parse_command_output(&o.stdout))
+        Ok(o.stdout)
     }
 }
 
-/// `{"steps": [...], "tests": [...]}`, or one step per line with `test: <name>` lines for tests.
+/// The stages and jobs in a command's JSON (`"stages": [{"name": "Lint", "result": "succeeded", "job":
+/// false, "stage": null}]`); None when it printed none.
+pub fn command_stages(out: &str) -> Option<Vec<Stage>> {
+    let v: Value = serde_json::from_str(out.trim()).ok()?;
+    Some(v["stages"].as_array()?.iter().filter_map(Stage::from_json).collect())
+}
+
+/// `{"steps": [...], "tests": [...], "stages": [...]}` (stages: [`command_stages`]), or one step per line with `test: <name>` lines for tests.
 pub fn parse_command_output(out: &str) -> Failures {
     if let Ok(v) = serde_json::from_str::<Value>(out.trim()) {
         if v.is_object() {
@@ -286,25 +496,132 @@ mod tests {
         assert_eq!(f.steps, vec!["Run tests: exit 1".to_string()]);
         assert_eq!(f.tests, vec!["Suite.login".to_string(), "logout".to_string()]);
         assert!(calls.lock()[0].starts_with("https://dev.azure.com/org/Proj/_apis/build/builds/55/timeline"));
+        assert!(f.tests_error.is_none() && f.stages.is_empty(), "readable tests need no stage list");
     }
 
-    struct NoTestScope;
+    struct NoTestScope(&'static str);
     impl Http for NoTestScope {
         fn call(&self, _m: &str, url: &str, _b: Option<&Value>) -> HostResult<Value> {
             if url.contains("/_apis/test/") {
-                return Err("Azure DevOps answered 401".into());
+                return Err(format!("Azure DevOps answered {}", self.0));
             }
-            Ok(json!({"records": [{"type": "Task", "name": "Run tests", "result": "failed"}]}))
+            Ok(json!({"records": [
+                {"id": "t1", "parentId": "j2", "type": "Task", "name": "Push image", "result": "failed", "order": 1},
+                {"id": "s2", "type": "Stage", "name": "Deploy", "result": "failed", "order": 2},
+                {"id": "s1", "type": "Stage", "name": "Build", "result": "succeeded", "order": 1},
+                {"id": "p1", "parentId": "s1", "type": "Phase", "name": "Build", "order": 1},
+                {"id": "p2", "parentId": "s2", "type": "Phase", "name": "Deploy", "order": 1},
+                {"id": "j1b", "parentId": "p1", "type": "Job", "name": "Lint", "result": "succeeded", "order": 2},
+                {"id": "j1a", "parentId": "p1", "type": "Job", "name": "Unit tests", "result": "succeeded", "order": 1},
+                {"id": "j2", "parentId": "p2", "type": "Job", "name": "Publish", "result": "failed", "order": 1},
+                {"id": "s3", "type": "Stage", "name": "Notify", "result": null, "state": "pending", "order": 3}
+            ]}))
         }
     }
 
     #[test]
-    fn an_azure_token_without_test_scope_still_reads_the_steps() {
+    fn unreadable_azure_test_results_say_so_and_list_each_stage_s_result() {
         let pr = PrRef { host: "github".into(), repo: "a/b".into(), num: 1, url: String::new() };
-        let f = AzurePipelines { http: Box::new(NoTestScope) }.failures(&pr, "h", &check("https://dev.azure.com/org/Proj/_build/results?buildId=55")).unwrap();
-        assert_eq!(f.steps, vec!["Run tests".to_string()]);
-        assert!(f.tests.is_empty());
-        let e = f.tests_error.unwrap();
-        assert!(e.contains("answered 401 reading the build's test results") && e.contains("Test Management (read)"), "{e}");
+        for code in ["401", "403"] {
+            let f = AzurePipelines { http: Box::new(NoTestScope(code)) }.failures(&pr, "h", &check("https://dev.azure.com/org/Proj/_build/results?buildId=55")).unwrap();
+            assert_eq!(f.steps, vec!["Push image".to_string()]);
+            assert!(f.tests.is_empty());
+            let e = f.tests_error.unwrap();
+            assert!(e.starts_with("the Azure DevOps token lacks Test Management (read)") && e.contains(&format!("answered {code}")), "{e}");
+            assert_eq!(
+                f.stages,
+                vec!["stage Build: succeeded", "job Build › Unit tests: succeeded", "job Build › Lint: succeeded", "stage Deploy: failed", "job Deploy › Publish: failed", "stage Notify: pending"]
+            );
+        }
+        let f = AzurePipelines { http: Box::new(NoTestScope("500")) }.failures(&pr, "h", &check("https://dev.azure.com/org/Proj/_build/results?buildId=55")).unwrap();
+        assert_eq!(f.tests_error.as_deref(), Some("Azure DevOps answered 500 reading the build's test results"));
+        assert_eq!(f.stages.len(), 6, "any unreadable test results fall back to the stages");
+    }
+
+    #[test]
+    fn an_azure_build_lists_its_stages_and_jobs_with_their_results() {
+        let pr = PrRef { host: "github".into(), repo: "a/b".into(), num: 1, url: String::new() };
+        let az = AzurePipelines { http: Box::new(NoTestScope("401")) };
+        let stages = az.stages(&pr, "h", &check("https://dev.azure.com/org/Proj/_build/results?buildId=55")).unwrap().unwrap();
+        let tests = stages.iter().find(|s| s.name == "Unit tests").unwrap();
+        assert!(tests.job && tests.passed() && tests.stage.as_deref() == Some("Build"));
+        let publish = stages.iter().find(|s| s.name == "Publish").unwrap();
+        assert!(!publish.passed());
+        assert!(!stages.iter().find(|s| s.name == "Notify").unwrap().passed(), "a stage that hasn't finished hasn't passed");
+        assert_eq!(Stage::from_json(&publish.json()).as_ref(), Some(publish));
+    }
+
+    #[test]
+    fn a_command_can_list_stages_as_json() {
+        let out = r#"{"steps": ["Upload"], "stages": [{"name": "Lint", "result": "succeeded"}, {"name": "Upload", "result": "canceled", "job": true, "stage": "Ship"}]}"#;
+        let stages = command_stages(out).unwrap();
+        assert_eq!(stages.len(), 2);
+        assert!(stages[0].passed() && !stages[0].job);
+        assert_eq!(stages[1].line(), "job Ship › Upload: canceled");
+        assert_eq!(command_stages("Run tests\ntest: a"), None);
+        assert_eq!(command_stages(r#"{"steps": []}"#), None);
+        let pr = PrRef { host: "bitbucket".into(), repo: "w/r".into(), num: 4, url: "u".into() };
+        let cmd = CommandCi { cmd: format!("echo '{out}'") };
+        assert_eq!(cmd.stages(&pr, "abc", &check("x")).unwrap(), Some(stages));
+        assert_eq!(cmd.failures(&pr, "abc", &check("x")).unwrap().steps, vec!["Upload".to_string()]);
+    }
+
+    #[test]
+    fn reads_an_azure_project_from_its_name_or_a_link() {
+        let want = Some("https://dev.azure.com/roonlabs/76c1886c".to_string());
+        assert_eq!(azure_project_base("roonlabs/76c1886c"), want);
+        assert_eq!(azure_project_base("https://dev.azure.com/roonlabs/76c1886c/_build?definitionId=16"), want);
+        assert_eq!(azure_project_base("dev.azure.com/roonlabs/76c1886c/"), want);
+        assert_eq!(azure_project_base("https://acme.visualstudio.com/Proj/_build"), Some("https://acme.visualstudio.com/Proj".into()));
+        assert_eq!(azure_project_base("roonlabs"), None);
+        assert_eq!(azure_project_base("https://dev.azure.com/roonlabs/_apis"), None);
+    }
+
+    #[test]
+    fn finds_the_head_s_build_on_its_branch_then_its_pull_request() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let http = Canned(
+            vec![
+                ("refs/heads/fix/RRD-1%20x", json!({"value": [
+                    {"id": 7, "status": "completed", "result": "succeeded", "sourceVersion": "0ld0ld0ld0ld"}
+                ]})),
+                ("refs/pull/18117/merge", json!({"value": [
+                    {"id": 9, "status": "notStarted", "sourceVersion": "merge1", "triggerInfo": {"pr.sourceSha": "abc123def456789"},
+                     "queueTime": "2026-11-20T19:10:00Z", "_links": {"web": {"href": "https://dev.azure.com/o/p/_build/results?buildId=9"}}}
+                ]})),
+            ],
+            calls.clone(),
+        );
+        let run = azure_run(&http, "https://dev.azure.com/o/p", 16, "fix/RRD-1 x", 18117, "abc123def456").unwrap().unwrap();
+        assert_eq!(run.id, 9);
+        assert_eq!(run.state, "running", "a queued build is a check that's coming");
+        assert_eq!(run.at.as_deref(), Some("2026-11-20T19:10:00Z"));
+        let calls = calls.lock();
+        assert!(calls[0].starts_with("https://dev.azure.com/o/p/_apis/build/builds?definitions=16&branchName=refs/heads/fix/RRD-1%20x&"), "{}", calls[0]);
+        assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn reads_a_finished_azure_build_as_passed_failed_or_stopped() {
+        let state = |status: &str, result: &str| AzureRun::of(&json!({"id": 1, "status": status, "result": result})).unwrap().state;
+        assert_eq!(state("completed", "succeeded"), "passed");
+        assert_eq!(state("completed", "partiallySucceeded"), "passed");
+        assert_eq!(state("completed", "failed"), "failed");
+        assert_eq!(state("completed", "canceled"), "stopped");
+        assert_eq!(state("inProgress", ""), "running");
+        assert_eq!(state("notStarted", ""), "running");
+        let http = Canned(vec![("builds?", json!({"value": [{"id": 3, "status": "inProgress", "sourceVersion": "ffff"}]}))], Arc::new(Mutex::new(vec![])));
+        assert_eq!(azure_run(&http, "https://dev.azure.com/o/p", 16, "feat", 4, "abcd").unwrap(), None, "another commit's build isn't this head's");
+    }
+
+    #[test]
+    fn a_pipeline_without_stages_lists_its_jobs() {
+        let records = vec![
+            json!({"id": "s", "type": "Stage", "name": "__default", "result": "failed", "order": 1}),
+            json!({"id": "p", "parentId": "s", "type": "Phase", "name": "Job", "order": 1}),
+            json!({"id": "j", "parentId": "p", "type": "Job", "name": "Build", "result": "failed", "order": 1}),
+            json!({"id": "k", "type": "Job", "name": "Orphan", "state": "inProgress", "order": 2}),
+        ];
+        assert_eq!(stage_results(&records), vec!["job Build: failed", "job Orphan: inProgress"]);
     }
 }

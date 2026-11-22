@@ -128,6 +128,75 @@ fn several_issues_change_together_or_not_at_all() {
 }
 
 #[test]
+fn closing_issues_can_be_undone_while_nothing_else_changed_them() {
+    let b = new_board();
+    let (x, y) = (b.issue("One"), b.issue("Two"));
+    for action in ["defer", "drop"] {
+        let r = b.post("backlog/bulk", json!({"action": action, "ids": [format!("B{x}"), format!("B{y}")]}));
+        assert_eq!((b.state(x), b.state(y)), (action.to_string(), action.to_string()));
+        b.post(r["undo"].as_str().expect("an undo path"), json!({}));
+        assert_eq!((b.state(x), b.state(y)), ("open".to_string(), "open".to_string()));
+    }
+    // One reopened by hand since: nothing is undone.
+    let r = b.post("backlog/bulk", json!({"action": "defer", "ids": [format!("B{x}"), format!("B{y}")]}));
+    b.post(&format!("backlog/B{y}/reopen"), json!({}));
+    let (code, msg) = b.post_err(r["undo"].as_str().unwrap(), json!({}));
+    assert_eq!((code, msg), (409, format!("B{y} changed since, so nothing was undone.")));
+    assert_eq!(b.state(x), "defer");
+    // Setting a priority can't be undone from the toast.
+    assert!(b.post("backlog/bulk", json!({"action": "priority", "priority": "p1", "ids": [format!("B{x}")]})).get("undo").is_none());
+    assert_eq!(b.post_err("backlog/undo/9999", json!({})).0, 410);
+}
+
+#[test]
+fn closed_issues_list_by_how_they_closed_newest_first_a_page_at_a_time() {
+    let b = new_board();
+    let (x, y, z, w) = (b.issue("One"), b.issue("Two"), b.issue("Three"), b.issue("Four"));
+    b.post("backlog/bulk", json!({"action": "defer", "ids": [format!("B{x}")]}));
+    b.post("backlog/bulk", json!({"action": "defer", "ids": [format!("B{y}")]}));
+    b.post(&format!("backlog/B{z}/drop"), json!({}));
+    b.app.db.update("issues", &json!(x), taskboardd::fields!["updated_at" => "2026-01-01T00:00:00Z"]).unwrap();
+    // Closed as fixed isn't listed either way.
+    b.app.db.update("issues", &json!(w), taskboardd::fields!["state" => "drop", "closed_as" => "fixed"]).unwrap();
+    let ids = |v: &Value| v["issues"].as_array().unwrap().iter().map(|i| i["id"].as_i64().unwrap()).collect::<Vec<_>>();
+    let d = b.get("backlog/closed?state=defer&limit=1");
+    assert_eq!((ids(&d), d["total"].as_u64(), &d["counts"]), (vec![y], Some(2), &json!({"defer": 2, "wont_do": 1})));
+    assert!(d["issues"][0]["closed_at"].is_string());
+    let older = b.get(&format!("backlog/closed?state=defer&limit=1&before={}", d["next"].as_str().unwrap()));
+    assert_eq!((ids(&older), &older["next"]), (vec![x], &Value::Null));
+    assert_eq!(ids(&b.get("backlog/closed?state=wont_do")), vec![z]);
+    assert_eq!(ids(&b.get(&format!("backlog/closed?state=defer&ids=B{x}"))), vec![x]);
+    b.post(&format!("backlog/B{y}/reopen"), json!({}));
+    assert_eq!(ids(&b.get("backlog/closed?state=defer")), vec![x]);
+}
+
+#[test]
+fn move_to_goal_can_be_undone_until_its_task_starts() {
+    let b = new_board();
+    let from = b.post("goals", json!({"name": "First", "project": "webapp"}))["id"].as_i64().unwrap();
+    let to = b.post("goals", json!({"name": "Second", "project": "webapp"}))["id"].as_i64().unwrap();
+    let (x, y) = (b.issue("One"), b.issue("Two"));
+    b.post("backlog/bulk", json!({"action": "move", "ids": [format!("B{x}")], "goal_id": format!("G{from}")}));
+    let before = b.task_count();
+    let r = b.post("backlog/bulk", json!({"action": "goal", "ids": [format!("B{x}"), format!("B{y}")], "goal_id": format!("G{to}")}));
+    assert_eq!(b.task_count(), before + 2);
+    b.post(r["undo"].as_str().expect("an undo path"), json!({}));
+    assert_eq!(b.task_count(), before, "the tasks it made are gone");
+    for (i, goal) in [(x, Some(from)), (y, None)] {
+        let it = board::get_issue(&b.app, i).unwrap();
+        assert_eq!((it.st("state").as_str(), it.i("goal_id"), it.i("task_id")), ("open", goal, None), "B{i}");
+    }
+
+    // Once a task it made has started, nothing is undone.
+    let r = b.post("backlog/bulk", json!({"action": "goal", "ids": [format!("B{x}")], "goal_id": format!("G{to}")}));
+    let t = r["tasks"][0]["id"].as_i64().unwrap();
+    b.app.db.update("tasks", &json!(t), taskboardd::fields!["status" => "working", "session_id" => "s1"]).unwrap();
+    let (code, _) = b.post_err(r["undo"].as_str().unwrap(), json!({}));
+    assert_eq!(code, 409);
+    assert_eq!(b.state(x), "task");
+}
+
+#[test]
 fn history_credits_the_terminal_that_ran_it() {
     let b = new_board();
     let i = b.issue("Flaky test");
@@ -246,6 +315,75 @@ fn issue_refuses_a_closed_or_already_tasked_item() {
     assert!(closed.contains("isn't open any more"), "{closed}");
     assert_eq!(b.task_count(), before);
     assert!(b.get("tasks")["tasks"].as_array().unwrap().iter().all(|t| t["session_id"] != "s1"), "the terminal took nothing");
+}
+
+#[test]
+fn issue_links_several_items_to_one_task_on_each_path() {
+    let b = new_board();
+    b.add_session("s1");
+    let g = b.post("/goals", json!({"name": "Login", "project": "webapp"}))["id"].as_i64().unwrap();
+    for (extra, label) in [(json!({}), "board"), (json!({"goal": format!("G{g}")}), "goal"), (json!({"here": true}), "here")] {
+        let (i, j, k) = (b.issue(&format!("Crash on {label}")), b.issue("Second"), b.issue("Third"));
+        let mut body = json!({"issue": [format!("B{i}"), format!("B{j}"), format!("b{k}"), format!("B{j}")]});
+        for (key, v) in extra.as_object().unwrap() {
+            body[key] = v.clone();
+        }
+        let r = b.report("tb.new_task", "s1", body);
+        let tr = r["created"][0].as_str().unwrap().to_string();
+        let tid: i64 = tr.trim_start_matches('T').parse().unwrap();
+        assert_eq!(b.get(&format!("tasks/{tr}"))["title"], format!("Crash on {label}"), "{label}: the first item's title");
+        assert_eq!(b.link(&tr, i), (Some(i), Some(tid)), "{label}: made from the first");
+        for x in [j, k] {
+            assert_eq!(b.link(&tr, x).1, Some(tid), "{label}: B{x} links to {tr}");
+            assert_eq!(b.state(x), "task");
+            let hist = json!(board::issue_history(&b.app, x).unwrap()).to_string();
+            assert!(hist.contains(&format!("Linked to {tr}")), "{hist}");
+        }
+        let log = b.get(&format!("tasks/{tr}/log"))["log"].to_string();
+        assert!(log.contains(&format!("Linked B{j}, B{k}: they close with this task")), "{label}: {log}");
+    }
+}
+
+#[test]
+fn several_issues_are_refused_together_when_one_cant_link() {
+    let b = new_board();
+    b.add_session("s1");
+    let i = b.issue("Open one");
+    let j = b.issue("Dropped one");
+    b.post(&format!("backlog/B{j}/drop"), json!({"reason": "dupe"}));
+    let k = b.post("/backlog", json!({"title": "Elsewhere", "project": "other", "kind": "bug"}))["id"].as_i64().unwrap();
+    let before = b.task_count();
+    let closed = b.try_report("tb.new_task", "s1", json!({"issue": [format!("B{i}"), format!("B{j}")]})).unwrap_err();
+    assert!(closed.contains(&format!("B{j} isn't open any more")), "{closed}");
+    let other = b.try_report("tb.new_task", "s1", json!({"issue": [format!("B{i}"), format!("B{k}")]})).unwrap_err();
+    assert!(other.contains(&format!("B{k} is in other's backlog")), "{other}");
+    assert_eq!(b.task_count(), before);
+    assert_eq!(b.state(i), "open", "a refused task links nothing");
+}
+
+#[test]
+fn task_set_issue_links_open_items_to_a_task() {
+    let b = new_board();
+    b.add_session("s1");
+    let tr = b.report("tb.new_task", "s1", json!({"title": "Fix the footer", "detail": "Fixes B1 and B2."}))["created"][0].as_str().unwrap().to_string();
+    let tid: i64 = tr.trim_start_matches('T').parse().unwrap();
+    let (i, j) = (b.issue("Footer overlaps"), b.issue("Footer flickers"));
+    b.post(&format!("tasks/{tr}"), json!({"issues": [format!("B{i}"), format!("B{j}")]}));
+    assert_eq!((b.link(&tr, i).1, b.link(&tr, j).1), (Some(tid), Some(tid)));
+    assert_eq!(b.link(&tr, i).0, None, "linking doesn't make it the task's source");
+    // Linking one it already has changes nothing; another task's is refused.
+    b.post(&format!("tasks/{tr}"), json!({"issues": [format!("B{i}")]}));
+    let other = b.report("tb.new_task", "s1", json!({"title": "Other work", "detail": "x"}))["created"][0].as_str().unwrap().to_string();
+    let (code, msg) = b.post_err(&format!("tasks/{other}"), json!({"issues": [format!("B{i}")]}));
+    assert_eq!(code, 409);
+    assert!(msg.contains(&format!("B{i} is already {tr}")), "{msg}");
+    // A done task can't take one: it says how to close it as fixed instead.
+    let k = b.issue("Footer clips");
+    board::update_task(&b.app, tid, taskboardd::fields!["status" => "done"]).unwrap();
+    let (code, msg) = b.post_err(&format!("tasks/{tr}"), json!({"issues": [format!("B{k}")]}));
+    assert_eq!(code, 409);
+    assert!(msg.contains(&format!("tb backlog fixed B{k} --by {tr}")), "{msg}");
+    assert_eq!(b.state(k), "open");
 }
 
 #[test]

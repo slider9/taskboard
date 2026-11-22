@@ -56,6 +56,8 @@ pub struct StreamRow {
     pub last_event: Option<String>,
     /// "Polling", "Poll resting", or none for Jira (it has no poll).
     pub poll: Option<&'static str>,
+    /// Why a failing stream fails, in the board's words.
+    pub why: Option<String>,
 }
 
 /// The Streams pill: shown while any source's stream is watched (stream mode, or `[feed] on` for
@@ -93,6 +95,7 @@ pub fn streams_view(v: &Value) -> Option<StreamsView> {
                 tone,
                 last_event: fmt::opt_s(x, "last_event_at").map(|t| fmt::log_time(t).replace('\n', ", ")),
                 poll: (name != "jira").then_some(if x["polling"] == false { "Poll resting" } else { "Polling" }),
+                why: (tone == "down").then(|| fmt::opt_s(x, "why").map(fmt::cap)).flatten(),
             }
         })
         .collect();
@@ -130,6 +133,9 @@ impl Render for StreamsCard {
                     .child(cell(120.).children(r.last_event.clone()))
                     .child(cell(84.).children(r.poll)),
             );
+            if let Some(why) = &r.why {
+                card = card.child(div().pl(px(56.)).max_w(px(396.)).text_size(px(11.5)).opacity(0.8).child(why.clone()));
+            }
         }
         card
     }
@@ -200,8 +206,7 @@ pub fn banner(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> Vec<An
                     div().ml(px(4.)).text_size(px(10.8)).font_weight(FontWeight::NORMAL).text_color(t.muted).child(r.ago.clone()),
                 ))
                 .children(r.task.clone().map(|task| {
-                    div()
-                        .id(("master-open", i))
+                    crate::ui::focus::stop(t, div().id(("master-open", i)))
                         .flex()
                         .flex_none()
                         .items_center()
@@ -222,26 +227,19 @@ pub fn banner(m: &MainWindow, t: &Theme, cx: &mut Context<MainWindow>) -> Vec<An
         .collect()
 }
 
-/// The status-bar pills for the PR watch.
-pub fn pills(st: &Value, t: &Theme) -> Vec<AnyElement> {
-    let mut out = vec![];
-    if let Some(p) = st.get("pr_builds").and_then(builds_pill) {
-        out.push(pill_shell(t, "builds-pill", t.warn_fg, t.warn_soft).child(kit::dot(t.warn, 7.)).child(p.label).tooltip(kit::tip(p.title)).into_any_element());
-    }
-    if let Some(p) = st.get("pr_feed").and_then(feed_pill) {
-        out.push(pill_shell(t, "feed-pill", t.warn_fg, t.warn_soft).child(kit::dot(t.warn, 7.)).child(p.label).tooltip(kit::tip(p.title)).into_any_element());
-    }
-    if let Some(v) = st.get("stream").and_then(streams_view) {
-        let rows = v.rows;
-        out.push(
-            pill_shell(t, "streams-pill", t.muted, t.seg)
-                .child(kit::dot(tone_color(t, v.tone), 7.))
-                .child("Streams")
-                .tooltip(move |_, cx| cx.new(|_| StreamsCard { rows: rows.clone() }).into())
-                .into_any_element(),
-        );
-    }
-    out
+/// The Streams pill, while a source's stream is watched; hovering lists every source. (A stuck
+/// feed or stopped builds are in the footer's summary.)
+pub fn streams_pill(st: &Value, t: &Theme) -> Option<AnyElement> {
+    let v = st.get("stream").and_then(streams_view)?;
+    let rows = v.rows;
+    Some(
+        pill_shell(t, "streams-pill", t.muted, t.seg)
+            .flex_none()
+            .child(kit::dot(tone_color(t, v.tone), 7.))
+            .child("Streams")
+            .tooltip(move |_, cx| cx.new(|_| StreamsCard { rows: rows.clone() }).into())
+            .into_any_element(),
+    )
 }
 
 #[cfg(test)]
@@ -295,7 +293,7 @@ mod tests {
         let v = streams_view(&json!({"sources": [
             src("prs", json!({"mode": "stream", "watched": true, "polling": false, "last_event_at": "2026-10-12T15:04:00Z"})),
             src("builds", json!({"mode": "stream", "watched": true, "settling_secs": 40})),
-            src("jira", json!({"mode": "stream", "watched": true, "polling": false, "problem": "silent"})),
+            src("jira", json!({"mode": "stream", "watched": true, "polling": false, "problem": "silent", "why": "no event or heartbeat for 12m"})),
             src("qa", json!({}))]}))
         .unwrap();
         assert_eq!(v.tone, "down", "the worst source colours the dot");
@@ -305,6 +303,8 @@ mod tests {
         assert!(at.contains("AM") || at.contains("PM"), "12-hour: {at}");
         assert_eq!((r[1].health.as_deref(), r[1].tone, r[1].poll), (Some("Settling"), "warn", Some("Polling")));
         assert_eq!((r[2].name, r[2].health.as_deref(), r[2].poll), ("Jira", Some("Silent"), None), "Jira has no poll");
+        assert_eq!(r[2].why.as_deref(), Some("No event or heartbeat for 12m"), "a failing row says why");
+        assert_eq!((r[0].why.as_deref(), r[1].why.as_deref()), (None, None));
         assert_eq!((r[3].name, r[3].mode, r[3].health.as_deref(), r[3].last_event.as_deref()), ("QA", "Board", None, None));
     }
 

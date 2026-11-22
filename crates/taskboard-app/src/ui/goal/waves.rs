@@ -1,8 +1,10 @@
 //! The goal page's tasks: one card per wave (its state, when it ran or what it waits for, and the
 //! review stop after it), the tasks with no wave, then tasks of other goals that also finish this
-//! one. A wave the goal stopped at, held or failed offers its one signal: let the goal go on.
+//! one, a card for each goal they came from. A wave the goal stopped at, held or failed offers its
+//! one signal: let the goal go on.
 use super::*;
 use crate::ui::status::{self, St};
+use crate::ui::stop::Kind;
 
 /// A wave card's header.
 #[derive(Clone, Debug, PartialEq)]
@@ -19,6 +21,8 @@ pub struct Head {
 /// What a stopped, held or failed wave says, and its button.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gate {
+    /// Held, failed or ready for review, said as the goal's stop says it.
+    pub kind: Kind,
     pub bad: bool,
     pub text: String,
     pub button: String,
@@ -75,9 +79,9 @@ pub fn head(w: &Value, prev: Option<&Value>, tasks: &[&Value]) -> Head {
             let last = tasks.iter().filter_map(|t| fmt::opt_s(t, "finished_at").or(fmt::opt_s(t, "when"))).filter(|x| fmt::parse(x).is_some()).max_by_key(|x| fmt::parse(x));
             (last.map(done_at).unwrap_or_else(|| "Done".into()), St::Done)
         }
-        "stopped" => ("Done · waiting for your review".into(), St::Needs),
-        "failed" => ("A task failed".into(), St::Failed),
-        "held" => ("Held".into(), St::Needs),
+        "stopped" => (format!("{} Done · ready for review", Kind::Review.glyph()), St::Needs),
+        "failed" => (Kind::Failed.label(), St::Failed),
+        "held" => (Kind::Held.label(), St::Needs),
         "running" => ("Now".into(), St::Working),
         _ => match prev {
             Some(p) if stopping(p) || s(p, "state") == "stopped" => (format!("After wave {} and your review", i(p, "wave")), St::Queued),
@@ -95,13 +99,13 @@ pub fn gate(w: &Value, next: Option<&Value>) -> Option<Gate> {
     let on = next.map(|n| format!("wave {}", i(n, "wave"))).unwrap_or_else(|| "the rest of the goal".into());
     let failed: Vec<&str> = arr(w, "failed").iter().filter_map(|x| x.as_str()).collect();
     if s(w, "state") == "held" || (b(w, "held") && s(w, "state") == "running") {
-        return Some(Gate { bad: false, text: format!("Wave {wave} is held."), button: format!("Let wave {wave} start"), wave });
+        return Some(Gate { kind: Kind::Held, bad: false, text: format!("Wave {wave} is held."), button: format!("Let wave {wave} start"), wave });
     }
     if s(w, "state") == "stopped" {
-        return Some(Gate { bad: false, text: format!("Wave {wave} is done. Look it over, then let {on} start."), button: format!("Continue to {on}"), wave });
+        return Some(Gate { kind: Kind::Review, bad: false, text: format!("Wave {wave} is done. Look it over, then let {on} start."), button: format!("Continue to {on}"), wave });
     }
     if (s(w, "state") == "failed" || !failed.is_empty()) && !b(w, "passed") {
-        return Some(Gate { bad: true, text: format!("{} failed. {} waits.", failed.join(", "), fmt::cap(&on)), button: "Continue anyway".into(), wave });
+        return Some(Gate { kind: Kind::Failed, bad: true, text: format!("{} failed. {} waits.", failed.join(", "), fmt::cap(&on)), button: "Continue anyway".into(), wave });
     }
     None
 }
@@ -123,6 +127,9 @@ pub fn pr_cell(t: &Value) -> String {
     }
     if let Some(br) = fmt::opt_s(t, "branch") {
         return br.to_string();
+    }
+    if let Some(n) = t["same_pr"].as_i64() {
+        return format!("Shares T{n}'s PR");
     }
     match t["ships_pr"].as_bool() {
         Some(true) if s(t, "status") != "done" => "Ships one PR".into(),
@@ -172,13 +179,14 @@ pub fn cards(g: &Value) -> Vec<Card> {
         let head = (!ws.is_empty()).then(|| Head { title: "No wave".into(), meta: String::new(), dot: St::Queued, stop: false });
         out.push(Card { key: "loose".into(), head, gate: None, rows: loose });
     }
-    let shared = arr(g, "shared");
-    if !shared.is_empty() {
+    // Shared tasks, a card for each goal they came from: "From G6 Import from CSV".
+    for (from, rows) in crate::ui::projects::shared_by_goal(g) {
+        let title = format!("From {} {}", fmt::ref_of(from, "G"), s(from, "name")).trim_end().to_string();
         out.push(Card {
-            key: "shared".into(),
-            head: Some(Head { title: "From other goals".into(), meta: String::new(), dot: St::Queued, stop: false }),
+            key: format!("shared:{}", fmt::ref_of(from, "G")),
+            head: Some(Head { title, meta: String::new(), dot: St::Queued, stop: false }),
             gate: None,
-            rows: shared.iter().map(wrow).collect(),
+            rows: rows.into_iter().map(wrow).collect(),
         });
     }
     out
@@ -212,13 +220,14 @@ fn gate_el(m: &MainWindow, t: &Theme, gr: &str, g: Gate, cx: &mut Context<MainWi
     let id = SharedString::from(format!("wave-continue-{}", g.wave));
     let (gr2, n) = (gr.to_string(), g.wave);
     let btn = if busy { kit::disabled(kit::btn_primary(t, id, "Continuing…")) } else { kit::btn_primary(t, id, g.button).on_click(cx.listener(move |m, _, _, cx| continue_wave(m, &gr2, n, cx))) };
+    let (fg, soft, _) = g.kind.colors(t);
     div()
         .flex()
         .flex_col()
         .gap(px(6.))
         .px(px(18.))
         .py(px(10.))
-        .bg(if g.bad { t.down_soft } else { t.warn_soft })
+        .bg(soft)
         .border_b_1()
         .border_color(t.divider)
         .child(
@@ -227,14 +236,27 @@ fn gate_el(m: &MainWindow, t: &Theme, gr: &str, g: Gate, cx: &mut Context<MainWi
                 .items_center()
                 .gap(px(12.))
                 .text_size(px(13.))
-                .text_color(if g.bad { t.text } else { t.warn_text })
+                .text_color(t.text)
+                .child(div().flex_none().text_size(px(11.)).font_weight(FontWeight::BOLD).text_color(fg).child(g.kind.label().to_uppercase()))
                 .child(div().flex_1().min_w_0().child(g.text))
                 .child(div().flex_none().child(btn)),
         )
         .children(inline_note(m, t, &format!("wgate:{gr}")))
 }
 
+/// A waves column narrower than this stacks each task row onto two lines (status and ref beside
+/// the title, then its latest, PR and time under the title), so titles and status words keep
+/// their room.
+pub const ROWS_STACK_BELOW: f32 = 760.;
+/// The chip's width; it borrows 6px of the gap after it.
+const CHIP_W: f32 = 92.;
+const REF_W: f32 = 44.;
+const ROW_GAP: f32 = 12.;
+/// Where a stacked row's second line starts: under the title, past the chip and ref.
+const STACK_INDENT: f32 = CHIP_W - 6. + ROW_GAP + REF_W + ROW_GAP;
+
 fn row_el(m: &MainWindow, t: &Theme, x: WRow, cx: &mut Context<MainWindow>) -> Stateful<Div> {
+    let stacked = m.goal_page.lists.stack_rows;
     let (loud, _, _) = x.row.st.colors(t);
     let (o1, o2) = (x.r.clone(), x.r.clone());
     let (hover, link) = (t.panel_2, t.accent);
@@ -247,42 +269,50 @@ fn row_el(m: &MainWindow, t: &Theme, x: WRow, cx: &mut Context<MainWindow>) -> S
     };
     // Just words: a click here opens the task like the rest of the row; its panel links the PR.
     let pr = div().flex_none().w(px(120.)).min_w_0().truncate().text_size(px(12.)).text_color(t.muted).child(kit::clipped(SharedString::from(format!("goal-task-pr-{}", x.r)), x.pr.clone()));
-    div()
-        .id(SharedString::from(format!("goal-task-{}", x.r)))
-        .flex()
-        .items_center()
-        .gap(px(12.))
-        .h(px(36.))
-        .px(px(18.))
-        .border_b_1()
-        .border_color(t.divider)
-        .text_size(px(13.))
-        .hover(move |s| s.bg(hover))
-        .cursor_pointer()
-        .on_click(cx.listener(move |m, _, _, cx| m.open_task(o1.clone(), cx)))
-        // A tighter chip than the board's, borrowing 6px of the gap so the ref and title stay put.
-        .child(div().flex_none().w(px(92.)).mr(px(-6.)).child(status::chip(t, x.row.st).w(px(92.)).px(px(5.)).text_size(px(11.))))
-        .child(div().flex_none().w(px(36.)).text_size(px(11.)).font_family(t.mono_font.clone()).text_color(t.muted).child(x.r.clone()))
-        .child(cell(
-            div().flex().child(
-                div()
-                    .id(SharedString::from(format!("goal-task-title-{o2}")))
-                    .min_w_0()
-                    .truncate()
-                    .font_weight(FontWeight::MEDIUM)
-                    .hover(move |s| s.text_color(link).underline())
-                    .child(kit::clipped(SharedString::from(format!("goal-task-title-text-{}", x.r)), x.title)),
-            )
+    // A tighter chip than the board's, borrowing 6px of the gap so the ref and title stay put.
+    let chip = div().flex_none().w(px(CHIP_W)).mr(px(-6.)).child(status::chip(t, x.row.st).w(px(CHIP_W)).px(px(5.)).text_size(px(11.)));
+    let r = div().flex_none().w(px(REF_W)).whitespace_nowrap().text_size(px(11.)).font_family(t.mono_font.clone()).text_color(t.muted).child(x.r.clone());
+    let words = div()
+        .id(SharedString::from(format!("goal-task-title-{o2}")))
+        .min_w_0()
+        .font_weight(FontWeight::MEDIUM)
+        .hover(move |s| s.text_color(link).underline())
+        .child(kit::clipped(SharedString::from(format!("goal-task-title-text-{}", x.r)), x.title));
+    let title = cell(
+        div()
+            .flex()
+            .child(if stacked { words.line_clamp(2) } else { words.truncate() })
             .items_center()
             .gap(px(8.))
             .when(x.design, |d| d.child(kit::design_pill(t)))
             .when(x.research, |d| d.child(kit::research_pill(t))),
-            1.,
-        ))
-        .child(cell(div().truncate().text_size(px(12.)).text_color(if x.row.loud { loud } else { t.muted }).child(kit::clipped(SharedString::from(format!("goal-task-line-{}", x.r)), x.row.line)), 1.1))
-        .when(x.retry, |d| d.child(retry_btn(m, t, &x.r, cx)))
-        .child(pr)
-        .child(div().flex_none().w(px(44.)).whitespace_nowrap().text_size(px(12.)).text_color(t.muted).text_right().child(x.row.age))
+        1.,
+    );
+    let line = |grow| cell(div().truncate().text_size(px(12.)).text_color(if x.row.loud { loud } else { t.muted }).child(kit::clipped(SharedString::from(format!("goal-task-line-{}", x.r)), x.row.line.clone())), grow);
+    let age = div().flex_none().w(px(44.)).whitespace_nowrap().text_size(px(12.)).text_color(t.muted).text_right().child(x.row.age.clone());
+    let retry = x.retry.then(|| retry_btn(m, t, &x.r, cx));
+    // The task open in the panel: a soft accent fill and a 2px accent edge on its left.
+    let on = crate::app::open_ref(m) == Some(x.r.as_str());
+    let base = focus::stop(t, div().id(SharedString::from(format!("goal-task-{}", x.r))))
+        .relative()
+        .when(on, |d| d.bg(t.accent_soft).child(div().absolute().left_0().top_0().bottom_0().w(px(2.)).bg(t.accent)))
+        .px(px(18.))
+        .border_b_1()
+        .border_color(t.divider)
+        .text_size(px(13.))
+        .when(!on, |d| d.hover(move |s| s.bg(hover)))
+        .cursor_pointer()
+        .on_click(cx.listener(move |m, _, _, cx| m.open_task(o1.clone(), cx)));
+    if stacked {
+        return base
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .py(px(8.))
+            .child(div().flex().items_center().gap(px(ROW_GAP)).child(chip).child(r).child(title))
+            .child(div().flex().items_center().gap(px(ROW_GAP)).pl(px(STACK_INDENT)).child(line(1.)).children(retry).child(pr).child(age));
+    }
+    base.flex().items_center().gap(px(ROW_GAP)).h(px(36.)).child(chip).child(r).child(title).child(line(1.1)).children(retry).child(pr).child(age)
 }
 
 fn retry_btn(m: &MainWindow, t: &Theme, r: &str, cx: &mut Context<MainWindow>) -> Stateful<Div> {
@@ -350,6 +380,9 @@ mod tests {
         assert_eq!(head(&w1, None, &[]).title, "Wave 1 · Foundation");
         let stopped = json!({"wave": 1, "state": "stopped"});
         assert_eq!(gate(&stopped, Some(&w2)).unwrap().button, "Continue to wave 2");
+        assert_eq!(gate(&stopped, Some(&w2)).unwrap().kind, Kind::Review);
+        assert_eq!(head(&stopped, None, &[]).meta, "◐ Done · ready for review");
+        assert_eq!(head(&json!({"wave": 2, "state": "held"}), Some(&w1), &[]).meta, "‖ Held");
         assert_eq!(gate(&w1, Some(&w2)), None);
     }
 
@@ -385,7 +418,27 @@ mod tests {
         assert_eq!(pr_cell(&json!({"pr": {"num": 398, "state": "MERGED"}})), "PR #398 merged");
         assert_eq!(pr_cell(&json!({"pr": {"num": 4, "state": "OPEN", "stage": {"label": "In review"}}})), "PR #4 · In review");
         assert_eq!(pr_cell(&json!({"status": "queued", "ships_pr": true})), "Ships one PR");
+        assert_eq!(pr_cell(&json!({"status": "queued", "ships_pr": true, "same_pr": 1666})), "Shares T1666's PR");
+        assert_eq!(pr_cell(&json!({"status": "queued", "ships_pr": true, "same_pr": null})), "Ships one PR");
         assert_eq!(pr_cell(&json!({"status": "done", "ships_pr": true, "no_pr": "not needed"})), "No PR: not needed");
+    }
+
+    #[test]
+    fn shared_tasks_sit_under_the_goal_they_came_from() {
+        let g6 = json!({"id": 6, "ref": "G6", "name": "Import from CSV"});
+        let g2 = json!({"id": 2, "ref": "G2", "name": "Search filters"});
+        let g = json!({"ref": "G1", "tasks": [{"ref": "T1", "status": "queued"}], "shared": [
+            {"id": 9, "ref": "T9", "status": "queued", "goal": g6},
+            {"id": 4, "ref": "T4", "status": "done", "goal": g2},
+            {"id": 7, "ref": "T7", "status": "queued", "goal": g6},
+        ]});
+        let cs = cards(&g);
+        let shared: Vec<(&str, String, Vec<&str>)> = cs[1..].iter().map(|c| (c.key.as_str(), c.head.as_ref().unwrap().title.clone(), c.rows.iter().map(|r| r.r.as_str()).collect())).collect();
+        assert_eq!(
+            shared,
+            vec![("shared:G2", "From G2 Search filters".to_string(), vec!["T4"]), ("shared:G6", "From G6 Import from CSV".to_string(), vec!["T7", "T9"])],
+            "a card per source goal, lowest ref first, each in id order"
+        );
     }
 
     #[test]

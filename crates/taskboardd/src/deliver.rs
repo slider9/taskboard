@@ -34,6 +34,7 @@ fn what(purpose: &str) -> &'static str {
         "line_next" => "the next task in its line",
         "code_review" => "the code review's word",
         "code_review_fix" => "the code review's fix list",
+        "checkin" => "the check-in on its slow turn",
         _ => "the board's message",
     }
 }
@@ -49,6 +50,7 @@ fn done_text(purpose: &str, to: &str) -> String {
         "line_next" => format!("Moved {to} on to the next task in its line"),
         "code_review" => format!("Told {to} its tb submit was turned back after its code review"),
         "code_review_fix" => format!("Sent {to} its code review's findings to fix"),
+        "checkin" => format!("Told {to} its turn looked slow or stuck"),
         _ => format!("Delivered a message to {to}"),
     }
 }
@@ -130,11 +132,22 @@ fn save_target(app: &App, j: &Row, target: &Row) -> Result<()> {
     Ok(())
 }
 
+/// The terminal sits at its prompt: idle, or needs-you only by a tab status's label (the board's own
+/// Question tab on a task that asked the owner) with no prompt of Claude's waiting. Midna's queue still
+/// holds the text until the terminal takes input (a dialog on screen, a draft in the input box).
+fn at_prompt(s: &Row) -> bool {
+    match s.s("status") {
+        Some("idle") => true,
+        Some("needs") => s.s("source") == Some("midna") && s.i("prompt_waiting") == Some(0),
+        _ => false,
+    }
+}
+
 fn send(app: &App, j: &Row, t: &Row, s: &Row, target: &mut Row) -> Result<Option<i64>> {
     let purpose = j.st("purpose");
     let failed_ago = age_secs(target.s("send_failed_at")).unwrap_or(SEND_RETRY_SECS);
     if !board::runs_claude(s)
-        || s.s("status") != Some("idle")
+        || !at_prompt(s)
         || board::offline(s)
         || (purpose == "checkpoint" && t.s("status") == Some("needs"))
         || (BOARD_PURPOSES.contains(&purpose.as_str()) && !hours_open(app, t)?)

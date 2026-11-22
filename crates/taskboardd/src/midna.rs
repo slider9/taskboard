@@ -79,6 +79,29 @@ pub fn up(app: &App) -> bool {
     age_secs(seen.as_deref()).map(|a| a <= app.cfg.intervals.midna_up).unwrap_or(false)
 }
 
+/// Talk it over clicked again for the same thing (`purpose` and every field of `target`): the
+/// terminal the last click opened, brought to the front while Midna still has it open, or that
+/// click's job while it's still opening. None when there's no such terminal, so a new one opens.
+pub fn open_talk(app: &App, purpose: &str, target: &Value) -> Result<Option<Value>> {
+    let same = |j: &Row| {
+        let t = board::job_target(j);
+        target.as_object().is_some_and(|want| want.iter().all(|(k, v)| t.get(k).unwrap_or(&Value::Null) == v))
+    };
+    let jobs = app.db.q("SELECT * FROM jobs WHERE kind = 'agent' AND purpose = ? ORDER BY id DESC LIMIT 50", p![purpose])?;
+    let Some(j) = jobs.iter().find(|j| same(j)) else { return Ok(None) };
+    if matches!(j.s("state"), Some("pending" | "running")) {
+        return Ok(Some(json!({"ok": true, "job": rf("job", j.id())})));
+    }
+    let Some(sid) = board::job_target(j).get("session").and_then(Value::as_str).map(str::to_string) else { return Ok(None) };
+    // A closed terminal isn't Midna's any more; an exited one is on its way out.
+    match call_timeout(app, "session.get", json!({"id": sid}), 5.0) {
+        Ok(s) if s["status"]["exit_code"].is_null() && s["status"]["state"] != "exited" => {}
+        _ => return Ok(None),
+    }
+    let f = app.db.tx(|| board::create_job(app, "focus", json!({"session": sid}), None, "", None))?;
+    Ok(Some(json!({"ok": true, "job": rf("job", f), "session": sid, "reused": true})))
+}
+
 pub fn status(app: &App) -> Value {
     json!({"up": up(app), "seen_at": app.shared.lock().midna_seen_at})
 }
@@ -102,7 +125,7 @@ fn open_app(app: &App) {
 /// Opens Midna's app in the background (`open -g`), which starts its daemon.
 #[cfg(not(windows))]
 fn start_midna(app: &App) -> bool {
-    std::process::Command::new("open").args(["-g", "-b", &app.cfg.midna_bundle]).spawn().is_ok()
+    proc::start_reaped(std::process::Command::new("open").args(["-g", "-b", &app.cfg.midna_bundle])).is_ok()
 }
 
 /// Starts Midna's daemon the way its login entry does, with no window: the installed `midnad.exe`, in
@@ -210,19 +233,27 @@ pub fn rpc(sock: &Path, method: &str, params: &Value, timeout: f64) -> std::resu
 
 /// The notification kind the board's notifications go as (their `category`).
 pub const NOTIFY_KIND: &str = "board";
+/// The kind start asks go as: it stays on screen until the owner answers, like an approval.
+pub const NOTIFY_ASK_KIND: &str = "board_ask";
 
-/// Sends a notification (`notify.send`). Midna refuses a category it has no kind for, so when the board's
-/// kind isn't there (a Midna that never had it, or the owner removed it) it adds the kind and sends again.
+/// What `notify.kinds.add` makes for one of the board's kinds.
+fn kind_params(kind: &str) -> Option<Value> {
+    match kind {
+        NOTIFY_KIND => Some(json!({"key": NOTIFY_KIND, "label": "Task board", "description": "Alerts, digests and reviews from the task board"})),
+        NOTIFY_ASK_KIND => Some(json!({"key": NOTIFY_ASK_KIND, "label": "Task board asks", "description": "Starts for you to approve; they stay until you answer",
+                                        "settings": {"stay": 0}})),
+        _ => None,
+    }
+}
+
+/// Sends a notification (`notify.send`). Midna refuses a category it has no kind for, so when one of the
+/// board's kinds isn't there (a Midna that never had it, or the owner removed it) it adds the kind and sends again.
 pub fn notify_send(exe: &Path, params: &Value) -> MResult<Value> {
+    let kind = params["category"].as_str().unwrap_or(NOTIFY_KIND);
     match call_exe(exe, "notify.send", params, CALL_TIMEOUT) {
-        Err(MidnaError::Refused(m)) if m.contains(&format!("no kind `{NOTIFY_KIND}`")) => {
+        Err(MidnaError::Refused(m)) if m.contains(&format!("no kind `{kind}`")) && kind_params(kind).is_some() => {
             // Another send may have added it meanwhile; the second send says whether it's there.
-            let _ = call_exe(
-                exe,
-                "notify.kinds.add",
-                &json!({"key": NOTIFY_KIND, "label": "Task board", "description": "Starts to approve, alerts, digests and reviews from the task board"}),
-                CALL_TIMEOUT,
-            );
+            let _ = call_exe(exe, "notify.kinds.add", &kind_params(kind).unwrap_or_default(), CALL_TIMEOUT);
             call_exe(exe, "notify.send", params, CALL_TIMEOUT)
         }
         r => r,
@@ -292,6 +323,26 @@ pub fn claude_args(a: &Row) -> MResult<(Vec<String>, Option<String>)> {
         parts.extend(["--append-system-prompt".to_string(), c.to_string()]);
     }
     Ok((parts, resume))
+}
+
+/// The terminal's Claude flags with `deny` (config.toml's `[terminals] deny`) added to its
+/// `--disallowedTools`, or as one of its own when it has none.
+pub fn with_denied(mut args: Vec<String>, deny: &[String]) -> Vec<String> {
+    let deny: Vec<&str> = deny.iter().map(|d| d.trim()).filter(|d| !d.is_empty()).collect();
+    if deny.is_empty() {
+        return args;
+    }
+    match args.iter().position(|a| a == "--disallowedTools" || a == "--disallowed-tools").filter(|i| i + 1 < args.len()) {
+        Some(i) => {
+            let have: Vec<String> = args[i + 1].split(',').map(|t| t.trim().to_string()).collect();
+            let more: Vec<&str> = deny.into_iter().filter(|d| !have.iter().any(|h| h == d)).collect();
+            if !more.is_empty() {
+                args[i + 1] = format!("{},{}", args[i + 1], more.join(","));
+            }
+        }
+        None => args.extend(["--disallowedTools".to_string(), deny.join(",")]),
+    }
+    args
 }
 
 /// Whether this job's terminal opens in Midna's Background group (config.toml's `[terminals]`): its
@@ -388,6 +439,7 @@ fn run_agent(app: &App, j: &Row, a: &Row) -> MResult<String> {
         }
     }
     let (agent_args, resume) = claude_args(&a)?;
+    let agent_args = with_denied(agent_args, &app.cfg.terminals.deny);
     let cold = !slash_commands_off(&agent_args) && resume.as_deref().and_then(|cid| cold_resume(app, j, &cwd, cid)).is_some();
     let prompt = a.s("prompt").filter(|p| !p.is_empty());
     // A slot's terminal is left for the board to `close`: closing itself on exit runs Midna's cleanup.
@@ -530,6 +582,13 @@ fn git_of(s: &Value) -> (Value, Value) {
     }
 }
 
+/// Midna's state for terminal `s` is only held by a tab status (the board's own Question puts it in
+/// needs_you), not by a prompt of the agent's: Midna's own rule for typing into a terminal.
+fn labelled(s: &Value) -> bool {
+    let (st, cs) = (&s["status"], &s["custom_status"]);
+    cs["label"].is_string() && cs["base"] == st["state"] && cs["label"] == st["reason"]
+}
+
 fn state_of(s: &str) -> &'static str {
     match s {
         "working" => "working",
@@ -581,7 +640,7 @@ pub fn sync(app: &App, sessions: &[Value], projects: &[Value]) -> Result<(Vec<St
                     let path = p.get("path").and_then(|v| v.as_str()).unwrap_or("");
                     !path.is_empty() && std::path::Path::new(path).exists() && crate::projects::main_checkout(path).is_none()
                 })
-                .map(|p| json!({"name": p.get("name"), "path": p.get("path")}))
+                .map(|p| json!({"name": p.get("name"), "path": p.get("path"), "id": p.get("id")}))
                 .collect();
             let list = jdumps(&Value::Array(list));
             if app.db.get_setting("midna_projects")?.as_deref() != Some(list.as_str()) {
@@ -631,7 +690,7 @@ pub fn sync(app: &App, sessions: &[Value], projects: &[Value]) -> Result<(Vec<St
             };
             let mut f = crate::fields![
                 "name" => name, "project" => project, "project_path" => path, "cwd" => s.get("cwd"), "branch" => branch, "dirty" => dirty,
-                "agent" => agent, "status" => state_of(&state), "prompt_waiting" => (state == "needs_you") as i64,
+                "agent" => agent, "status" => state_of(&state), "prompt_waiting" => (state == "needs_you" && !labelled(s)) as i64,
                 "last_activity" => s.get("last_activity_at"), "source" => "midna", "missed" => 0, "gone_at" => null
             ];
             if let Some(c) = info.s("conversation_id").filter(|c| !c.is_empty()) {
@@ -670,7 +729,8 @@ pub fn sync(app: &App, sessions: &[Value], projects: &[Value]) -> Result<(Vec<St
                 gone.push(sid);
             }
         }
-        retire_stale_hook_terminals(app, sessions, &mut gone)
+        retire_stale_hook_terminals(app, sessions, &mut gone)?;
+        crate::startwatch::sweep(app, sessions)
     })?;
     if !gone.is_empty() {
         app.debug(format!("midna: {} gone", plural(gone.len() as i64, "terminal")));
@@ -683,14 +743,20 @@ fn listed_id(s: &Value) -> Option<String> {
 }
 
 /// Marks gone the terminals only hooks ever told the board about, once Midna doesn't list them and
-/// they've been quiet for `hook_gone_after_idle`. Such a row may be a real Claude outside Midna, so
-/// being missing from the list isn't enough; a hook from one that's still alive brings it back.
+/// either Midna said it closed them (`closed_by`, from its `session.closed` event) or they've been
+/// quiet for `hook_gone_after_idle`. Without a close, such a row may be a real Claude outside Midna,
+/// so being missing from the list isn't enough; a hook from one that's still alive brings it back.
 /// Any listing counts, also one with no agent in it, which the sync loop skips.
 fn retire_stale_hook_terminals(app: &App, sessions: &[Value], gone: &mut Vec<String>) -> Result<()> {
     let listed: Vec<String> = sessions.iter().filter_map(listed_id).collect();
     for s in app.db.q("SELECT * FROM sessions WHERE status != 'gone' AND source = 'hook'", p![])? {
         let sid = s.st("id");
         if listed.contains(&sid) || gone.contains(&sid) {
+            continue;
+        }
+        if has(s.s("closed_by")) {
+            board::session_gone(app, &sid, "closed in Midna")?;
+            gone.push(sid);
             continue;
         }
         let quiet = [s.s("last_activity"), s.s("seen_at")].into_iter().filter_map(wall_age_secs).reduce(f64::min);
@@ -1108,14 +1174,17 @@ pub fn send_tabs(app: &App) {
 const PANELS_KEPT: usize = 200;
 /// The most terminals whose last panel is kept, so an unchanged one isn't sent again.
 const PANELS_REMEMBERED: usize = 500;
+/// The most terminals kept as gone from Midna's Summary, so no panel is sent to them again.
+const GONE_REMEMBERED: usize = 2000;
 
 /// The task fields a terminal's panel is read from (`task_panel`), beyond the tab status's.
 pub fn panel_field(field: &str) -> bool {
     tab_field(field) || matches!(field, "session_id" | "title" | "goal_id")
 }
 
-/// The badge and color a task's panel shows for its state.
-pub fn panel_state(t: &Row) -> (&'static str, &'static str) {
+/// The badge and color a task's panel shows for its state. A terminal closed by hand (`by_hand`,
+/// `board::closed_by_hand`) is quiet, as the app's Stopped row is, not a red Lost.
+pub fn panel_state(t: &Row, by_hand: bool) -> (&'static str, &'static str) {
     match t.s("status") {
         Some("done") if t.b("failed") => ("Failed", "red"),
         Some("done") if pr_merged(t) => ("Merged", "green"),
@@ -1125,6 +1194,7 @@ pub fn panel_state(t: &Row) -> (&'static str, &'static str) {
         },
         Some("done") if t.i("pr_num").is_some() || has(t.s("pr_url")) => ("PR closed", "gray"),
         Some("done") => ("Done", "green"),
+        Some("needs") if by_hand => ("Stopped", "gray"),
         Some("needs") => match t.s("needs_reason") {
             Some("question") => ("Question", "amber"),
             Some("lost") => ("Lost", "red"),
@@ -1137,12 +1207,17 @@ pub fn panel_state(t: &Row) -> (&'static str, &'static str) {
     }
 }
 
-/// The panel a task puts on its terminals' entries in Midna's Summary: the task and its state, its
-/// goal (`goal`, with how many of its tasks are done) and buttons to the task, its PR and the goal's
-/// next task (`next`).
-pub fn task_panel(app: &App, t: &Row, goal: Option<(&Row, i64, i64)>, next: Option<&Row>) -> Value {
+/// The badge and color task `t`'s panel shows now (`panel_state`).
+fn panel_state_now(app: &App, t: &Row) -> Result<(&'static str, &'static str)> {
+    Ok(panel_state(t, board::closed_by_hand(app, t)?))
+}
+
+/// The panel a task puts on its terminals' entries in Midna's Summary: the task and its state
+/// (`state`, from `panel_state`), its goal (`goal`, with how many of its tasks are done) and buttons
+/// to the task, its PR and the goal's next task (`next`).
+pub fn task_panel(app: &App, t: &Row, state: (&str, &str), goal: Option<(&Row, i64, i64)>, next: Option<&Row>) -> Value {
     let tref = rf("task", t.id());
-    let (badge, color) = panel_state(t);
+    let (badge, color) = state;
     let open = dispatch::page_link(app, &format!("task/{tref}"));
     let mut buttons = vec![json!({"label": "Open task", "open": open})];
     if let Some(pr) = t.s("pr_url").filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
@@ -1182,7 +1257,7 @@ fn panel_of(app: &App, t: &Row) -> Result<Option<(Vec<String>, Value)>> {
         None => (None, None),
     };
     let goal = goal.as_ref().zip(counts).map(|(g, c)| (g, c["done"].as_i64().unwrap_or(0), c["total"].as_i64().unwrap_or(0)));
-    Ok(Some((sids, task_panel(app, t, goal, next.as_ref()))))
+    Ok(Some((sids, task_panel(app, t, panel_state_now(app, t)?, goal, next.as_ref()))))
 }
 
 /// The goal's next task for `t`: the first not done after it in the goal's order, else before it.
@@ -1245,13 +1320,14 @@ pub fn panel_changed(app: &App, before: &Row, after: &Row) -> Result<()> {
     if !app.cfg.runner {
         return Ok(());
     }
-    let shown = |t: &Row| (panel_state(t), t.v("title"), t.v("session_id"), t.v("goal_id"), t.v("pr_url"), t.v("pr_num"));
-    if shown(before) == shown(after) {
+    let (was, is) = (panel_state_now(app, before)?, panel_state_now(app, after)?);
+    let shown = |t: &Row| (t.v("title"), t.v("session_id"), t.v("goal_id"), t.v("pr_url"), t.v("pr_num"));
+    if was == is && shown(before) == shown(after) {
         return Ok(());
     }
     queue_panel(app, after.id());
     let goals = [before.i("goal_id"), after.i("goal_id")];
-    if panel_state(before) == panel_state(after) && goals[0] == goals[1] {
+    if was == is && goals[0] == goals[1] {
         return Ok(());
     }
     for g in goals.into_iter().flatten() {
@@ -1267,8 +1343,8 @@ pub fn panel_changed(app: &App, before: &Row, after: &Row) -> Result<()> {
 }
 
 /// Sends the queued tasks' panels to the Summary entries of their terminals. One Midna won't take is
-/// logged (one for a terminal it doesn't know, quietly) and dropped; with Midna down they wait. A
-/// Midna too old for `summary.annotate` is logged once.
+/// logged and dropped; one for a terminal it doesn't know is dropped quietly, and that terminal gets
+/// no panel again. With Midna down they wait. A Midna too old for `summary.annotate` is logged once.
 pub fn send_panels(app: &App) {
     static TOO_OLD: AtomicBool = AtomicBool::new(false);
     loop {
@@ -1283,8 +1359,11 @@ pub fn send_panels(app: &App) {
         };
         let owner = links_owner(app).to_lowercase().replace(' ', "-");
         for sid in sids {
-            if app.shared.lock().midna_panels_sent.get(&sid) == Some(&panel) {
-                continue;
+            {
+                let s = app.shared.lock();
+                if s.midna_panels_sent.get(&sid) == Some(&panel) || s.midna_panels_gone.contains(&sid) {
+                    continue;
+                }
             }
             match call_timeout(app, "summary.annotate", json!({"id": sid, "owner": owner, "panel": panel}), 5.0) {
                 Ok(_) => {
@@ -1303,8 +1382,16 @@ pub fn send_panels(app: &App) {
                         app.info("midna: it doesn't take Summary panels yet (summary.annotate); closed terminals show no task until it's updated".to_string());
                     }
                 }
-                // A terminal Midna has dropped from its Summary.
-                Err(MidnaError::Refused(e)) if e.starts_with("no terminal") => {}
+                // A terminal Midna has dropped from its Summary doesn't come back: asking again for every
+                // change to its task (and its goal's other tasks) only loads Midna with refused calls.
+                Err(MidnaError::Refused(e)) if e.starts_with("no terminal") => {
+                    let mut s = app.shared.lock();
+                    if s.midna_panels_gone.len() >= GONE_REMEMBERED {
+                        s.midna_panels_gone.clear();
+                    }
+                    s.midna_panels_sent.remove(&sid);
+                    s.midna_panels_gone.insert(sid);
+                }
                 Err(MidnaError::Refused(e)) => app.info(format!("midna: couldn't put {}'s panel on {sid}: {e}", rf("task", id))),
             }
         }
@@ -1314,8 +1401,9 @@ pub fn send_panels(app: &App) {
 /// How far back the first look at Midna's event log reaches (the board keeps its place after that).
 const CLOSED_LOOKBACK_SECS: f64 = 60.0;
 
-/// Applies Midna's `session.closed` events (who closed each terminal) and `session.opened` ones from a
-/// trigger (which trigger opened it, for the owner's standing start grants).
+/// Applies Midna's `session.closed` events (who closed each terminal), `session.exited` and
+/// `session.closed` ones for a start terminal whose agent never checked in (`startwatch`), and
+/// `session.opened` ones from a trigger (which trigger opened it, for the owner's standing start grants).
 pub fn closed_events(app: &App, events: &[Value]) -> Result<()> {
     let mut last = app.db.get_setting("midna_event_seq")?.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
     app.db.tx(|| {
@@ -1330,10 +1418,14 @@ pub fn closed_events(app: &App, events: &[Value]) -> Result<()> {
                 }
                 continue;
             }
-            if e["kind"] != "session.closed" || age_secs(e["at"].as_str()).is_none_or(|a| a > CLOSED_LOOKBACK_SECS) {
+            let kind = e["kind"].as_str().unwrap_or("");
+            if !matches!(kind, "session.closed" | "session.exited") || age_secs(e["at"].as_str()).is_none_or(|a| a > CLOSED_LOOKBACK_SECS) {
                 continue;
             }
-            board::terminal_closed(app, sid, by)?;
+            if kind == "session.closed" {
+                board::terminal_closed(app, sid, by)?;
+            }
+            crate::startwatch::midna_event(app, kind, sid, &e["data"])?;
         }
         app.db.set_setting("midna_event_seq", Some(&last.to_string()))
     })
@@ -1346,7 +1438,7 @@ static CLOSED_FAILED: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None
 /// that then goes missing just ends for an unknown reason.
 fn read_closed(app: &App) {
     let since = app.db.get_setting("midna_event_seq").ok().flatten().and_then(|s| s.parse::<u64>().ok());
-    match call_timeout(app, "events.list", json!({"since_seq": since, "limit": 200, "filter": {"kinds": ["session.closed", "session.opened"]}}), 10.0) {
+    match call_timeout(app, "events.list", json!({"since_seq": since, "limit": 200, "filter": {"kinds": ["session.closed", "session.exited", "session.opened"]}}), 10.0) {
         Ok(events) => {
             *CLOSED_FAILED.lock().unwrap_or_else(|e| e.into_inner()) = None;
             if let Err(e) = closed_events(app, events.as_array().map(|a| a.as_slice()).unwrap_or(&[])) {
@@ -1402,15 +1494,14 @@ pub fn sync_loop(app: Arc<App>) {
     }
 }
 
-/// How long each look at a terminal that just ended may take: the hook that reports it waits.
-const EXIT_DETAIL_TIMEOUT: f64 = 0.3;
 const EXIT_LINES: usize = 3;
 
 /// What Midna can tell of a terminal that ended with no reason Claude named: how it exited, how
 /// long it ran and its last lines. Straight to its CLI, so a Midna that's down marks nothing.
 pub fn exit_detail(app: &App, sid: &str) -> Option<String> {
-    let s = call_exe(&app.cfg.midna, "session.get", &json!({"id": sid}), EXIT_DETAIL_TIMEOUT).ok();
-    let read = call_exe(&app.cfg.midna, "session.read", &json!({"id": sid, "lines": 20}), EXIT_DETAIL_TIMEOUT).ok();
+    let wait = app.cfg.midna_exit_timeout;
+    let s = call_exe(&app.cfg.midna, "session.get", &json!({"id": sid}), wait).ok();
+    let read = call_exe(&app.cfg.midna, "session.read", &json!({"id": sid, "lines": 20}), wait).ok();
     describe_exit(s.as_ref(), read.as_ref().and_then(|r| r["text"].as_str()), now_ts())
 }
 
@@ -1578,8 +1669,10 @@ mod tests {
             (row(json!({})), ("Planned", "gray")),
         ];
         for (t, want) in cases {
-            assert_eq!(panel_state(&t), want, "{t:?}");
+            assert_eq!(panel_state(&t, false), want, "{t:?}");
         }
+        let lost = row(json!({"status": "needs", "needs_reason": "lost", "lost": 1}));
+        assert_eq!(panel_state(&lost, true), ("Stopped", "gray"), "a terminal closed by hand is quiet, not Lost");
     }
 
     #[test]
@@ -1591,7 +1684,7 @@ mod tests {
         let g = row(json!({"id": 12, "name": "Drag and drop"}));
         let next = row(json!({"id": 732, "title": "Drop folders"}));
         assert_eq!(
-            task_panel(&app, &t, Some((&g, 3, 5)), Some(&next)),
+            task_panel(&app, &t, ("In review", "purple"), Some((&g, 3, 5)), Some(&next)),
             json!({
                 "title": "T731 Dropped files type their path",
                 "url": "taskboard://task/T731",
@@ -1609,7 +1702,7 @@ mod tests {
             })
         );
         let alone = row(json!({"id": 5, "title": "Fix", "status": "working", "pr_url": "file:///tmp/x"}));
-        let p = task_panel(&app, &alone, None, None);
+        let p = task_panel(&app, &alone, ("Working", "teal"), None, None);
         assert_eq!(p["buttons"], json!([{"label": "Open task", "open": "taskboard://task/T5"}]), "only web PR links");
         assert!(p.get("subtitle").is_none() && p.get("subtitle_url").is_none());
     }
@@ -1646,6 +1739,16 @@ mod tests {
         assert_eq!(args, vec!["--model", "opus", "--append-system-prompt", "be brief"]);
         a.insert("flags".into(), json!("--x \"unclosed"));
         assert!(claude_args(&a).is_err());
+    }
+
+    #[test]
+    fn denied_tools_join_the_terminal_s_own() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let deny = s(&["mcp__midna", " Agent(flutter-doctor) ", ""]);
+        assert_eq!(with_denied(s(&["--model", "opus"]), &deny), s(&["--model", "opus", "--disallowedTools", "mcp__midna,Agent(flutter-doctor)"]));
+        let desk = s(&["--disallowedTools", "Agent,Task,mcp__midna", "--disable-slash-commands"]);
+        assert_eq!(with_denied(desk, &deny), s(&["--disallowedTools", "Agent,Task,mcp__midna,Agent(flutter-doctor)", "--disable-slash-commands"]), "one flag, nothing twice");
+        assert_eq!(with_denied(s(&["--model", "opus"]), &[]), s(&["--model", "opus"]), "[] keeps every tool");
     }
 
     #[test]

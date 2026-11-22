@@ -410,6 +410,13 @@ pub fn register(dir: &Path, m: &Manifest) -> crate::install::LoginItem {
         return LoginItem::Failed(e);
     }
     // Switched off, it still runs now (the app needs it), but not at the next sign-in.
+    startup_status(m)
+}
+
+/// Whether the startup entry is switched on in Settings ▸ Apps ▸ Startup, as it is now; it changes
+/// nothing (`install::recheck`).
+pub fn startup_status(m: &Manifest) -> crate::install::LoginItem {
+    use crate::install::LoginItem;
     if startup_disabled(&m.name) { LoginItem::RequiresApproval } else { LoginItem::Enabled }
 }
 

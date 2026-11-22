@@ -37,7 +37,7 @@ pub fn bar(app: &App, t: &Row) -> Result<Value> {
     let rec = f.get("rec").cloned().unwrap_or(json!({}));
     let head = rec["head"].as_str().unwrap_or("");
     let skipped = prflow::checks_skipped(&f, &rec);
-    let failing = !prflow::failing(app, &f, &rec).is_empty();
+    let failing = !prflow::failing(app, t, &f, &rec).is_empty();
     let waits = t.s("pr_phase") == Some("waits");
     // Builds the board stopped aren't failures, cleared or not.
     let stopped = prflow::board_stopped(app, &f, &rec);
@@ -165,8 +165,8 @@ pub fn reviewer_rows(f: &Row, rec: &Value) -> Vec<Value> {
             let ask = prflow::rereview_ask(f, r);
             let state = match r["state"].as_str().unwrap_or("") {
                 "approved" => "approved",
-                "commented" => "commented",
                 _ if ask.is_some() => "rereview",
+                "commented" => "commented",
                 "changes" => "changes",
                 _ => "waiting",
             };

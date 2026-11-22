@@ -93,7 +93,7 @@ fn a_task_starts_is_claimed_reports_and_finishes() {
     let job = &b.jobs("agent")[0];
     let args = board::job_args(job);
     assert!(args.st("prompt").starts_with("[task-board:T1] You are picking up “Add login” in webapp"));
-    assert!(args.st("prompt").contains("What to do:\nDo the thing."));
+    assert!(!args.st("prompt").contains("What to do:"), "a short prompt: the hook carries the handoff");
     assert_eq!(b.task(id).i("start_job"), Some(job.id()));
     assert!(runner::start_queued(&b.app).unwrap().is_empty(), "a task with a live start job isn't started twice");
 
@@ -101,7 +101,10 @@ fn a_task_starts_is_claimed_reports_and_finishes() {
     let prompt = args.st("prompt");
     let out = b.report("hook.prompt", "s1", json!({"prompt": prompt}));
     assert_eq!(out["task"], "T1");
-    assert!(out.get("context").is_none(), "the full handoff was already in the prompt");
+    let ctx = out["context"].as_str().unwrap_or("");
+    assert!(ctx.contains("What to do:\nDo the thing.") && ctx.contains(taskboardd::handoff::CLOSING), "the hook carries the whole handoff: {ctx}");
+    let again = b.report("hook.prompt", "s1", json!({"prompt": "carry on"}));
+    assert!(!again["context"].as_str().unwrap_or("").contains(taskboardd::handoff::CLOSING), "and sends it once: {again}");
     let t = b.task(id);
     assert_eq!(t.s("status"), Some("working"));
     assert_eq!(t.s("session_id"), Some("s1"));
@@ -195,6 +198,36 @@ fn a_closed_terminal_requeues_the_task_then_waits_for_the_owner() {
     assert_eq!(t.s("status"), Some("needs"), "after two restarts in an hour it waits for the owner");
     assert_eq!(t.s("needs_reason"), Some("lost"));
     assert!(t.b("lost"));
+}
+
+#[test]
+fn claude_restarted_in_place_keeps_its_task_instead_of_a_new_terminal() {
+    let b = new_board();
+    let id = new_task(&b, "Long job", json!({}));
+    b.add_session("s1", "working");
+    b.report("tb.take", "s1", json!({"task": "T1"}));
+    b.report("hook.session_end", "s1", json!({"reason": "other"}));
+    assert_eq!(b.task(id).s("status"), Some("queued"));
+
+    b.report("hook.session_start", "s1", json!({"source": "resume"}));
+    let t = b.task(id);
+    assert_eq!((t.s("status"), t.s("session_id"), t.s("retry_at")), (Some("working"), Some("s1"), None), "Midna resumed it in the same terminal");
+    let last = b.app.db.q("SELECT text FROM events WHERE task_id = ? AND kind = 'status' ORDER BY id DESC LIMIT 1", p![id]).unwrap();
+    assert!(last[0].st("text").starts_with("Terminal came back (resume) in "), "{}", last[0].st("text"));
+}
+
+#[test]
+fn another_conversation_in_the_ended_terminal_leaves_the_restart_queued() {
+    let b = new_board();
+    let id = new_task(&b, "Long job", json!({}));
+    b.add_session("s1", "working");
+    b.report("tb.take", "s1", json!({"task": "T1"}));
+    b.report("hook.session_end", "s1", json!({"reason": "other"}));
+
+    b.report("hook.session_start", "s1", json!({"source": "resume", "claude_session": "c-other"}));
+    b.report("hook.session_start", "s1", json!({"source": "startup"}));
+    let t = b.task(id);
+    assert_eq!((t.s("status"), t.s("session_id")), (Some("queued"), None), "only its own conversation, resumed, takes it back");
 }
 
 #[test]
@@ -365,7 +398,7 @@ fn a_task_waits_for_another_and_a_goal_runs_in_order() {
 
     b.post(&format!("/tasks/T{other}/done"), json!({"summary": "Table in"}));
     assert_eq!(runner::start_queued(&b.app).unwrap(), vec![t1]);
-    let prompt = board::job_args(&b.jobs("agent")[0]).st("prompt");
+    let prompt = taskboardd::handoff::build_starting(&b.app, t1).unwrap();
     assert!(prompt.contains("This task needs work from another task, and it's ready"));
     assert!(prompt.contains("It is part of the goal “Checkout”, done when people can pay."));
 }
@@ -594,6 +627,55 @@ fn a_turn_that_loses_the_network_waits_for_midna_to_carry_it_on() {
     assert!(b.task(id).st("question").contains("type anything"), "a plain 429 isn't a limit Claude Code waits out");
 }
 
+/// Terminal `s1` as Midna lists it: needs_you, either held by the board's Question tab (`labelled`)
+/// or by a prompt of Claude's, and settled long enough for the board to type in it.
+fn needs_you(b: &Board, labelled: bool) {
+    let repo = b._dir.path().join("webapp");
+    let (reason, custom) = if labelled {
+        ("Question", json!({"label": "Question", "color": "amber", "base": "needs_you"}))
+    } else {
+        ("Claude needs your permission to use Bash", json!({"label": "Question", "color": "amber", "base": "needs_you"}))
+    };
+    let s = json!({"id": "s1", "name": "Term s1", "agent": "claude", "cwd": repo.to_string_lossy(),
+                   "status": {"state": "needs_you", "reason": reason}, "custom_status": custom});
+    midna::sync(&b.app, &[s], &[]).unwrap();
+    b.app.db.x("UPDATE sessions SET status_at = '2026-01-01T00:00:00Z' WHERE id = 's1'", p![]).unwrap();
+}
+
+fn asked_and_answered(b: &Board) {
+    new_task(b, "Pick a colour", json!({}));
+    b.add_session("s1", "working");
+    b.report("tb.take", "s1", json!({"task": "T1"}));
+    b.report("tb.question", "s1", json!({"text": "Blue or green?"}));
+    b.report("hook.stop", "s1", json!({"last_message": "Asked."}));
+    b.post("/tasks/T1/answer", json!({"text": "Green"}));
+}
+
+#[test]
+fn an_answer_is_typed_into_a_terminal_idle_under_its_question_tab() {
+    let b = new_board();
+    asked_and_answered(&b);
+    needs_you(&b, true);
+    taskboardd::deliver::tick(&b.app).unwrap();
+    let sent = b.jobs("message");
+    assert_eq!(sent.len(), 1, "the Question tab is only the board's label: the terminal sits at its prompt");
+    let a = board::job_args(&sent[0]);
+    assert_eq!(a.s("to"), Some("s1"));
+    assert!(a.st("text").contains("answer: Green"));
+    let log = b.get("/tasks/T1/log")["log"].as_array().unwrap().clone();
+    // Typed, not yet delivered: it's the agent's once its prompt hook reports it (deliver::arrived).
+    assert!(log.iter().any(|e| e["text"].as_str().unwrap().contains("is typing your answer into it through Midna")), "{log:?}");
+}
+
+#[test]
+fn an_answer_waits_while_claude_shows_a_prompt() {
+    let b = new_board();
+    asked_and_answered(&b);
+    needs_you(&b, false);
+    taskboardd::deliver::tick(&b.app).unwrap();
+    assert!(b.jobs("message").is_empty(), "a permission prompt is waiting, so nothing is typed over it");
+}
+
 #[test]
 fn a_terminal_waiting_out_a_usage_limit_stays_open_after_hours() {
     let b = new_board();
@@ -614,6 +696,53 @@ fn a_terminal_waiting_out_a_usage_limit_stays_open_after_hours() {
     idle_since(&b);
     runner::close_idle_after_hours(&b.app).unwrap();
     assert_eq!(b.jobs("close").len(), 1, "once it has carried on, an idle terminal closes after hours as before");
+}
+
+#[test]
+fn tasks_closed_idle_after_hours_start_again() {
+    let b = new_board();
+    let h = b.post("/hours", json!({"on": true, "start": "00:00", "end": "00:01", "days": "mon"}));
+    if h["open"].as_bool().unwrap() {
+        return;
+    }
+    let pushed = new_task(&b, "Add login", json!({}));
+    let asking = new_task(&b, "Add logout", json!({}));
+    let repo = b._dir.path().join("webapp");
+    let terms = |state: &str| {
+        let s = |sid: &str| json!({"id": sid, "name": format!("Term {sid}"), "agent": "claude", "cwd": repo.to_string_lossy(), "status": {"state": state}});
+        midna::sync(&b.app, &[s("s1"), s("s2")], &[]).unwrap();
+    };
+    for (id, sid) in [(pushed, "s1"), (asking, "s2")] {
+        b.app.db.x("UPDATE tasks SET status = 'working', session_id = ?, started_at = '2026-01-01T00:00:00Z' WHERE id = ?", p![sid, id]).unwrap();
+    }
+    terms("working");
+    b.report("tb.question", "s2", json!({"text": "10 or 30 retries?"}));
+    assert_eq!(b.task(asking).s("needs_reason"), Some("question"));
+    terms("idle");
+    b.app.db.x("UPDATE sessions SET status_at = '2026-01-01T00:00:00Z'", p![]).unwrap();
+
+    runner::close_idle_after_hours(&b.app).unwrap();
+    assert_eq!(b.jobs("close").len(), 2);
+    b.app.db.x("UPDATE jobs SET state = 'done', updated_at = ? WHERE kind = 'close'", p![taskboardd::util::now_iso()]).unwrap();
+    board::session_gone(&b.app, "s1", "other").unwrap();
+    board::session_gone(&b.app, "s2", "other").unwrap();
+
+    let t = b.task(pushed);
+    assert_eq!((t.s("status"), t.s("session_id"), t.b("lost")), (Some("queued"), None, false));
+    assert_eq!(t.st("latest"), "Closed idle after work hours. It starts again from its handoff when the work hours open.");
+    let t = b.task(asking);
+    assert_eq!((t.s("status"), t.s("needs_reason"), t.s("session_id")), (Some("needs"), Some("question"), None), "it still waits on its answer");
+    assert_eq!(t.st("latest"), "Closed idle after work hours. It starts again once you answer.");
+    assert!(runner::start_queued(&b.app).unwrap().is_empty(), "nothing starts while the hours are closed");
+
+    b.post("/hours", json!({"on": false}));
+    assert_eq!(runner::start_queued(&b.app).unwrap(), vec![pushed], "the hours open: the closed task starts again");
+
+    b.post(&format!("/tasks/{asking}/answer"), json!({"text": "10"}));
+    let t = b.task(asking);
+    assert!(board::live_start_job(&b.app, &t).unwrap().is_some(), "the answer starts it again");
+    let started = b.app.db.q1("SELECT text FROM events WHERE task_id = ? ORDER BY id DESC LIMIT 1", p![asking]).unwrap().unwrap().st("text");
+    assert_eq!(started, "Its terminal is closed, so the board started it in a new terminal with your answer in its handoff");
 }
 
 #[test]
@@ -750,6 +879,35 @@ fn the_triage_list_pages_newest_first() {
 }
 
 #[test]
+fn issues_picked_after_the_plan_join_its_last_wave() {
+    let b = new_board();
+    let first = issue(&b, "First", "bug");
+    let second = issue(&b, "Second", "gap");
+    let later = issue(&b, "Picked later", "clean");
+    // Nothing to add to before there's a plan.
+    let (code, _) = b.post_err("backlog/plan/add", json!({"ids": [later]}));
+    assert_eq!(code, 409);
+
+    b.post("backlog/bulk", json!({"ids": [first], "action": "priority", "priority": "p1"}));
+    let plan = b.post("backlog/plan", json!({"ids": [first, second]}));
+    let waves = plan["waves"].as_array().unwrap().len();
+    let added = b.post("backlog/plan/add", json!({"ids": [later, first]}));
+    assert_eq!(added["id"], plan["id"], "the same plan, not a new one");
+    let last = added["waves"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(added["waves"].as_array().unwrap().len(), waves, "no new wave");
+    assert_eq!(last["items"].as_array().unwrap().last().unwrap(), &json!({"ref": later, "after": []}));
+    let all: Vec<&Value> = added["waves"].as_array().unwrap().iter().flat_map(|w| w["items"].as_array().unwrap()).collect();
+    assert_eq!(all.iter().filter(|i| i["ref"] == first.as_str()).count(), 1, "already planned issues stay put");
+    assert!(added["ids"].as_array().unwrap().contains(&json!(later)));
+    assert_eq!(b.get("backlog/plan"), added);
+
+    let g = b.post("backlog/goal", json!({"name": "All three", "waves": added["waves"]}));
+    let gid = g["goal"]["id"].as_i64().or(g["id"].as_i64()).unwrap();
+    let tasks = b.app.db.q("SELECT * FROM tasks WHERE goal_id = ? ORDER BY id", p![gid]).unwrap();
+    assert_eq!(tasks.last().unwrap().i("wave"), Some(waves as i64), "the later issue's task is in the last wave");
+}
+
+#[test]
 fn a_backlog_goal_holds_one_project() {
     let b = new_board();
     let a = issue(&b, "A", "bug");
@@ -841,6 +999,21 @@ fn the_goal_lists_every_task_attachment_next_to_its_own() {
     let titles = |k: &str| gd[k].as_array().unwrap().iter().map(|a| (a["title"].as_str().unwrap().to_string(), a["task"].as_str().map(String::from))).collect::<Vec<_>>();
     assert_eq!(titles("attachments"), vec![("Spec".into(), None)], "the goal's own list is unchanged");
     assert_eq!(titles("task_attachments"), vec![("Before".into(), Some(format!("T{one}"))), ("After".into(), Some(format!("T{two}")))], "in task order, each with its task");
+}
+
+#[test]
+fn a_task_lists_an_attachment_it_shares_with_its_goal_once() {
+    let b = new_board();
+    let g = b.post("/goals", json!({"name": "Recap", "project": "webapp"}))["id"].as_i64().unwrap();
+    let t = b.post("/tasks", json!({"title": "Fix it", "detail": "Do it.", "project": "webapp", "goal_id": g}))["id"].as_i64().unwrap();
+    let design = json!({"url": "https://claude.ai/artifact/abc", "title": "Recap page components", "kind": "design"});
+    b.post(&format!("/tasks/T{t}/attachments"), design.clone());
+    b.post(&format!("/goals/G{g}/attachments"), design);
+    b.post(&format!("/goals/G{g}/attachments"), json!({"url": "https://example.com/spec", "title": "Spec", "kind": "doc"}));
+    let td = b.get(&format!("/tasks/T{t}"));
+    let titles = |k: &str| td[k].as_array().unwrap().iter().map(|a| a["title"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(titles("attachments"), vec!["Recap page components"]);
+    assert_eq!(titles("goal_attachments"), vec!["Spec"], "the shared one shows once, as the task's");
 }
 
 #[test]

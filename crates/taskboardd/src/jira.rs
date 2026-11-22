@@ -90,6 +90,17 @@ pub fn drop_pending_creates(app: &App, project: &str) -> Result<()> {
     Ok(())
 }
 
+/// The task needs no ticket (it ends without a PR, or opted out with `--jira none`): its find-or-make
+/// job that nothing has started yet is cancelled, so no ticket is made for it.
+pub fn drop_pending_for_task(app: &App, task_id: i64) -> Result<()> {
+    app.db.x(
+        "UPDATE jobs SET state = 'cancelled', updated_at = ? WHERE kind = 'jira' AND state = 'pending' \
+         AND json_extract(args, '$.op') = 'create' AND json_extract(target, '$.task') = ?",
+        p![now_iso(), task_id],
+    )?;
+    Ok(())
+}
+
 pub fn request_create_for_task(app: &App, t: &Row) -> Result<i64> {
     create_for_task(app, t, None)
 }
@@ -211,6 +222,10 @@ fn credentials(app: &App) -> Option<(String, String)> {
         if let Some(c) = &s.jira_creds {
             return Some(c.clone());
         }
+    }
+    if let Some(c) = crate::accounts::board_credentials(app, crate::accounts::Provider::Jira) {
+        app.shared.lock().jira_creds = Some(c.clone());
+        return Some(c);
     }
     let j = &app.cfg.jira;
     let mut email = j.email.clone();
@@ -819,7 +834,7 @@ pub fn run_pending(app: &App) -> Result<()> {
         return run_through_claude(app, &jobs);
     }
     let Some(creds) = credentials(app) else {
-        return fail_all(app, &jobs, "there's no Jira API token (config.toml, TASKBOARD_JIRA_TOKEN or the Keychain), or set [jira] via = \"claude\"");
+        return fail_all(app, &jobs, "there's no Jira API token: connect Jira in Settings ▸ Accounts (or set it in config.toml, TASKBOARD_JIRA_TOKEN or the Keychain), or set [jira] via = \"claude\"");
     };
     let conn = Conn::Rest(creds);
     for j in jobs {

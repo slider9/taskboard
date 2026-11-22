@@ -1,10 +1,11 @@
 //! The name sort against the web board (`localeSort` cases in `parity/golden/forms.json`), and
-//! the alerts dialog in a headless window.
+//! the dialogs in a headless window.
 use super::*;
 // An explicit import beats the glob above, which would bring in GPUI's own `test` attribute
 // (and `#[gpui_kit::test]` expands to a plain `#[test]`).
 #[allow(unused_imports)]
 use ::core::prelude::v1::test;
+use crate::app::Page;
 use crate::backend::Backend;
 use crate::parity::{self, golden};
 use gpui_kit::{TestAppContext, WindowHandle};
@@ -21,7 +22,7 @@ fn names_sort_like_the_web() {
 
 type W = WindowHandle<MainWindow>;
 
-/// Draw the window once (the dialog checks its alerts while it renders).
+/// Draw the window once.
 fn redraw(w: W, cx: &mut TestAppContext) {
     cx.update_window(w.into(), |_, window, cx| {
         window.refresh();
@@ -31,42 +32,14 @@ fn redraw(w: W, cx: &mut TestAppContext) {
     parity::settle(cx);
 }
 
-fn one_alert() -> Value {
-    json!([{"id": "a1", "at": "2026-10-07T14:00:00Z", "text": "T3 couldn't start.", "task": "T3", "goal": null}])
-}
-
 #[gpui_kit::test]
-fn escape_closes_the_alerts_dialog(cx: &mut TestAppContext) {
+fn escape_closes_the_dialog(cx: &mut TestAppContext) {
     let (w, _) = parity::window(cx);
-    w.update(cx, |m, window, cx| {
-        // An alert, so the dialog doesn't close by itself.
-        std::rc::Rc::make_mut(m.data.state.as_mut().unwrap())["alerts"] = one_alert();
-        m.set_modal(Some(Modal::Alerts), window, cx);
-    })
-    .unwrap();
-    redraw(w, cx);
-    w.update(cx, |m, _, _| assert!(matches!(m.modal, Some(Modal::Alerts)), "the dialog stays while there are alerts")).unwrap();
+    open_note(w, cx);
+    w.update(cx, |m, _, _| assert!(matches!(m.modal, Some(Modal::Note(_))), "the dialog is open")).unwrap();
     cx.simulate_keystrokes(w.into(), "escape");
     parity::settle(cx);
-    w.update(cx, |m, _, _| assert!(m.modal.is_none(), "esc closes the alerts dialog")).unwrap();
-}
-
-#[gpui_kit::test]
-fn the_alerts_dialog_closes_itself_when_none_are_left(cx: &mut TestAppContext) {
-    let (w, _) = parity::window(cx);
-    w.update(cx, |m, window, cx| {
-        std::rc::Rc::make_mut(m.data.state.as_mut().unwrap())["alerts"] = one_alert();
-        m.set_modal(Some(Modal::Alerts), window, cx);
-    })
-    .unwrap();
-    redraw(w, cx);
-    w.update(cx, |m, _, _| {
-        assert!(matches!(m.modal, Some(Modal::Alerts)));
-        std::rc::Rc::make_mut(m.data.state.as_mut().unwrap())["alerts"] = json!([]);
-    })
-    .unwrap();
-    redraw(w, cx);
-    w.update(cx, |m, _, _| assert!(m.modal.is_none())).unwrap();
+    w.update(cx, |m, _, _| assert!(m.modal.is_none(), "esc closes the dialog")).unwrap();
 }
 
 fn finish_note(m: &MainWindow) -> Option<String> {
@@ -172,4 +145,251 @@ fn other_do_words_just_open_the_task(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert!(rec.posts().is_empty());
+}
+
+/// Opens a task's note for testers and draws it.
+fn open_note(w: W, cx: &mut TestAppContext) {
+    w.update(cx, |m, window, cx| m.set_modal(Some(Modal::Note("Log in, then open Settings.".into())), window, cx))
+    .unwrap();
+    redraw(w, cx);
+}
+
+#[gpui_kit::test]
+fn a_dialog_takes_focus_and_gives_it_back(cx: &mut TestAppContext) {
+    let (w, _) = parity::window(cx);
+    redraw(w, cx);
+    // A control on the page has focus, as after a Tab.
+    let before = w
+        .update(cx, |m, window, cx| {
+            window.focus(&m.focus, cx);
+            window.focus_next(cx);
+            window.focused(cx).filter(|f| *f != m.focus).expect("the page has a tab stop")
+        })
+        .unwrap();
+    open_note(w, cx);
+    w.update(cx, |m, window, cx| assert!(m.modal_focus.contains_focused(window, cx), "the dialog has focus")).unwrap();
+    cx.simulate_keystrokes(w.into(), "escape");
+    redraw(w, cx);
+    w.update(cx, |m, window, cx| {
+        assert!(m.modal.is_none());
+        assert_eq!(window.focused(cx), Some(before), "focus goes back where it was");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn tab_stays_inside_an_open_dialog(cx: &mut TestAppContext) {
+    let (w, _) = parity::window(cx);
+    open_note(w, cx);
+    for keys in ["tab", "tab", "tab", "tab", "tab", "shift-tab", "shift-tab", "shift-tab"] {
+        cx.simulate_keystrokes(w.into(), keys);
+        redraw(w, cx);
+        w.update(cx, |m, window, cx| {
+            assert!(m.modal_focus.contains_focused(window, cx), "{keys} keeps focus in the dialog");
+            assert!(window.focused(cx) != Some(m.modal_focus.clone()), "{keys} lands on a control in it");
+        })
+        .unwrap();
+    }
+}
+
+#[gpui_kit::test]
+fn page_keys_pause_while_a_dialog_is_open(cx: &mut TestAppContext) {
+    let (w, _) = parity::window(cx);
+    open_note(w, cx);
+    cx.simulate_keystrokes(w.into(), "secondary-4");
+    parity::settle(cx);
+    cx.simulate_keystrokes(w.into(), "secondary-k");
+    parity::settle(cx);
+    w.update(cx, |m, _, _| {
+        assert!(m.page == Page::Board, "the page behind stays put");
+        assert!(matches!(m.modal, Some(Modal::Note(_))), "search doesn't open over the dialog");
+    })
+    .unwrap();
+    cx.simulate_keystrokes(w.into(), "escape");
+    redraw(w, cx);
+    cx.simulate_keystrokes(w.into(), "secondary-4");
+    parity::settle(cx);
+    w.update(cx, |m, _, _| assert!(m.page == Page::Backlog, "once it closes, they work again")).unwrap();
+}
+
+#[gpui_kit::test]
+fn esc_closes_the_top_layer_and_keeps_the_checked_issues(cx: &mut TestAppContext) {
+    let (w, _) = parity::window(cx);
+    w.update(cx, |m, window, cx| {
+        m.page = Page::Backlog;
+        m.backlog.picked = vec!["B1".into(), "B2".into()];
+        m.menu = Some(("plan-B1".into(), point(px(0.), px(0.))));
+        m.panel = Some(crate::app::Panel::Issue { r: "B1".into() });
+        m.escape(window, cx);
+        assert!(m.menu.is_none(), "the menu closes first");
+        assert!(m.panel.is_some() && m.backlog.picked.len() == 2, "the panel and checks stay");
+        m.set_modal(Some(Modal::Note("x".into())), window, cx);
+        m.escape(window, cx);
+        assert!(m.modal.is_none() && m.panel.is_some() && m.backlog.picked.len() == 2, "then the dialog alone");
+        m.escape(window, cx);
+        assert!(m.panel.is_none() && m.backlog.picked.len() == 2, "then the panel alone");
+        m.escape(window, cx);
+        assert!(m.backlog.picked.is_empty(), "then the checks");
+    })
+    .unwrap();
+}
+
+#[test]
+fn merge_names_the_holds_it_skips() {
+    assert_eq!(super::holds(&json!({"checks": "pending", "review": "pending", "approvals": {"have": 0, "need": 1}})), ["CI, still running", "Review, 0 of 1 approvals"]);
+    assert_eq!(super::holds(&json!({"checks": "fail", "review": "changes"})), ["CI, failing", "Review, changes asked for"]);
+    assert_eq!(super::holds(&json!({"checks": "pass", "review": "pending", "approvals": {"have": 1, "need": 1}})), ["Review, not approved yet"]);
+    assert!(super::holds(&json!({"checks": "pass", "review": "approved"})).is_empty());
+}
+
+#[test]
+fn a_refused_merge_says_who_refused_and_what_next() {
+    assert_eq!(super::refuser(&json!({"host": "github"})), "GitHub");
+    assert_eq!(super::refuser(&json!({})), "The board");
+    assert_eq!(
+        super::refused_lines("GitHub", "The branch is 3 commits behind main."),
+        ("GitHub says the branch is behind main.".to_string(), "The agent can rebase it on main and merge again.".to_string())
+    );
+    assert_eq!(
+        super::refused_lines("GitHub", "PR #944 can't merge: it conflicts with its base branch develop. Rebase onto it."),
+        ("GitHub says the branch conflicts with develop.".to_string(), "The agent can rebase it on develop and merge again.".to_string())
+    );
+    assert_eq!(super::refused_lines("GitHub", "Head branch is out of date.").0, "GitHub says the branch is behind its base.");
+    assert_eq!(super::refused_lines("The board", "Not allowed."), ("The board refused the merge.".to_string(), "Not allowed.".to_string()));
+    assert_eq!(super::refusal("Not allowed."), None, "no rebase button for a refusal a rebase doesn't fix");
+}
+
+#[gpui_kit::test]
+fn ask_the_agent_to_rebase_sends_it_and_closes(cx: &mut TestAppContext) {
+    let (w, rec) = parity::window(cx);
+    let pr = taskboardd::fields!["pr_repo" => "acme/webapp", "pr_num" => 944, "pr_url" => "https://github.com/acme/webapp/pull/944", "pr_state" => "OPEN"];
+    taskboardd::board::update_task(rec.board().app(), 2, pr).unwrap();
+    let why = "The branch is 3 commits behind main.";
+    w.update(cx, |m, _, cx| {
+        m.modal = Some(Modal::Finish(Finish {
+            r: "T2".into(),
+            ask: Ask::Merge,
+            note: None,
+            busy: false,
+            refused: Some(Refused { why: why.into(), at: "3:16 PM".into(), asking: false }),
+        }));
+        super::ask_rebase(m, cx);
+        assert!(matches!(&m.modal, Some(Modal::Finish(f)) if f.refused.as_ref().is_some_and(|r| r.asking)), "the button says it's asking");
+        super::ask_rebase(m, cx);
+    })
+    .unwrap();
+    parity::settle(cx);
+    assert_eq!(rec.posts(), [("tasks/T2/pr/rebase".to_string(), json!({"why": why}))], "sent once");
+    w.update(cx, |m, _, _| {
+        assert!(m.modal.is_none(), "the dialog closes");
+        assert_eq!(m.toasts.first().map(|t| t.text.as_str()), Some("Asked T2's agent to rebase"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_merge_dialog_holds_its_answer_until_closed(cx: &mut TestAppContext) {
+    let (w, _) = parity::window(cx);
+    let refused = Refused { why: "The branch is 3 commits behind main.".into(), at: "3:16 PM".into(), asking: false };
+    w.update(cx, |m, _, _| {
+        m.modal = Some(Modal::Finish(Finish { r: "T2".into(), ask: Ask::Merge, note: None, busy: true, refused: None }));
+    })
+    .unwrap();
+    redraw(w, cx);
+    w.update(cx, |m, _, _| assert!(matches!(&m.modal, Some(Modal::Finish(f)) if f.busy), "merging, the dialog stays")).unwrap();
+    w.update(cx, |m, _, _| {
+        if let Some(Modal::Finish(f)) = &mut m.modal {
+            f.busy = false;
+            f.refused = Some(refused.clone());
+        }
+    })
+    .unwrap();
+    redraw(w, cx);
+    redraw(w, cx);
+    w.update(cx, |m, _, _| assert!(matches!(&m.modal, Some(Modal::Finish(f)) if f.refused.as_ref() == Some(&refused)), "a refusal stays on screen")).unwrap();
+    cx.simulate_keystrokes(w.into(), "escape");
+    parity::settle(cx);
+    w.update(cx, |m, _, _| assert!(m.modal.is_none(), "esc closes it")).unwrap();
+}
+
+#[gpui_kit::test]
+fn closing_the_confirm_while_it_works_still_shows_the_answer(cx: &mut TestAppContext) {
+    let (w, rec) = parity::window(cx);
+    w.update(cx, |m, _, cx| m.open_link("taskboard://task/T2?do=done", cx)).unwrap();
+    parity::settle(cx);
+    w.update(cx, |m, _, cx| {
+        confirm_finish(m, cx);
+        m.modal = None;
+    })
+    .unwrap();
+    parity::settle(cx);
+    assert_eq!(rec.posts().iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(), ["tasks/T2/done"]);
+    w.update(cx, |m, _, _| assert_eq!(m.toasts.first().map(|t| t.text.as_str()), Some("Marked T2 done"), "a toast says what happened")).unwrap();
+}
+
+#[test]
+fn each_confirm_says_what_it_skips() {
+    assert!(super::what_it_does(Ask::Done).contains("without waiting for its agent"));
+    assert!(super::what_it_does(Ask::Cancel).contains("cancelled by you"));
+    assert!(super::what_it_does(Ask::Merge).contains("past its checks and reviews"));
+}
+
+fn drawn(cx: &mut gpui_kit::VisualTestContext) -> (gpui_kit::Bounds<gpui_kit::Pixels>, gpui_kit::Bounds<gpui_kit::Pixels>) {
+    for _ in 0..2 {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+    }
+    (cx.debug_bounds("modal-box").expect("the dialog is drawn"), cx.debug_bounds("modal-body").expect("its wrapper is drawn"))
+}
+
+#[gpui_kit::test]
+fn a_short_dialog_is_as_tall_as_its_content(cx: &mut TestAppContext) {
+    use gpui_kit::{VisualTestContext, px, size};
+    let (w, _) = parity::window(cx);
+    w.update(cx, |m, _, cx| m.open_link("taskboard://task/T2?do=done", cx)).unwrap();
+    parity::settle(cx);
+    let cx = &mut VisualTestContext::from_window(w.into(), cx);
+    cx.simulate_resize(size(px(1200.), px(900.)));
+    let (dialog, body) = drawn(cx);
+    assert_eq!(dialog.size.height, body.size.height, "nothing is cut off its bottom padding");
+}
+
+#[gpui_kit::test]
+fn a_tall_dialog_stops_at_nine_tenths_of_the_window(cx: &mut TestAppContext) {
+    use gpui_kit::{VisualTestContext, px, size};
+    let (w, _) = parity::window(cx);
+    w.update(cx, |m, window, cx| {
+        let long: Vec<String> = (0..60).map(|i| format!("{i}. Open T{i} and check it starts.")).collect();
+        m.set_modal(Some(Modal::Note(long.join("\n\n"))), window, cx);
+    })
+    .unwrap();
+    parity::settle(cx);
+    let cx = &mut VisualTestContext::from_window(w.into(), cx);
+    cx.simulate_resize(size(px(1200.), px(500.)));
+    let (dialog, _) = drawn(cx);
+    assert_eq!(dialog.size.height, px(450.), "the list scrolls inside a dialog capped by the window");
+}
+
+#[gpui_kit::test]
+fn tab_and_return_open_a_page_from_the_sidebar(cx: &mut TestAppContext) {
+    let (w, _) = parity::window(cx);
+    redraw(w, cx);
+    w.update(cx, |m, window, cx| window.focus(&m.focus, cx)).unwrap();
+    // The sidebar's search box, Needs you, then Projects.
+    for _ in 0..3 {
+        cx.simulate_keystrokes(w.into(), "tab");
+        redraw(w, cx);
+    }
+    // GPUI clicks the focused element when Return comes back up, and simulated keystrokes only go down.
+    let key = gpui_kit::Keystroke::parse("enter").unwrap();
+    cx.update_window(w.into(), |_, window, cx| {
+        window.dispatch_event(gpui_kit::KeyDownEvent { keystroke: key.clone(), is_held: false, prefer_character_input: false }.to_platform_input(), cx);
+        window.dispatch_event(gpui_kit::KeyUpEvent { keystroke: key }.to_platform_input(), cx);
+    })
+    .unwrap();
+    parity::settle(cx);
+    w.update(cx, |m, _, _| assert!(m.page == Page::Projects, "return opens the sidebar row Tab reached, not {:?}", m.page)).unwrap();
 }

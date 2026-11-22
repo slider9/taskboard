@@ -1,5 +1,6 @@
 //! What Needs you shows, worked out from its items: the four groups, one row per goal in each, what
-//! each row finishes with, what its Later and More menus offer, and the Later line.
+//! each row finishes with, what its Later and More menus offer, the ideas waiting on the owner,
+//! and the Later line.
 use super::{Act, Ask, Sev};
 use crate::fmt::{self, arr, b, opt_s, s};
 use chrono::{Datelike, Days, Months, NaiveDate};
@@ -265,12 +266,13 @@ pub enum Note {
 }
 
 impl Note {
-    pub fn label(self) -> &'static str {
+    /// The note box's name: what it holds.
+    pub fn name(self) -> &'static str {
         match self {
-            Note::Done => "Done",
-            Note::CantDo => "Can't do this",
-            Note::NotNeeded => "Not needed",
-            Note::WaitingOn => "Waiting on someone",
+            Note::Done => "Note for the agents",
+            Note::CantDo => "Why you can't do this",
+            Note::NotNeeded => "Why it isn't needed",
+            Note::WaitingOn => "Who you're waiting on",
         }
     }
 
@@ -283,6 +285,20 @@ impl Note {
             Note::WaitingOn => "It comes back on that day",
         }
     }
+
+    /// The toast once human task `r`'s answer is in, with its Undo when it has one: Done is taken
+    /// back by reopening it.
+    pub fn sent(self, r: &str) -> (String, Option<String>) {
+        match self {
+            Note::Done => (format!("Marked {r} done"), Some(format!("tasks/{r}/owner-reopen"))),
+            _ => (self.said().to_string(), None),
+        }
+    }
+}
+
+/// Don't wait for me on human task `r`: its toast and the Undo that waits for it again.
+pub fn dont_wait_sent(r: &str) -> (String, Option<String>) {
+    ("The work goes on without you".to_string(), Some(format!("tasks/{r}/owner-wait")))
 }
 
 /// The post that sends a human task's note: its path and body. None while Waiting on someone has no date.
@@ -309,6 +325,8 @@ pub enum Do {
     TalkTask(String),
     TalkAlert(String),
     MakeTask(String),
+    /// Every miss of a goal at once: one batch, so all of them become tasks or none do.
+    MakeAll(Vec<String>),
     WontDo(String),
     Ticket(String),
     FinishWithout(String),
@@ -391,9 +409,14 @@ pub fn more_vm(a: &Ask, jira: bool) -> Vec<Entry> {
             if a.dismiss {
                 rest.push(Entry::Item("Dismiss", Do::Dismiss(a.id.clone())));
             }
+        } else if let Some(r) = task_ref(a) {
+            rest.push(Entry::Item("Talk it over", Do::TalkTask(r)));
         }
     }
     if let Some((g, _)) = &a.goal {
+        if !matches!(&a.act, Some(Act::OpenGoal(x)) if x == g) {
+            rest.push(Entry::Item("Open goal", Do::Act(Act::OpenGoal(g.clone()))));
+        }
         rest.extend(goal_entries(g));
     }
     if !top.is_empty() && !rest.is_empty() {
@@ -518,6 +541,35 @@ pub fn later_vm(home: &Value, project: &str) -> Option<LaterLine> {
     Some(LaterLine { text, items: shown.iter().map(|i| later_item(i)).collect(), waiting })
 }
 
+/// An idea a dig left waiting on the owner: its open questions, or a report that says it fits.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdeaRow {
+    /// "I3"
+    pub r: String,
+    pub title: String,
+    /// The verdict's pill: (label, tone).
+    pub pill: Option<(&'static str, &'static str)>,
+    /// "1 question · 5:52 PM", "Ready to plan · Oct 7"
+    pub note: String,
+}
+
+/// The ideas group's rows, for the project shown.
+pub fn ideas_vm(home: &Value, project: &str) -> Vec<IdeaRow> {
+    arr(home, "ideas")
+        .iter()
+        .filter(|i| in_project(i, project))
+        .map(|i| {
+            let wait = match fmt::i(i, "questions") {
+                0 => "Ready to plan".to_string(),
+                n => fmt::plural(n, "question", "questions"),
+            };
+            let at = fmt::hhmm(s(i, "at"));
+            let note = if at.is_empty() { wait } else { format!("{wait} · {at}") };
+            IdeaRow { r: s(i, "ref").to_string(), title: s(i, "title").to_string(), pill: crate::ui::ideas::verdict_pill(&i["verdict"]), note }
+        })
+        .collect()
+}
+
 /// The header's line, which says so when no agent waits.
 pub fn waiting_line(n: usize) -> String {
     match n {
@@ -615,7 +667,7 @@ mod tests {
         assert_eq!(g.kids[1].title, "Two title");
         assert_eq!(g.kids[1].id, "task:T9", "Later puts the one task off");
         assert_eq!(finish_vm(&g.kids[1]), vec![("Restart".to_string(), Do::Act(Act::Restart("T9".into())))]);
-        assert_eq!(labels(&more_vm(&g.kids[1], false)), vec!["Mark done", "Cancel task", "—", "Pause goal", "Set goal aside"]);
+        assert_eq!(labels(&more_vm(&g.kids[1], false)), vec!["Mark done", "Cancel task", "—", "Talk it over", "Open goal", "Pause goal", "Set goal aside"]);
     }
 
     #[test]
@@ -624,7 +676,7 @@ mod tests {
         assert_eq!(finish_vm(&a), vec![("Done".to_string(), Do::Done("H1".into()))]);
         assert_eq!(
             labels(&more_vm(&a, false)),
-            vec!["Can't do this", "Waiting on someone", "Don't wait for me", "Not needed", "—", "Talk it over", "Pause goal", "Set goal aside"]
+            vec!["Can't do this", "Waiting on someone", "Don't wait for me", "Not needed", "—", "Talk it over", "Open goal", "Pause goal", "Set goal aside"]
         );
         assert_eq!(a.holds.label(), "Holds 1 task");
         assert_eq!(labels(&more_vm(&ask_vm(&todo("H2", None, json!([]))), false)).last(), Some(&"Talk it over"), "no goal, no goal items");
@@ -635,7 +687,7 @@ mod tests {
         let a = ask_vm(&miss(3, "G1"));
         let labels_on_row: Vec<String> = finish_vm(&a).into_iter().map(|(l, _)| l).collect();
         assert_eq!(labels_on_row, vec!["Make it a task", "Won’t do"]);
-        assert_eq!(labels(&more_vm(&a, true)), vec!["Create ticket", "Finish the goal without it", "—", "Pause goal", "Set goal aside"]);
+        assert_eq!(labels(&more_vm(&a, true)), vec!["Create ticket", "Finish the goal without it", "—", "Open goal", "Pause goal", "Set goal aside"]);
         assert_eq!(labels(&more_vm(&a, false))[0], "Finish the goal without it", "no Jira, no ticket");
         assert_eq!(a.holds.label(), "Holds the goal");
         assert_eq!(tag_of(&a, false).as_deref(), Some("1 missed"));
@@ -654,7 +706,7 @@ mod tests {
         let a = ask_vm(&agent("T5", "G1"));
         assert_eq!(kind_of(&a), Kind::Waiting);
         assert_eq!(finish_vm(&a), vec![("Open terminal".to_string(), Do::Act(Act::Focus("T5".into())))]);
-        assert_eq!(labels(&more_vm(&a, false)), vec!["Open task", "—", "Pause goal", "Set goal aside"]);
+        assert_eq!(labels(&more_vm(&a, false)), vec!["Open task", "—", "Talk it over", "Open goal", "Pause goal", "Set goal aside"]);
     }
 
     #[test]
@@ -672,7 +724,7 @@ mod tests {
         let a = ask_vm(&json!({"id": "task:T5", "task": "T5", "text": "", "card": card, "at": "2026-11-05T10:00:00Z", "waiting": false, "holds": {"tasks": [], "goal": null}}));
         let on_row: Vec<String> = finish_vm(&a).into_iter().map(|(l, _)| l).collect();
         assert_eq!(on_row, vec!["Mark done", "Open task"]);
-        assert_eq!(labels(&more_vm(&a, false)), vec!["Cancel task"]);
+        assert_eq!(labels(&more_vm(&a, false)), vec!["Cancel task", "—", "Talk it over"]);
     }
 
     #[test]
@@ -696,6 +748,13 @@ mod tests {
         assert_eq!(note_post("H1", Note::NotNeeded, "", None).unwrap().1["answer"], "not_needed");
         assert_eq!(note_post("H1", Note::WaitingOn, "Apple", None), None, "it needs a date");
         assert_eq!(note_post("H1", Note::WaitingOn, "Apple", Some("2026-11-12")).unwrap().1, json!({"answer": "waiting", "note": "Apple", "until": "2026-11-12"}));
+    }
+
+    #[test]
+    fn done_and_dont_wait_toasts_carry_their_undo() {
+        assert_eq!(Note::Done.sent("H4"), ("Marked H4 done".to_string(), Some("tasks/H4/owner-reopen".to_string())));
+        assert_eq!(Note::CantDo.sent("H4"), ("Told the agents you can't do this".to_string(), None));
+        assert_eq!(dont_wait_sent("H4").1.as_deref(), Some("tasks/H4/owner-wait"));
     }
 
     #[test]
@@ -728,5 +787,24 @@ mod tests {
         assert_eq!(later_note(&json!({"snoozed_goal": 3})), "Back when G3 finishes");
         assert_eq!(later_note(&json!({"snoozed_until": "2099-11-20T15:00:00Z"})), "Back Nov 20");
         assert_eq!(later_note(&json!({"snoozed_back": "x"})), "Back when you are");
+    }
+
+    #[test]
+    fn ideas_waiting_on_the_owner_say_what_they_wait_for() {
+        let home = json!({"ideas": [
+            {"id": "idea:I3", "ref": "I3", "title": "Search across projects", "project": "web", "verdict": "fits", "questions": 1, "at": "2025-10-07T12:00:00Z"},
+            {"id": "idea:I5", "ref": "I5", "title": "Offline mode", "project": "api", "verdict": "fits", "questions": 0, "at": "2025-10-07T12:00:00Z"},
+            {"id": "idea:I6", "ref": "I6", "title": "Dark sync", "project": "web", "verdict": "doesnt_fit", "questions": 2, "at": null}]});
+        let rows = ideas_vm(&home, "all");
+        let seen: Vec<_> = rows.iter().map(|r| (r.r.as_str(), r.pill, r.note.as_str())).collect();
+        assert_eq!(seen, [
+            ("I3", Some(("Fits", "up")), "1 question · Oct 7"),
+            ("I5", Some(("Fits", "up")), "Ready to plan · Oct 7"),
+            ("I6", Some(("Doesn’t fit", "muted")), "2 questions"),
+        ]);
+        assert_eq!(rows[0].title, "Search across projects");
+        let web: Vec<_> = ideas_vm(&home, "web").into_iter().map(|r| r.r).collect();
+        assert_eq!(web, ["I3", "I6"], "only the project shown");
+        assert!(ideas_vm(&json!({}), "all").is_empty(), "an older board sends none");
     }
 }

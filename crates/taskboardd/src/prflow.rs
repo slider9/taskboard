@@ -38,6 +38,9 @@ pub const IN_REVIEW: &[&str] = &["ask", "review", "rereview", "comments", "steps
 pub const IN_CODE_REVIEW: &[&str] = &["review", "rereview", "comments", "steps", "merge", "waits", "stack"];
 const FINISHED: &[&str] = &["merged", "declined"];
 const WAKE_RETRY_WAITS: [i64; 3] = [60, 300, 900];
+/// Slot claims for a task's PR work that failed in a row before the board says so (#1012): one can be a
+/// passing git hiccup, but the same failure again means every retry fails the same way.
+const CLAIM_FAILS_ALERT: i64 = 3;
 /// How long a terminal a visit opened may sit idle before its prompt reaches it (#592).
 const PROMPT_WAIT_SECS: f64 = 120.0;
 /// A merge the agent said it finished (`tb pr wait`) that's still open is brought back after each of these.
@@ -59,6 +62,7 @@ pub fn label(phase: &str) -> &str {
         "merge" => "Ready to merge",
         "waits" => "Waits on base",
         "stack" => "Waits on stack",
+        "landing" => "Merged, checks still running",
         "merged" => "Merged",
         "declined" => "Closed",
         other => other,
@@ -121,6 +125,94 @@ pub fn refuse_other_repo(app: &App, t: &Row, pr: &PrLink) -> Result<()> {
     }
 }
 
+/// Why `pr` can't finish the task: it merged at a head the checkout, still on the PR's branch, has
+/// commits on top of (and the base doesn't), so they'd never land. None when the board doesn't watch
+/// the host, the PR isn't merged, or the checkout can't say (not a git repo, another branch, a head it
+/// hasn't fetched).
+pub fn merged_early(app: &App, t: &Row, pr: &PrLink, cwd: &str) -> Option<String> {
+    if !(crate::prhost::watched(Some(&pr.host)) && app.cfg.pr.watch) {
+        return None;
+    }
+    let dir = crate::propen::dir_for(t, cwd)?;
+    let at = git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"], GIT_SECS);
+    if at.code != 0 || at.out.trim().is_empty() || at.out.trim() == "HEAD" {
+        return None;
+    }
+    let host = crate::prhost::host_for(app, &pr.host).ok()?;
+    let refr = crate::prhost::PrRef { host: pr.host.clone(), repo: pr.repo.clone(), num: pr.num, url: pr.url.clone() };
+    let rec = host.read(&refr).map_err(|e| app.info(format!("prs: couldn't read PR #{} to check it holds the branch: {e}", pr.num))).ok()?;
+    if !rec.state.eq_ignore_ascii_case("MERGED") || rec.head.is_empty() || rec.branch != at.out.trim() {
+        return None;
+    }
+    if git(&dir, &["merge-base", "--is-ancestor", &rec.head, "HEAD"], GIT_SECS).code != 0 {
+        return None;
+    }
+    let base = format!("refs/remotes/{}/{}", app.cfg.pr_body.remote, rec.base);
+    let mut range = vec!["rev-list".to_string(), format!("{}..HEAD", rec.head)];
+    if !rec.base.is_empty() && git(&dir, &["rev-parse", "--verify", "-q", &base], GIT_SECS).code == 0 {
+        range.push(format!("^{base}"));
+    }
+    let args: Vec<&str> = range.iter().map(|s| s.as_str()).collect();
+    let left = git(&dir, &args, GIT_SECS);
+    let shas: Vec<&str> = left.out.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if left.code != 0 || shas.is_empty() {
+        return None;
+    }
+    let short = |s: &str| s.chars().take(7).collect::<String>();
+    let n = shas.len();
+    let which = shas.iter().rev().take(5).map(|s| short(s)).collect::<Vec<_>>().join(", ");
+    Some(format!(
+        "PR #{} merged at {}, but {} has {n} commit{} after that ({which}{}) that the PR doesn't hold, so linking it would leave them \
+         unshipped. Open a PR for them: rebase the branch onto {}, push it, and run tb submit \"<summary>\" --pr-body <file>.",
+        pr.num,
+        short(&rec.head),
+        rec.branch,
+        if n == 1 { "" } else { "s" },
+        if n > 5 { ", …" } else { "" },
+        if rec.base.is_empty() { "the base".to_string() } else { format!("{}/{}", app.cfg.pr_body.remote, rec.base) },
+    ))
+}
+
+/// Why `tb submit --pr` can't link `pr` to `t`: the host says it was opened after `t` started, so it isn't
+/// a PR that was open before the task (the only kind `--pr` takes; the board opens the task's own at
+/// `--pr-body`). None when it predates the task, another task on the board holds it (a same-PR join), the
+/// task has no start time, or the host isn't watched or can't say.
+pub fn opened_after_start(app: &App, t: &Row, pr: &PrLink) -> Option<String> {
+    if !(crate::prhost::watched(Some(&pr.host)) && app.cfg.pr.watch) {
+        return None;
+    }
+    let started = t.s("started_at").and_then(parse_iso)?;
+    let held = app.db.q1("SELECT id FROM tasks WHERE pr_repo = ? AND pr_num = ? AND id != ?", p![pr.repo, pr.num, t.id()]).ok()?;
+    if held.is_some() {
+        return None;
+    }
+    let host = crate::prhost::host_for(app, &pr.host).ok()?;
+    let refr = crate::prhost::PrRef { host: pr.host.clone(), repo: pr.repo.clone(), num: pr.num, url: pr.url.clone() };
+    let rec = host.read(&refr).map_err(|e| app.info(format!("prs: couldn't read PR #{} to check it predates the task: {e}", pr.num))).ok()?;
+    let opened = parse_iso(&rec.created_at)?;
+    if opened <= started {
+        return None;
+    }
+    let when = |ts: f64| {
+        let d = local_dt(ts);
+        format!("{} {}", d.format("%b %-d"), twelve_hour(&d.format("%H:%M").to_string()))
+    };
+    let me = rf("task", t.id());
+    let close = match pr.host.as_str() {
+        "github" => format!("gh pr close {} -R {}", pr.num, pr.repo),
+        _ => pr.url.clone(),
+    };
+    Some(format!(
+        "PR #{} was opened {}, after {me} started ({}), so it isn't a PR from before the task: tb submit --pr only links one \
+         that was open before the task started. The board opens this task's PR: close #{} ({close}), then finish with \
+         tb submit \"<summary>\" --pr-body <file>.",
+        pr.num,
+        when(opened),
+        when(started),
+        pr.num,
+    ))
+}
+
 /// Links a PR found in an agent's report to its task (only the first one sticks; never one from
 /// another repo than the task's project).
 pub fn link_pr(app: &App, t: &Row, pr: &PrLink, who: &str) -> Result<bool> {
@@ -176,12 +268,17 @@ pub fn late_reads(app: &App) -> Result<()> {
 /// PRs held at `checks` only by a wait that has run out since (the `no_checks_after` grace, or the
 /// expected checks' wait), stepped again with their last record. The wait ends with time, not with a
 /// read: a PR a healthy feed covers isn't polled, and one with no checks sends no event, so nothing
-/// else moves it on to review. The read time (`checked_at`) stays the last read's.
+/// else moves it on to review. The read time (`checked_at`) stays the last read's. A merged PR waiting on
+/// its head's checks (`landing`) moves on to merged the same way.
 pub fn waits_over(app: &App) -> Result<()> {
-    for t in app.db.q("SELECT * FROM tasks WHERE pr_phase = 'checks' AND pr_num IS NOT NULL", p![])? {
+    for t in app.db.q("SELECT * FROM tasks WHERE pr_phase IN ('checks', 'landing') AND pr_num IS NOT NULL", p![])? {
         let f = flow(&t);
         let Some(rec) = f.get("rec").filter(|r| r.is_object()).cloned() else { continue };
-        if phase_of(app, &t, &rec) == "checks" {
+        let still = match t.st("pr_phase").as_str() {
+            "landing" => after_merge(app, &t, &rec) == "landing",
+            _ => phase_of(app, &t, &rec) == "checks",
+        };
+        if still {
             continue;
         }
         gate(app, &t, &rec)?;
@@ -251,6 +348,8 @@ pub fn card(t: &Row) -> Value {
         "phase": phase, "label": label(phase),
         "session": if waking { f.v("session") } else { Value::Null },
         "stopped": if waking { f.v("stopped") } else { Value::Null },
+        // The board ran out of merge tries: the owner's Merge anyway is what's left (#1033).
+        "gave_up": phase == "merge" && f.contains_key("merge_gave_up"),
         "failed_checks": rec.get("failed").cloned().unwrap_or(json!([])),
         "comments": rec.get("comments").cloned().unwrap_or(json!(0)),
         "open_threads": open_threads(&f, &rec).len(),
@@ -310,7 +409,7 @@ pub fn awaiting_owner(t: &Row) -> bool {
 pub fn wake_stuck(t: &Row) -> bool {
     let f = flow(t);
     WAKE.contains(&t.s("pr_phase").unwrap_or(""))
-        && (f.contains_key("wake_tries") || (t.s("pr_phase") == Some("merge") && f.contains_key("merge_gave_up")))
+        && (f.contains_key("wake_tries") || claim_stuck(&f) || (t.s("pr_phase") == Some("merge") && f.contains_key("merge_gave_up")))
 }
 
 pub fn live_job(app: &App, t: &Row) -> Result<Option<Row>> {
@@ -533,13 +632,17 @@ fn wake_key(phase: &str, rec: &Value) -> String {
     if phase != "merge" {
         return key;
     }
-    // A change in the reviews or the builds wakes the merge again.
+    // A change in the reviews, the builds or the branch it merges into wakes the merge again.
     let mut builds: Vec<String> = rec["checks"]
         .as_array()
         .map(|a| a.iter().map(|c| format!("{}={}", c["name"].as_str().unwrap_or(""), c["state"].as_str().unwrap_or(""))).collect())
         .unwrap_or_default();
     builds.sort();
-    format!("{key}:{}:{}:{}", rec["review_decision"].as_str().unwrap_or(""), rec["approvals"].as_i64().unwrap_or(0), builds.join(","))
+    let key = format!("{key}:{}:{}:{}", rec["review_decision"].as_str().unwrap_or(""), rec["approvals"].as_i64().unwrap_or(0), builds.join(","));
+    match rec["base"].as_str().filter(|b| !b.is_empty()) {
+        Some(base) => format!("{key}:{base}"),
+        None => key,
+    }
 }
 
 fn since_handled(f: &Row) -> f64 {
@@ -568,6 +671,21 @@ fn reread_by(f: &Row, at: Option<f64>) -> Option<(&'static str, Value)> {
     let at = at.filter(|a| *a > now_ts())?;
     let set = f.s("reread_at").and_then(parse_iso).filter(|r| *r > now_ts());
     set.is_none_or(|r| r > at).then(|| ("reread_at", json!(iso(at))))
+}
+
+/// The task's stacking changed (`tb task set --stack-on|--stack-merge`): a merge visit that ended with the
+/// PR still open, part way through its retries or past them, starts over with fresh tries, and the PR is
+/// read again now rather than at the next poll. What refused it may be what changed (#1033).
+pub fn merge_setup_changed(app: &App, id: i64, who: &str) -> Result<()> {
+    let t = board::get_task(app, id)?;
+    let f = flow(&t);
+    let spent = f.contains_key("handled") || f.contains_key("merge_tries") || f.contains_key("merge_gave_up");
+    if t.s("pr_phase") != Some("merge") || t.s("status") != Some("done") || f.contains_key("woke") || !spent {
+        return Ok(());
+    }
+    merge_flow(app, id, fields!["handled" => null, "merge_tries" => null, "merge_gave_up" => null, "merge_refused" => null, "reread_at" => now_iso()])?;
+    board::log_event(app, id, who, "status", &format!("PR #{}: its stack changed, so the board tries to merge it again", t.i0("pr_num")))?;
+    Ok(())
 }
 
 /// `tb pr merge` refused this PR (or its host wouldn't merge it): kept with its head for the alert raised
@@ -836,13 +954,10 @@ fn resume_or_fresh(app: &App, t: &Row, mut args: Value) -> Result<Value> {
 /// Where PR follow-up work runs. A task that worked in a slot claims one again, on its pushed
 /// branch; while the pool is full there's nowhere yet, and the next wake tries again.
 pub(crate) fn pr_cwd(app: &App, t: &Row) -> Result<Option<String>> {
-    match crate::slots::reclaim(app, t) {
+    match reclaim_for_pr(app, t)? {
         Ok(Some(path)) => return Ok(Some(path)),
         Ok(None) => {}
-        Err(e) => {
-            app.info(format!("worktrees: {} has no slot for its PR work yet: {}", rf("task", t.id()), e.message));
-            return Ok(None);
-        }
+        Err(()) => return Ok(None),
     }
     let ctx = board::task_context(t);
     let wt = ctx.get("where").and_then(|w| w.get("worktree")).and_then(|v| v.as_str()).filter(|w| Path::new(w).is_dir()).map(|s| s.to_string());
@@ -850,6 +965,96 @@ pub(crate) fn pr_cwd(app: &App, t: &Row) -> Result<Option<String>> {
         Some(w) => Some(w),
         None => runner::task_cwd(app, t)?,
     })
+}
+
+/// `slots::reclaim` for PR work, keeping count of the claims that failed in a row (`claim_fails`, with
+/// the last `claim_error`). The third says so once, in the task's log and as an alert, since nothing
+/// runs on the PR meanwhile while its stage still reads as under way (#1012); the claim that works
+/// again clears them. A full pool isn't a failure: the task waits its turn. `Err(())` when there's no
+/// slot for it yet.
+fn reclaim_for_pr(app: &App, t: &Row) -> Result<std::result::Result<Option<String>, ()>> {
+    match crate::slots::reclaim(app, t) {
+        Ok(path) => {
+            if path.is_some() {
+                claim_worked(app, t.id())?;
+            }
+            Ok(Ok(path))
+        }
+        Err(e) => {
+            app.info(format!("worktrees: {} has no slot for its PR work yet: {}", rf("task", t.id()), e.message));
+            if e.message != crate::slots::WAIT {
+                claim_failed(app, t.id(), &e.message)?;
+            }
+            Ok(Err(()))
+        }
+    }
+}
+
+fn claim_alert_key(id: i64) -> String {
+    format!("slot-claim:{}", rf("task", id))
+}
+
+pub fn is_claim_alert_key(key: &str) -> bool {
+    key.starts_with("slot-claim:")
+}
+
+/// The task's PR work has failed to get its slot often enough in a row to say so.
+fn claim_stuck(f: &Row) -> bool {
+    f.i0("claim_fails") >= CLAIM_FAILS_ALERT
+}
+
+fn claim_failed(app: &App, id: i64, why: &str) -> Result<()> {
+    let t = board::get_task(app, id)?;
+    let tries = flow(&t).i0("claim_fails") + 1;
+    let why = one_line(why, 300);
+    let why = why.trim_end_matches(['.', ' ']);
+    merge_flow(app, id, fields!["claim_fails" => tries, "claim_error" => why])?;
+    if tries != CLAIM_FAILS_ALERT {
+        return Ok(());
+    }
+    let (num, task) = (t.i0("pr_num"), rf("task", id));
+    let stage = t.s("pr_phase").map(|p| format!(" PR #{num} reads “{}”, but", label(p))).unwrap_or_default();
+    board::log_event(
+        app,
+        id,
+        board::BOARD,
+        "status",
+        &format!("Couldn't get a worktree slot for PR #{num}'s work after {tries} tries: {why}.{stage} nothing runs on it until a claim works. The board keeps trying."),
+    )?;
+    let text = format!(
+        "{task} couldn't get a worktree slot for PR #{num}'s work after {tries} tries: {why}. Nothing runs on the PR until a claim works; the board keeps trying."
+    );
+    let fields = json!({
+        "title": format!("PR #{num} can't get a worktree slot for its work"),
+        "detail": why,
+        "project": t.v("project"),
+        "actions": [dispatch::AlertAction {
+            label: "Claim its slot".into(),
+            prompt: format!("Run `tb slot claim --task {task}` and fix what stops it, so the board can start PR #{num}'s work in that slot."),
+            command: format!("tb slot claim --task {task}"),
+        }.json()],
+    });
+    dispatch::add_alert_keyed_with(app, &text, Some(id), t.i("goal_id"), &claim_alert_key(id), fields)
+}
+
+fn claim_worked(app: &App, id: i64) -> Result<()> {
+    let t = board::get_task(app, id)?;
+    let f = flow(&t);
+    if !f.contains_key("claim_fails") {
+        return Ok(());
+    }
+    merge_flow(app, id, fields!["claim_fails" => null, "claim_error" => null])?;
+    if claim_stuck(&f) {
+        dispatch::clear_alert_key(app, &claim_alert_key(id))?;
+        board::log_event(app, id, board::BOARD, "status", &format!("Got a worktree slot for PR #{}'s work again", t.i0("pr_num")))?;
+    }
+    Ok(())
+}
+
+/// A `slot-claim:T<n>` alert holds while its task's PR work still can't get a slot.
+pub fn claim_alert_resolved(app: &App, a: &Value) -> Result<bool> {
+    let Some(t) = board::find_task(app, a["task_id"].as_i64())? else { return Ok(true) };
+    Ok(t.s("status") != Some("done") || !claim_stuck(&flow(&t)))
 }
 
 /// What a wake that had to wait for its slot does once the claim is made. A follow-up or a note ask
@@ -899,8 +1104,7 @@ fn claim_later(app: &App, id: i64, again: Again) {
 
 fn claimed_then(app: &App, id: i64, again: Again) -> Result<()> {
     let t = board::get_task(app, id)?;
-    if let Err(e) = crate::slots::reclaim(app, &t) {
-        app.info(format!("worktrees: {} has no slot for its PR work yet: {}", rf("task", id), e.message));
+    if reclaim_for_pr(app, &t)?.is_err() {
         return Ok(());
     }
     let t = board::get_task(app, id)?;
@@ -1193,7 +1397,7 @@ fn follow_up(app: &App, t: &Row, slot: &Row, left: &Leftovers, branch: &str) -> 
     board::get_task(app, id)
 }
 
-fn short_sha(sha: &str) -> &str {
+pub fn short_sha(sha: &str) -> &str {
     &sha[..sha.len().min(10)]
 }
 
@@ -1242,19 +1446,28 @@ pub fn refresh_task(app: &App, id: i64) -> Result<std::result::Result<Value, Str
         Ok(r) => r,
         Err(e) => return Ok(Err(e)),
     };
-    apply(app, id, &rec)?;
-    Ok(Ok(rec))
+    Ok(Ok(apply(app, id, &rec)?))
 }
 
-/// Steps one task's PR with a record, as a read of it would.
-pub fn apply(app: &App, id: i64, rec: &Value) -> Result<()> {
+/// The host's record with what Azure DevOps says about the expected checks the host hasn't shown yet
+/// (`azure_checks.rs`): asked, when due, then folded in as checks.
+pub fn with_azure(app: &App, id: i64, rec: &Value) -> Result<Value> {
+    crate::azure_checks::note(app, &board::get_task(app, id)?, rec)?;
+    Ok(crate::azure_checks::fold(&board::get_task(app, id)?, rec))
+}
+
+/// Steps one task's PR with a record, as a read of it would. The record it stepped with: the host's,
+/// with Azure DevOps' builds of its head folded in ([`with_azure`]).
+pub fn apply(app: &App, id: i64, rec: &Value) -> Result<Value> {
+    let rec = &with_azure(app, id, rec)?;
     let t = board::get_task(app, id)?;
     note_expected(app, &t, rec)?;
+    note_stages(app, &board::get_task(app, id)?, rec, false)?;
     let t = board::get_task(app, id)?;
     gate(app, &t, rec)?;
     let t = board::get_task(app, id)?;
     app.db.tx(|| step(app, &t, rec))?;
-    Ok(())
+    Ok(rec.clone())
 }
 
 /// A stream pr event, stepped as the PR's state without reading its host (stream mode). A partial one
@@ -1275,9 +1488,7 @@ pub fn apply_event(app: &App, id: i64, ev: &Value) -> Result<Option<Value>> {
             _ => return Ok(None),
         }
     }
-    let rec = rec.to_value();
-    apply(app, id, &rec)?;
-    Ok(Some(rec))
+    Ok(Some(apply(app, id, &rec.to_value())?))
 }
 
 fn str_list(v: &Value) -> Vec<String> {
@@ -1327,13 +1538,192 @@ fn not_ours_card(f: &Row, rec: &Value) -> Value {
     n
 }
 
-/// The failed checks that still count: those the board didn't stop itself ([`board_stopped`]) and
-/// `tb pr not-ours` didn't clear for this push. The one verdict the stage, the card, `tb pr merge`,
-/// `tb pr status` and `tb pr skip-checks` all go by.
-pub fn failing(app: &App, f: &Row, rec: &Value) -> Vec<String> {
+/// The failed checks that still count: those the board didn't stop itself ([`board_stopped`]),
+/// `tb pr not-ours` didn't clear for this push, and the project's required checks don't leave out
+/// ([`not_required`]). The one verdict the stage, the card, `tb pr merge`, `tb pr status` and `tb pr
+/// skip-checks` all go by.
+pub fn failing(app: &App, t: &Row, f: &Row, rec: &Value) -> Vec<String> {
     let cleared = str_list(&not_ours(f, rec)["checks"]);
     let stopped = board_stopped(app, f, rec);
-    str_list(&rec["failed"]).into_iter().filter(|c| !cleared.iter().chain(&stopped).any(|x| x.eq_ignore_ascii_case(c))).collect()
+    let optional = not_required(app, t, f, rec);
+    str_list(&rec["failed"]).into_iter().filter(|c| !cleared.iter().chain(&stopped).chain(&optional).any(|x| x.eq_ignore_ascii_case(c))).collect()
+}
+
+/// The project's required checks, stages and jobs (`tb project set --required-check`), or none.
+fn required(app: &App, t: &Row) -> Vec<String> {
+    crate::projects::pr_rules(app, t.s("project")).required.unwrap_or_default()
+}
+
+/// The required names that aren't a check on this push: stages or jobs inside a check's build.
+fn required_stages(required: &[String], rec: &Value) -> Vec<String> {
+    let posted: Vec<String> = rec["checks"].as_array().into_iter().flatten().filter_map(|c| c["name"].as_str().map(str::to_string)).collect();
+    required.iter().filter(|r| !posted.iter().any(|c| c.eq_ignore_ascii_case(r))).cloned().collect()
+}
+
+/// Failed checks that don't hold the PR because its project names what must pass (#928): a check that
+/// isn't required itself, and whose build's stages show every required stage in it passed. A check
+/// whose stages haven't been read ([`note_stages`]) or can't be still holds it, and so does one when
+/// none of the required names match anything, as a misspelt name would.
+pub fn not_required(app: &App, t: &Row, f: &Row, rec: &Value) -> Vec<String> {
+    let required = required(app, t);
+    if required.is_empty() {
+        return vec![];
+    }
+    let stages = required_stages(&required, rec);
+    let checks_named = stages.len() < required.len();
+    str_list(&rec["failed"])
+        .into_iter()
+        .filter(|c| !required.iter().any(|r| r.eq_ignore_ascii_case(c)))
+        .filter(|c| !stages_hold(&stages, checks_named, stages_of(f, rec, c).as_deref()))
+        .collect()
+}
+
+/// Whether a failed check that isn't required holds the PR by its build's stages: a required stage in
+/// it didn't pass, or it can't tell.
+fn stages_hold(required: &[String], checks_named: bool, stages: Option<&[crate::prhost::ci::Stage]>) -> bool {
+    if required.is_empty() {
+        return false;
+    }
+    let Some(stages) = stages else { return true };
+    let found = |r: &String, failed: bool| stages.iter().any(|s| s.name.eq_ignore_ascii_case(r) && (!failed || !s.passed()));
+    if required.iter().any(|r| found(r, true)) {
+        return true;
+    }
+    !checks_named && !required.iter().any(|r| found(r, false))
+}
+
+/// A failed check's stages and jobs on this push, as [`note_stages`] read them; None when they
+/// haven't been read or couldn't be.
+pub fn stages_of(f: &Row, rec: &Value, check: &str) -> Option<Vec<crate::prhost::ci::Stage>> {
+    let head = rec["head"].as_str().filter(|h| !h.is_empty())?;
+    let by_check = f.get("stages_by_head")?.get(head)?.as_object()?;
+    let entry = by_check.iter().find(|(c, _)| c.eq_ignore_ascii_case(check))?.1;
+    Some(entry["stages"].as_array()?.iter().filter_map(crate::prhost::ci::Stage::from_json).collect())
+}
+
+/// How long a stage read that failed waits before it's tried again.
+const STAGES_RETRY_SECS: f64 = 15.0 * 60.0;
+
+/// Reads the stages and jobs of this push's failed checks from their CI and keeps them in the flow
+/// (`stages_by_head`, this head's only): for the project's required stages ([`not_required`]), or,
+/// with `for_alert`, to name what holds an approved PR ([`held_alerts`]). Outside any transaction: it
+/// asks the CI. A check read before isn't read again; one whose read failed is, after a while.
+pub fn note_stages(app: &App, t: &Row, rec: &Value, for_alert: bool) -> Result<()> {
+    let head = rec["head"].as_str().unwrap_or("");
+    let Some(pr) = crate::prhost::PrRef::of(t) else { return Ok(()) };
+    let required = required(app, t);
+    if head.is_empty() || (required_stages(&required, rec).is_empty() && !for_alert) {
+        return Ok(());
+    }
+    let f = flow(t);
+    let known = f.get("stages_by_head").and_then(|m| m.get(head)).cloned().unwrap_or(json!({}));
+    let fresh = |c: &str| {
+        known.as_object().into_iter().flatten().find(|(k, _)| k.eq_ignore_ascii_case(c)).is_some_and(|(_, e)| {
+            e["stages"].is_array() || e["at"].as_str().and_then(parse_iso).is_some_and(|at| now_ts() - at < STAGES_RETRY_SECS)
+        })
+    };
+    let cleared = str_list(&not_ours(&f, rec)["checks"]);
+    let stopped = board_stopped(app, &f, rec);
+    let skip = |c: &String| cleared.iter().chain(&stopped).any(|x| x.eq_ignore_ascii_case(c)) || (!for_alert && required.iter().any(|r| r.eq_ignore_ascii_case(c)));
+    let want: Vec<String> = str_list(&rec["failed"]).into_iter().filter(|c| !skip(c) && !fresh(c)).collect();
+    if want.is_empty() {
+        return Ok(());
+    }
+    let rules = crate::projects::pr_rules(app, t.s("project"));
+    let mut read = serde_json::Map::new();
+    for name in want {
+        let check = rec["checks"].as_array().into_iter().flatten().find(|c| c["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(&name)));
+        let check = check.and_then(|c| serde_json::from_value::<crate::prhost::Check>(c.clone()).ok());
+        let entry = match check.map(|c| (crate::prhost::ci::provider_for(app, &rules, &c), c)) {
+            None => json!({"error": "the check isn't on the push's record", "at": now_iso()}),
+            Some((Ok(Some(ci)), c)) => match ci.stages(&pr, head, &c) {
+                Ok(Some(list)) => json!({"stages": list.iter().map(|s| s.json()).collect::<Vec<_>>(), "at": now_iso()}),
+                Ok(None) => json!({"error": format!("{} can't list a build's stages", ci.name()), "at": now_iso()}),
+                Err(e) => json!({"error": e, "at": now_iso()}),
+            },
+            Some((Ok(None), _)) => json!({"error": "the board can't read this check's CI", "at": now_iso()}),
+            Some((Err(e), _)) => json!({"error": e, "at": now_iso()}),
+        };
+        read.insert(name, entry);
+    }
+    app.db.tx(|| {
+        let f = flow(&board::get_task(app, t.id())?);
+        let mut entries = f.get("stages_by_head").and_then(|m| m.get(head)).and_then(|v| v.as_object()).cloned().unwrap_or_default();
+        entries.extend(read.clone());
+        merge_flow(app, t.id(), fields!["stages_by_head" => json!({head: Value::Object(entries)})]).map(|_| ())
+    })
+}
+
+/// How long an approved PR may be held by failed checks before the owner hears (#928).
+pub const HELD_ALERT_SECS: f64 = 24.0 * 3600.0;
+
+/// Approved PRs held by failed checks for over a day ([`HELD_ALERT_SECS`]): the owner hears once per
+/// push, with the failed checks and stages, and the two ways on: rebase and push (a new build) or
+/// merge past them with `tb pr merge --override`. The hold is timed from the first time this sees it
+/// on the push (`held`).
+pub fn held_alerts(app: &App) -> Result<()> {
+    for t in app.db.q("SELECT * FROM tasks WHERE pr_phase = 'fix' AND pr_num IS NOT NULL", p![])? {
+        let f = flow(&t);
+        let Some(rec) = f.get("rec").filter(|r| r.is_object()).cloned() else { continue };
+        let head = rec["head"].as_str().unwrap_or("").to_string();
+        if head.is_empty() || !held_approved(app, &t, &f, &rec) {
+            continue;
+        }
+        let since = f.get("held").filter(|h| h["head"] == head.as_str()).and_then(|h| h["at"].as_str()).and_then(parse_iso);
+        let Some(since) = since else {
+            app.db.tx(|| merge_flow(app, t.id(), fields!["held" => json!({"head": head, "at": now_iso()})]).map(|_| ()))?;
+            continue;
+        };
+        if now_ts() - since < HELD_ALERT_SECS || f.s("held_alerted") == Some(head.as_str()) {
+            continue;
+        }
+        note_stages(app, &t, &rec, true)?;
+        let t = board::get_task(app, t.id())?;
+        app.db.tx(|| held_alert(app, &t, &rec, since))?;
+    }
+    Ok(())
+}
+
+/// The PR's review lets it merge, and only failed checks hold it.
+fn held_approved(app: &App, t: &Row, f: &Row, rec: &Value) -> bool {
+    let open = rec["state"].as_str().unwrap_or("OPEN").eq_ignore_ascii_case("OPEN");
+    let review = review_of(f, rec);
+    open && !review.changes && (review_skipped(app, t, f, rec) || approved(app, t, &review)) && !skip_hides_failures(f, rec) && !failing(app, t, f, rec).is_empty()
+}
+
+fn held_alert(app: &App, t: &Row, rec: &Value, since: f64) -> Result<()> {
+    let f = flow(t);
+    let head = rec["head"].as_str().unwrap_or("");
+    let failed = failing(app, t, &f, rec);
+    let what: Vec<String> = failed
+        .iter()
+        .map(|c| match stages_of(&f, rec, c).map(|s| s.into_iter().filter(|s| !s.passed()).map(|s| s.line()).collect::<Vec<_>>()) {
+            Some(bad) if !bad.is_empty() => format!("{c} ({})", bad.join("; ")),
+            _ => c.clone(),
+        })
+        .collect();
+    let (num, task) = (t.i0("pr_num"), rf("task", t.id()));
+    let base = rec["base"].as_str().filter(|b| !b.is_empty()).unwrap_or("its base branch");
+    let days = ((now_ts() - since) / 86400.0).floor().max(1.0) as i64;
+    let text = format!(
+        "PR #{num} for {task} is approved but failed checks have held it for {days} day{}: {}. Rebase it onto {base} and push to start a new build, or merge it past them with tb pr merge {task} --override.",
+        if days == 1 { "" } else { "s" },
+        what.join(", "),
+    );
+    let action = |label: &str, prompt: String, command: String| dispatch::AlertAction { label: label.into(), prompt, command }.json();
+    let fields = json!({
+        "title": format!("PR #{num} is approved but held by failed checks"),
+        "detail": what.join(", "),
+        "project": t.v("project"),
+        "actions": [
+            action("Rebase and push", format!("Claim {task}'s slot with `tb slot claim --task {task}`, rebase its branch onto origin/{base} and push it, so a new build runs on PR #{num}."), format!("tb slot claim --task {task}")),
+            action("Merge anyway", format!("Run `tb pr merge {task} --override` to merge PR #{num} past its failed checks."), format!("tb pr merge {task} --override")),
+        ],
+    });
+    dispatch::add_alert_keyed_with(app, &text, Some(t.id()), t.i("goal_id"), &format!("pr-held:{}:{head}", t.id()), fields)?;
+    board::log_event(app, t.id(), "PR", "status", &format!("PR #{num} approved but held by failed checks: {}", what.join(", ")))?;
+    merge_flow(app, t.id(), fields!["held_alerted" => head])?;
+    Ok(())
 }
 
 /// The checks whose build was stopped on this push and not run again: a stopped run of a check that has
@@ -1545,16 +1935,19 @@ fn waiting_since(f: &Row, rec: &Value) -> Option<Value> {
 }
 
 /// Whether `ask` (an entry of `rereview_asks`: `tb pr addressed` asked the reviewer to look again)
-/// still stands for reviewer `r` as just read: until they review again. An approval or a comment
-/// ends it, and so does a request for changes newer than the one it answered.
+/// still stands for reviewer `r` as just read: until they review again. An approval ends it, and so
+/// does a request for changes or a comment newer than the one it answered. A comment the record gives
+/// no time for (`commented_at`: Bitbucket, older reads) ends it too, as it can't be told from a new one.
 pub fn rereview_stands(ask: &Value, r: &Value) -> bool {
+    let same = |key: &str, unknown: bool| match (ask[key].as_str().and_then(parse_iso), r[key].as_str().and_then(parse_iso)) {
+        (Some(was), Some(now)) => now <= was,
+        (None, Some(now)) => ask["at"].as_str().and_then(parse_iso).is_some_and(|at| now <= at),
+        _ => unknown,
+    };
     match r["state"].as_str().unwrap_or("") {
-        "approved" | "commented" => false,
-        "changes" => match (ask["changes_at"].as_str().and_then(parse_iso), r["changes_at"].as_str().and_then(parse_iso)) {
-            (Some(was), Some(now)) => now <= was,
-            (None, Some(now)) => ask["at"].as_str().and_then(parse_iso).is_some_and(|at| now <= at),
-            _ => true,
-        },
+        "approved" => false,
+        "commented" => same("commented_at", false),
+        "changes" => same("changes_at", true),
         _ => true,
     }
 }
@@ -1676,14 +2069,14 @@ pub fn skip_hides_failures(f: &Row, rec: &Value) -> bool {
 
 pub fn phase_of(app: &App, t: &Row, rec: &Value) -> String {
     match rec["state"].as_str().unwrap_or("OPEN").to_uppercase().as_str() {
-        "MERGED" => return "merged".into(),
+        "MERGED" => return after_merge(app, t, rec).into(),
         "CLOSED" | "DECLINED" | "SUPERSEDED" => return "declined".into(),
         _ => {}
     }
     let f = flow(t);
     // While the board's PR builds are stopped (`prbuilds.rs`), checks count as passed.
     let skipped = checks_skipped(&f, rec).is_some() || crate::prbuilds::stopped(app);
-    if !skip_hides_failures(&f, rec) && !failing(app, &f, rec).is_empty() {
+    if !skip_hides_failures(&f, rec) && !failing(app, t, &f, rec).is_empty() {
         return "fix".into();
     }
     let seen = f.i0("comments_seen");
@@ -1803,11 +2196,15 @@ pub fn expected_wait_mins(app: &App, t: &Row) -> f64 {
     crate::projects::pr_rules(app, t.s("project")).expected_wait_mins.unwrap_or(crate::config::EXPECTED_WAIT_MINS)
 }
 
-/// How long this push waits for expected checks that haven't posted: `expected_wait_mins`, or only the
-/// `no_checks_after` grace when they were learned from an earlier push (`earlier_checks`) and every check
+/// How long this push waits for expected checks that haven't posted: `expected_wait_mins`; a stacked
+/// PR whose missing checks Azure DevOps has no build for, `azure_stacked_wait_mins`
+/// (`azure_checks::stacked_wait`); or only the `no_checks_after` grace when they were learned from an earlier push (`earlier_checks`) and every check
 /// this push posted has finished, as a check that no longer runs on the PR never posts.
 pub fn missing_wait_mins(app: &App, t: &Row, rec: &Value) -> f64 {
     let full = expected_wait_mins(app, t);
+    if let Some(stacked) = expected_missing(app, t, rec).and_then(|m| crate::azure_checks::stacked_wait(app, t, rec, &m)) {
+        return stacked.min(full);
+    }
     let checks = rec["checks"].as_array().cloned().unwrap_or_default();
     let finished = !checks.is_empty() && rec["running"].as_i64().unwrap_or(0) == 0 && checks.iter().all(|c| c["state"] != "running");
     if finished && expected_for(app, t, rec).source == Some("earlier") {
@@ -1821,6 +2218,117 @@ pub fn missing_wait_mins(app: &App, t: &Row, rec: &Value) -> f64 {
 /// (the stage moves on, and `tb pr merge` doesn't wait on it).
 pub fn expected_wait_over(app: &App, t: &Row, f: &Row, rec: &Value) -> bool {
     head_waited(f, rec) >= missing_wait_mins(app, t, rec) * 60.0
+}
+
+/// The checks on the head a PR merged with that haven't finished yet (#933). Its task stays open on
+/// `landing` ("Merged, checks still running") until they do, and the owner hears if they fail: the base
+/// branch now carries that head.
+#[derive(Debug, Default, PartialEq)]
+pub struct Landing {
+    /// Still running, or expected and not posted within their wait.
+    pub pending: Vec<String>,
+    /// Failed (and not cleared with `tb pr not-ours`) or stopped.
+    pub failed: Vec<String>,
+}
+
+impl Landing {
+    pub fn settled(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+/// What the head's checks still owe a merged PR, by the merge gates' own rules: a skip (`tb pr
+/// skip-checks`, a hook) or stopped PR builds count as passed, a skip covers failures only when a
+/// hook gave it. A PR whose project posts no checks has nothing to wait for.
+pub fn landing(app: &App, t: &Row, f: &Row, rec: &Value) -> Landing {
+    let mut out = Landing::default();
+    if crate::prbuilds::stopped(app) {
+        return out;
+    }
+    if !skip_hides_failures(f, rec) {
+        out.failed = failing(app, t, f, rec);
+    }
+    if checks_skipped(f, rec).is_some() {
+        return out;
+    }
+    let checks = rec["checks"].as_array().cloned().unwrap_or_default();
+    for c in &checks {
+        let Some(name) = c["name"].as_str() else { continue };
+        let list = match c["state"].as_str() {
+            Some("running") => &mut out.pending,
+            Some("stopped") => &mut out.failed,
+            _ => continue,
+        };
+        if !list.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            list.push(name.to_string());
+        }
+    }
+    if let Some(missing) = expected_missing(app, t, rec).filter(|_| !expected_wait_over(app, t, f, rec)) {
+        for m in missing {
+            if !out.pending.iter().any(|p| p.eq_ignore_ascii_case(&m)) {
+                out.pending.push(m);
+            }
+        }
+    }
+    out
+}
+
+/// A merged PR's phase: `merged` once its head's checks have finished, else `landing`.
+fn after_merge(app: &App, t: &Row, rec: &Value) -> &'static str {
+    if landing(app, t, &flow(t), rec).settled() {
+        "merged"
+    } else {
+        "landing"
+    }
+}
+
+/// Tells the owner, once per head, that checks a PR merged before failed: the base branch now has that head.
+fn landing_alert(app: &App, t: &Row, probe: &Row, rec: &Value) -> Result<Option<Value>> {
+    let f = flow(probe);
+    let head = rec["head"].as_str().unwrap_or("");
+    let failed = landing(app, probe, &f, rec).failed;
+    if failed.is_empty() || f.s("landing_alerted") == Some(head) {
+        return Ok(None);
+    }
+    dispatch::add_alert(
+        app,
+        &format!(
+            "PR #{} for {} was merged before its checks finished, and {} failed on the merged commit {}: {} may be broken. Fix it, or clear the check with tb pr not-ours.",
+            t.i0("pr_num"),
+            rf("task", t.id()),
+            failed.join(", "),
+            short_sha(head),
+            rec["base"].as_str().filter(|b| !b.is_empty()).unwrap_or("the base branch"),
+        ),
+        Some(t.id()),
+        t.i("goal_id"),
+        None,
+        Some("pr"),
+    )?;
+    board::log_event(app, t.id(), "PR", "status", &format!("PR #{}: {} failed after the merge", t.i0("pr_num"), failed.join(", ")))?;
+    Ok(Some(json!(head)))
+}
+
+/// A push to the PR's branch the host's read doesn't show yet (#933): the project checkout's
+/// remote-tracking ref for the branch, which the agent's own `git push` moves, is at a commit the
+/// record's head doesn't build on. A host's read can lag a force-push by a few seconds, and checks
+/// judged on it are an older head's. None when the checkout can't tell, or the host's head is the
+/// newer one (a push from elsewhere).
+pub fn newer_push(app: &App, t: &Row, rec: &Value) -> Option<String> {
+    let head = rec["head"].as_str().filter(|h| !h.is_empty())?;
+    let branch = rec["branch"].as_str().filter(|b| !b.is_empty())?;
+    let repo = crate::worktrees::repo_of(app, t).ok().flatten().filter(|r| Path::new(r).is_dir())?;
+    let commit = |r: &str| {
+        let g = git(&repo, &["rev-parse", "--verify", "-q", &format!("{r}^{{commit}}")], 10.0);
+        (g.code == 0).then(|| g.out.trim().to_string()).filter(|s| !s.is_empty())
+    };
+    let pushed = commit(&format!("refs/remotes/{}/{branch}", app.cfg.pr_body.remote))?;
+    if pushed.starts_with(head) || head.starts_with(&pushed) {
+        return None;
+    }
+    let shown = commit(head)?;
+    let behind = git(&repo, &["merge-base", "--is-ancestor", &pushed, &shown], 10.0).code == 0;
+    (!behind).then_some(pushed)
 }
 
 /// The task's flow with this record's head noted (when it was first seen), as `step` will save it.
@@ -1930,7 +2438,7 @@ pub fn skip_checks(app: &App, t: &Row, reason: &str, all: bool, who: &str) -> Re
     } else {
         vec![]
     };
-    let failed: Vec<String> = failing(app, &f, &rec).into_iter().filter(|c| !stopped.contains(c)).collect();
+    let failed: Vec<String> = failing(app, t, &f, &rec).into_iter().filter(|c| !stopped.contains(c)).collect();
     if !failed.is_empty() {
         return err(
             409,
@@ -2010,19 +2518,23 @@ pub fn step(app: &App, t: &Row, rec: &Value) -> Result<bool> {
     }
     let old = t.st("pr_phase");
     // A merged PR stays merged: a stream event laid over the record from before the merge still reads open.
-    let phase = if old == "merged" { old.clone() } else { phase_of(app, &probe(t, &f), rec) };
+    let phase = match old.as_str() {
+        "merged" => old.clone(),
+        "landing" => after_merge(app, &probe(t, &f), rec).to_string(),
+        _ => phase_of(app, &probe(t, &f), rec),
+    };
     let phase_changed = phase != old;
     changes.extend(crate::prpace::note(app, t, &f, rec, &phase, phase_changed)?);
     let build = if crate::prbuilds::stopped(app) {
         "Builds stopped"
-    } else if checks_skipped(&f, rec).is_some() && (skip_hides_failures(&f, rec) || failing(app, &f, rec).is_empty()) {
+    } else if checks_skipped(&f, rec).is_some() && (skip_hides_failures(&f, rec) || failing(app, t, &f, rec).is_empty()) {
         "Checks skipped"
-    } else if !str_list(&rec["failed"]).is_empty() && failing(app, &f, rec).is_empty() {
-        "Failed, not this PR"
+    } else if !str_list(&rec["failed"]).is_empty() && failing(app, t, &f, rec).is_empty() {
+        if not_required(app, t, &f, rec).is_empty() { "Failed, not this PR" } else { "Failed, not required" }
     } else {
         build_label(rec)
     };
-    let state = if phase == "merged" { "MERGED".to_string() } else { rec["state"].as_str().unwrap_or("OPEN").to_uppercase() };
+    let state = if phase == "merged" || phase == "landing" { "MERGED".to_string() } else { rec["state"].as_str().unwrap_or("OPEN").to_uppercase() };
     let mut task_fields = fields!["pr_state" => state,
                                   "pr_build" => build, "pr_review" => review_label(&review_of(&f, rec), approvals_needed(app, t))];
     if let Some(title) = rec["title"].as_str() {
@@ -2048,6 +2560,11 @@ pub fn step(app: &App, t: &Row, rec: &Value) -> Result<bool> {
             board::log_event(app, t.id(), "PR", "status", &format!("PR #{} was closed without merging", t.i0("pr_num")))?;
         }
         task_fields.push(("pr_phase", json!(phase)));
+    }
+    if old == "landing" || phase == "landing" {
+        if let Some(alerted) = landing_alert(app, t, &probe(t, &f), rec)? {
+            changes.push(("landing_alerted", alerted));
+        }
     }
     if t.s("status") == Some("done")
         && phase == "review"
@@ -2076,8 +2593,8 @@ pub fn step(app: &App, t: &Row, rec: &Value) -> Result<bool> {
         }
     }
     let stalled = phase == "merge" && merge_stalled(&now_flow, &key);
-    // A phase change clears what the last visit handled, so a PR back in a phase it was handled in (a
-    // merge again once the watch on a running check is over) wakes now, not on the next read.
+    // Against the flow after this step's changes: a phase change drops what the last visit settled, so a
+    // merge held for checks running on the host wakes again once the hold ends, on the same record.
     let fresh = now_flow.s("woke") != Some(key.as_str()) && now_flow.s("handled") != Some(key.as_str());
     let would_wake = may_wake
         && WAKE.contains(&phase.as_str())
@@ -2123,11 +2640,14 @@ pub fn step(app: &App, t: &Row, rec: &Value) -> Result<bool> {
         dispatch::add_alert(
             app,
             &format!(
-                "PR #{} for {} is ready to merge but still open after {} tries to merge it: {}.",
+                "PR #{} for {} is ready to merge but still open after {} tries to merge it: {}. The board tries again once \
+                 it's pushed, its checks, reviews or base change, or its stacking is set; or merge it yourself with Merge \
+                 anyway in its PR menu (tb pr merge {} --override).",
                 t.i0("pr_num"),
                 rf("task", t.id()),
                 MERGE_RETRY_WAITS.len(),
-                merge_refusal(&now_flow, rec)
+                merge_refusal(&now_flow, rec),
+                rf("task", t.id()),
             ),
             Some(t.id()),
             t.i("goal_id"),
@@ -2182,6 +2702,9 @@ pub fn step(app: &App, t: &Row, rec: &Value) -> Result<bool> {
     changes.extend(reread_by(&after, merge_look_at(&phase, &after)));
     board::update_task(app, t.id(), task_fields)?;
     merge_flow(app, t.id(), changes)?;
+    if phase_changed {
+        crate::samepr::follow(app, t, &old, &phase)?;
+    }
     Ok(phase_changed)
 }
 
@@ -2401,8 +2924,10 @@ fn poll_host(app: &App, host: &str, tasks: &[Row], skip_covered: bool, streams: 
                 }
             },
         };
+        let rec = with_azure(app, t.id(), &rec)?;
         let t = board::get_task(app, t.id())?;
         note_expected(app, &t, &rec)?;
+        note_stages(app, &board::get_task(app, t.id())?, &rec, false)?;
         gate(app, &board::get_task(app, t.id())?, &rec)?;
         let t = board::get_task(app, t.id())?;
         if app.db.tx(|| step(app, &t, &rec))? {
@@ -2477,7 +3002,7 @@ fn stamps(app: &App, host: &str, tasks: &[Row], streams: bool) -> Option<Vec<Opt
 /// them without a push).
 fn waits_on_checks(t: &Row) -> bool {
     let rec = flow(t).get("rec").cloned().unwrap_or(Value::Null);
-    t.s("pr_phase") == Some("checks") || rec["running"].as_i64().unwrap_or(0) > 0 || rec["failed"].as_array().is_some_and(|f| !f.is_empty())
+    matches!(t.s("pr_phase"), Some("checks" | "landing")) || rec["running"].as_i64().unwrap_or(0) > 0 || rec["failed"].as_array().is_some_and(|f| !f.is_empty())
 }
 
 /// A wake whose terminal closed before it finished, or whose job failed: try again.
@@ -2518,7 +3043,7 @@ fn heal(app: &App, t: &Row) -> Result<()> {
 pub fn waited(app: &App, t: &Row) -> Result<Row> {
     let f = flow(t);
     let rec = f.get("rec").cloned().unwrap_or(json!({}));
-    let mut ch = fields!["woke" => null, "stopped" => null, "comments_seen" => rec["comments"].as_i64().unwrap_or(0)];
+    let mut ch = fields!["woke" => null, "stopped" => null, "comments_seen" => rec["comments"].as_i64().unwrap_or(0), "watched_at" => now_iso()];
     if t.s("pr_phase") == Some("comments") {
         ch.push(("answered_changes", rec["changes_at"].clone()));
     }
@@ -2596,21 +3121,69 @@ impl HasPhase for Row {
 
 /// The ticket's comment when its PR merges, so whoever reads the ticket sees what merged.
 pub fn merged_comment(t: &Row) -> String {
+    let num = crate::samepr::pr_num(t).unwrap_or(0);
     match t.s("pr_url").filter(|u| !u.is_empty()) {
-        Some(url) => format!("PR #{} was merged: {url}", t.i0("pr_num")),
-        None => format!("PR #{} was merged", t.i0("pr_num")),
+        Some(url) => format!("PR #{num} was merged: {url}"),
+        None => format!("PR #{num} was merged"),
     }
 }
 
 pub fn mark_merged(app: &App, t: &Row, who: &str) -> Result<()> {
-    if t.s("pr_phase") == Some("merged") {
+    if matches!(t.s("pr_phase"), Some("merged" | "landing")) {
         return Ok(());
     }
+    let f = flow(t);
+    let mut rec = f.get("rec").cloned().filter(Value::is_object).unwrap_or(Value::Null);
+    if !rec.is_null() {
+        rec["state"] = json!("MERGED");
+        let held = landing(app, t, &f, &rec);
+        if !held.settled() {
+            return mark_landing(app, t, who, &held);
+        }
+    }
+    merged_now(app, t, who, &format!("Merged PR #{}", t.i0("pr_num")), fields!["woke" => null, "stopped" => null])
+}
+
+/// Counts a still-open PR as merged because a stacked child `by` merged into its base carrying every
+/// one of its commits (`stack_carried.rs`). Its own checks don't hold it on `landing`: the child's
+/// checks ran on the code that merged.
+pub fn mark_carried(app: &App, t: &Row, by: &Row, base: &str) -> Result<()> {
+    if matches!(t.s("pr_phase"), Some("merged" | "landing")) {
+        return Ok(());
+    }
+    let line = format!(
+        "PR #{}'s commits reached {base} through {}'s PR #{}, which stacked on it and merged with all of them, so it counts as merged",
+        t.i0("pr_num"),
+        rf("task", by.id()),
+        by.i0("pr_num")
+    );
+    let carried = json!({"task": by.id(), "pr": by.i0("pr_num"), "base": base, "at": now_iso()});
+    merged_now(app, t, board::BOARD, &line, fields!["woke" => null, "stopped" => null, "carried" => carried])
+}
+
+fn merged_now(app: &App, t: &Row, who: &str, line: &str, flow: Vec<(&str, Value)>) -> Result<()> {
     board::update_task(app, t.id(), fields!["pr_state" => "MERGED", "pr_phase" => "merged"])?;
-    merge_flow(app, t.id(), fields!["woke" => null, "stopped" => null])?;
-    board::log_event(app, t.id(), who, "status", &format!("Merged PR #{}", t.i0("pr_num")))?;
+    merge_flow(app, t.id(), flow)?;
+    board::log_event(app, t.id(), who, "status", line)?;
     dispatch::clear_alerts(app, Some(t.id()), None)?;
     crate::merged_note::ticket_merged(app, &board::get_task(app, t.id())?, &merged_comment(t))?;
+    crate::samepr::follow(app, t, t.s("pr_phase").unwrap_or(""), "merged")
+}
+
+/// A PR merged while its head's checks are still running: the task stays open on `landing` until
+/// they pass, and the owner hears if they fail (`step`).
+fn mark_landing(app: &App, t: &Row, who: &str, held: &Landing) -> Result<()> {
+    board::update_task(app, t.id(), fields!["pr_state" => "MERGED", "pr_phase" => "landing"])?;
+    merge_flow(app, t.id(), fields!["woke" => null, "stopped" => null])?;
+    let waiting = if held.pending.is_empty() { "its checks".to_string() } else { held.pending.join(", ") };
+    board::log_event(
+        app,
+        t.id(),
+        who,
+        "status",
+        &format!("Merged PR #{} before {waiting} finished: it stays open until they pass", t.i0("pr_num")),
+    )?;
+    dispatch::clear_alerts(app, Some(t.id()), None)?;
     Ok(())
 }
 
@@ -2627,12 +3200,19 @@ pub fn mark_declined(app: &App, t: &Row, who: &str, reason: &str) -> Result<()> 
     board::log_event(app, t.id(), who, "status", &format!("Closed PR #{} without merging{why}", t.i0("pr_num")))?;
     dispatch::clear_alerts(app, Some(t.id()), None)?;
     crate::declined::check(app, &board::get_task(app, t.id())?)?;
-    Ok(())
+    crate::samepr::follow(app, t, t.s("pr_phase").unwrap_or(""), "declined")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_base_wakes_the_merge_again() {
+        let rec = |base: &str| json!({"head": "h1", "comments": 0, "review_decision": "APPROVED", "approvals": 1, "checks": [], "base": base});
+        assert_ne!(wake_key("merge", &rec("main")), wake_key("merge", &rec("feature")));
+        assert_eq!(wake_key("comments", &rec("main")), wake_key("comments", &rec("feature")), "only the merge");
+    }
 
     #[test]
     fn a_wake_inside_a_transaction_claims_its_slot_on_the_deferred_worker_first() {
@@ -2818,6 +3398,51 @@ mod tests {
         assert!(crate::slots::needs_claim(&app, &t).unwrap());
         assert_eq!(follow_wake(&app, &t, "Rebase").unwrap(), None, "no slot free: the wake waits");
         assert!(app.db.q("SELECT id FROM jobs WHERE task_id = ?", p![id]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pr_work_that_keeps_failing_to_get_its_slot_says_so_once_then_clears_when_a_claim_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, id, _) = gave_its_slot_back(dir.path(), 10);
+        let set_base = |base: &str| {
+            let mut ctx = board::task_context(&board::get_task(&app, id).unwrap());
+            ctx.insert("worktree_base".into(), json!(base));
+            board::save_context(&app, id, &ctx, false).unwrap();
+        };
+        set_base("origin/gone");
+        board::update_task(&app, id, fields!["pr_phase" => "comments"]).unwrap();
+        let said = || app.db.count("SELECT COUNT(*) FROM events WHERE task_id = ? AND text LIKE 'Couldn''t get a worktree slot%'", p![id]).unwrap();
+        let alerted = || dispatch::alerts(&app).into_iter().filter(|a| a["key"] == claim_alert_key(id)).count();
+        for n in 1..=CLAIM_FAILS_ALERT + 2 {
+            assert_eq!(follow_wake(&app, &board::get_task(&app, id).unwrap(), "Rebase").unwrap(), None, "try {n}: no slot");
+            let t = board::get_task(&app, id).unwrap();
+            assert_eq!(flow(&t).i0("claim_fails"), n);
+            assert!(flow(&t).st("claim_error").contains("origin/gone"), "{:?}", flow(&t));
+            let stuck = n >= CLAIM_FAILS_ALERT;
+            assert_eq!((said(), alerted()), if stuck { (1, 1) } else { (0, 0) }, "try {n}: said once, at the third");
+            assert_eq!(wake_stuck(&t), stuck);
+        }
+        let a = dispatch::alerts(&app).into_iter().find(|a| a["key"] == claim_alert_key(id)).unwrap();
+        assert!(!claim_alert_resolved(&app, &a).unwrap(), "it holds while the claims fail");
+        set_base("HEAD");
+        assert!(follow_wake(&app, &board::get_task(&app, id).unwrap(), "Rebase").unwrap().is_some(), "the claim works again");
+        let t = board::get_task(&app, id).unwrap();
+        assert!(!flow(&t).contains_key("claim_fails") && !flow(&t).contains_key("claim_error"));
+        assert_eq!(alerted(), 0);
+        assert!(claim_alert_resolved(&app, &a).unwrap());
+    }
+
+    #[test]
+    fn a_full_pool_is_not_a_failed_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, id, old) = gave_its_slot_back(dir.path(), 1);
+        let ctx = json!({"where": {"worktree": old}}).to_string();
+        board::update_task(&app, id, fields!["context" => ctx]).unwrap();
+        for _ in 0..CLAIM_FAILS_ALERT {
+            assert_eq!(follow_wake(&app, &board::get_task(&app, id).unwrap(), "Rebase").unwrap(), None);
+        }
+        assert!(!flow(&board::get_task(&app, id).unwrap()).contains_key("claim_fails"));
+        assert!(dispatch::alerts(&app).is_empty());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::cell::Cell;
 
 use chrono::{DateTime, Local, TimeZone, Utc};
 use once_cell::sync::Lazy;
@@ -48,23 +49,24 @@ pub fn kind_label(kind: &str) -> String {
 }
 
 thread_local! {
-    /// How far a test moved the board's clock, on its own thread only: its board runs there, and the
-    /// tests beside it in the same binary keep the real time.
-    static CLOCK_OFFSET_MS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    /// How far the tests moved this thread's clock. Per thread: the tests share one process, and a
+    /// test that moves its clock mustn't move the clock under the tests running beside it.
+    static CLOCK_OFFSET_MS: Cell<i64> = const { Cell::new(0) };
 }
 
 pub fn now_ts() -> f64 {
     let real = Utc::now().timestamp_millis() as f64 / 1000.0;
-    real + CLOCK_OFFSET_MS.with(|o| o.get()) as f64 / 1000.0
+    real + CLOCK_OFFSET_MS.with(Cell::get) as f64 / 1000.0
 }
 
-/// Moves the board's clock on this thread (tests).
+/// Moves this thread's clock by `seconds`, back when negative (tests only).
 pub fn advance_clock(seconds: f64) {
-    CLOCK_OFFSET_MS.with(|o| o.set(o.get() + (seconds * 1000.0) as i64));
+    CLOCK_OFFSET_MS.with(|c| c.set(c.get() + (seconds * 1000.0) as i64));
 }
 
+/// Puts this thread's clock back to the real time.
 pub fn reset_clock() {
-    CLOCK_OFFSET_MS.with(|o| o.set(0));
+    CLOCK_OFFSET_MS.with(|c| c.set(0));
 }
 
 pub fn iso(ts: f64) -> String {

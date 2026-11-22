@@ -75,6 +75,10 @@ impl Board {
     fn card(&self, id: i64) -> Value {
         self.get(&format!("tasks/T{id}"))
     }
+    /// The handoff the task's terminal gets in its context.
+    fn handoff(&self, id: i64) -> String {
+        taskboardd::handoff::build_starting(&self.app, id).unwrap()
+    }
     fn start_job(&self, id: i64) -> taskboardd::util::Row {
         let j = self.app.db.q1("SELECT * FROM jobs WHERE kind = 'agent' AND purpose = 'start' AND task_id = ? ORDER BY id DESC", p![id]).unwrap();
         board::job_args(&j.unwrap_or_else(|| panic!("T{id} has no start job")))
@@ -126,7 +130,7 @@ fn tasks_sharing_a_lock_take_turns() {
     b.run_to_done(a, "s1");
     runner::start_queued(&b.app).unwrap();
     assert!(b.started().contains(&t2));
-    assert!(b.start_job(t2).st("prompt").contains("This task holds local-core, emulator-5554"));
+    assert!(b.handoff(t2).contains("This task holds local-core, emulator-5554"));
 }
 
 #[test]
@@ -165,7 +169,7 @@ fn alone_waits_for_the_goal_to_be_quiet_and_then_holds_it() {
     assert!(b.started().contains(&d));
     assert!(!b.started().contains(&e));
     assert_eq!(b.card(e)["waiting"], format!("Waits while T{d} runs alone"));
-    assert!(b.start_job(d).st("prompt").contains("runs alone in its goal"));
+    assert!(b.handoff(d).contains("runs alone in its goal"));
 }
 
 #[test]
@@ -264,8 +268,9 @@ fn each_task_starts_in_a_worktree_slot_off_the_base() {
         let job = b.start_job(t);
         assert_eq!(job.st("cwd"), folder);
         assert_eq!(git(Path::new(&folder), &["rev-parse", "HEAD"]), head);
-        assert!(job.st("prompt").contains(&format!("The board gave the task the worktree slot-{n} from its pool: {folder}, detached at origin/main")), "{}", job.st("prompt"));
-        assert!(job.st("prompt").contains(&format!("Its builds go in {folder}/target")), "{}", job.st("prompt"));
+        let h = b.handoff(t);
+        assert!(h.contains(&format!("The board gave the task the worktree slot-{n} from its pool: {folder}, detached at origin/main")), "{h}");
+        assert!(h.contains(&format!("Its builds go in {folder}/target")), "{h}");
         let log = log_text(&b.get(&format!("tasks/T{t}"))["log"]);
         assert!(log.contains(&format!("Made worktree slot-{n} from origin/main at {folder}")), "{log}");
     }
@@ -334,7 +339,8 @@ fn a_backport_task_starts_from_its_pr_base_and_its_pr_goes_into_it() {
     let job = b.start_job(t);
     assert_eq!(job.st("cwd"), slot(&b, 1));
     assert_eq!(git(Path::new(&slot(&b, 1)), &["rev-parse", "HEAD"]), first, "it starts at the release branch, not main");
-    assert!(job.st("prompt").contains("Its PR goes into release/1.x, not the default branch"), "{}", job.st("prompt"));
+    let h = b.handoff(t);
+    assert!(h.contains("Its PR goes into release/1.x, not the default branch"), "{h}");
 
     // A goal's base is what its tasks take unless they name their own; default clears a task's.
     b.post(&format!("goals/G{g}"), json!({"pr_base": "release/2.x"}));
@@ -411,7 +417,7 @@ fn finish(b: &Board, t: i64) {
 }
 
 #[test]
-fn a_task_takes_the_free_slot_used_last_and_saves_what_was_left_in_it() {
+fn a_task_takes_the_free_slot_used_last_and_saves_what_it_was_left_with() {
     let b = new_board();
     git_repo(&b);
     let g = b.side_by_side();
@@ -438,11 +444,9 @@ fn a_task_takes_the_free_slot_used_last_and_saves_what_was_left_in_it() {
     std::fs::write(Path::new(&slot(&b, 2)).join("left"), "x\n").unwrap();
     let after = b.task("After", json!({"goal_id": g}));
     runner::start_queued(&b.app).unwrap();
-    assert_eq!(b.start_job(after).st("cwd"), slot(&b, 2), "a slot left with uncommitted changes is still taken");
+    assert_eq!(b.start_job(after).st("cwd"), slot(&b, 2), "a slot with uncommitted changes is still the warmest");
     assert!(!Path::new(&slot(&b, 2)).join("left").exists(), "taken clean");
-    let wip = format!("wip/T{next}-slot-2");
-    assert_eq!(git(Path::new(&b.repo()), &["show", &format!("{wip}:left")]), "x", "what was left is saved on {wip}");
-    assert!(log_text(&b.card(next)["log"]).contains(&format!("to branch {wip}")), "{}", b.card(next)["log"]);
+    assert_eq!(git(Path::new(&slot(&b, 2)), &["show", &format!("wip/T{next}-slot-2:left")]), "x", "what it was left with is saved off it");
 }
 
 #[test]
@@ -575,7 +579,7 @@ fn queue_with_no_free_slot_queues_the_task_to_start_once_one_frees() {
 }
 
 #[test]
-fn a_full_pool_keeps_the_task_queued_and_a_free_slot_that_cant_be_cleaned_alerts_once() {
+fn a_full_pool_keeps_the_task_queued_and_a_free_slot_it_cant_save_alerts_once() {
     let b = new_board();
     git_repo(&b);
     let g = b.side_by_side();
@@ -585,7 +589,8 @@ fn a_full_pool_keeps_the_task_queued_and_a_free_slot_that_cant_be_cleaned_alerts
     runner::start_queued(&b.app).unwrap();
     finish(&b, one);
     std::fs::write(Path::new(&slot(&b, 1)).join("left"), "x\n").unwrap();
-    // A stale lock: what was left can't be cleared off the slot, so no task can take it.
+    // A stale lock, so the slot's changes can't be saved off it and it's passed over. (Not a file git
+    // can't read: Windows has no such mode.)
     let lock = Path::new(&git(Path::new(&slot(&b, 1)), &["rev-parse", "--absolute-git-dir"])).join("index.lock");
     std::fs::write(&lock, "").unwrap();
 
@@ -663,17 +668,28 @@ fn a_project_s_slot_settings_are_checked_and_go_back_to_config() {
     let b = new_board();
     let w = |out: &Value| out["worktrees"].clone();
     let out = b.get("projects")["projects"][0].clone();
-    assert_eq!(w(&out), json!({"min_slots": 2, "max_slots": 10, "idle_trim_days": 2, "idle_remove_days": 7, "low_disk_gb": 50, "set": {}}));
+    assert_eq!(w(&out), json!({"min_slots": 2, "max_slots": 10, "idle_trim_days": 2, "idle_remove_days": 7, "low_disk_gb": 50, "stale_build_days": 3, "set": {}}));
     let out = b.post("projects/webapp", json!({"min_slots": "1", "idle_trim_days": 3, "low_disk_gb": 20}));
     assert_eq!(w(&out)["set"], json!({"min_slots": 1, "idle_trim_days": 3, "low_disk_gb": 20}));
     let (code, msg) = b.post_err("projects/webapp", json!({"max_slots": 0}));
     assert_eq!(code, 400);
-    assert!(msg.contains("max_slots is a count from 1 to 50"), "{msg}");
+    assert!(msg.contains("max_slots is a count from 1 to 100"), "{msg}");
+    assert_eq!(w(&b.post("projects/webapp", json!({"max_slots": 100})))["set"]["max_slots"], 100);
+    let (code, msg) = b.post_err("projects/webapp", json!({"max_slots": 101}));
+    assert_eq!(code, 400);
+    assert!(msg.contains("max_slots is a count from 1 to 100"), "{msg}");
+    b.post("projects/webapp", json!({"max_slots": "default"}));
     let (_, msg) = b.post_err("projects/webapp", json!({"idle_remove_days": 2}));
     assert!(msg.contains("idle_trim_days (3) can't be more than idle_remove_days (2)"), "{msg}");
     assert_eq!(b.get("projects")["projects"][0]["worktrees"]["idle_remove_days"], 7, "a refused change isn't kept");
     let out = b.post("projects/webapp", json!({"min_slots": "default", "idle_trim_days": null, "low_disk_gb": null}));
     assert_eq!(w(&out)["set"], json!({}));
+    let out = b.post("projects/webapp", json!({"idle_remove_days": "never", "idle_trim_days": 30}));
+    assert_eq!(w(&out)["set"], json!({"idle_trim_days": 30, "idle_remove_days": 0}), "never is 0, and any clearing comes before it");
+    let out = b.post("projects/webapp", json!({"idle_trim_days": "Never", "idle_remove_days": 7}));
+    assert_eq!((w(&out)["idle_trim_days"].clone(), w(&out)["idle_remove_days"].clone()), (json!(0), json!(7)), "a slot can be removed without clearing it first");
+    let (_, msg) = b.post_err("projects/webapp", json!({"min_slots": "never"}));
+    assert!(msg.contains("min_slots is a count from 0 to 100"), "only the idle timers take never: {msg}");
 }
 
 #[test]
@@ -1047,6 +1063,24 @@ fn idle_slots_lose_their_build_output_then_the_checkout_but_never_below_min() {
     assert!(Path::new(&slot(&b, 4)).join("target").exists(), "still claimed");
 }
 
+#[test]
+fn idle_timers_set_to_never_keep_a_free_slot_and_its_build_output() {
+    let b = new_board();
+    git_repo(&b);
+    let g = b.side_by_side();
+    b.post(&format!("goals/G{g}"), json!({"worktree_base": "origin/main"}));
+    b.post("projects/webapp", json!({"min_slots": 0, "idle_trim_days": "never", "idle_remove_days": "never"}));
+    let t = b.task("T1", json!({"goal_id": g}));
+    runner::start_queued(&b.app).unwrap();
+    std::fs::create_dir_all(Path::new(&slot(&b, 1)).join("target")).unwrap();
+    finish(&b, t);
+    let later = taskboardd::util::now_ts() + 400.0 * 86_400.0;
+    assert!(slot_ageing::sweep_at(&b.app, later, &|_| None).unwrap().is_empty(), "never removed");
+    assert!(Path::new(&slot(&b, 1)).join("target").exists(), "never cleared");
+    b.post("projects/webapp", json!({"idle_remove_days": 7}));
+    assert_eq!(slot_ageing::sweep_at(&b.app, later, &|_| None).unwrap(), [slot(&b, 1)], "a removal timer takes it");
+}
+
 /// A commit on a new branch in the slot, pushed or not.
 fn commit_in(folder: &str, branch: &str, push: bool) {
     let dir = Path::new(folder);
@@ -1300,7 +1334,7 @@ fn a_lane_on_the_task_or_its_goal_says_where_it_starts() {
     runner::start_queued(&b.app).unwrap();
     assert_eq!(b.start_job(in_slot).st("cwd"), slot(&b, 1), "a slot without a goal base starts at the default branch");
     assert_eq!(git(Path::new(&slot(&b, 1)), &["rev-parse", "HEAD"]), head);
-    assert!(b.start_job(in_slot).st("prompt").contains("Lane: slot (it's set on the task)"), "{}", b.start_job(in_slot).st("prompt"));
+    assert!(b.handoff(in_slot).contains("Lane: slot (it's set on the task)"), "{}", b.handoff(in_slot));
 
     b.post(&format!("goals/G{g}"), json!({"worktree_base": "origin/main"}));
     assert_eq!(b.get(&format!("goals/G{g}"))["lane"], "slot", "--worktrees puts the goal on the slot lane");
@@ -1387,7 +1421,7 @@ fn alone_is_the_alone_lane() {
     let (one, two) = (b.task("One", json!({"goal_id": g})), b.task("Two", json!({"goal_id": g})));
     runner::start_queued(&b.app).unwrap();
     assert_eq!(b.started(), [t], "on the goal's alone lane, one runs at a time");
-    assert!(b.start_job(t).st("prompt").contains("runs alone in its goal"), "{}", b.start_job(t).st("prompt"));
+    assert!(b.handoff(t).contains("runs alone in its goal"), "{}", b.handoff(t));
     assert!(![one, two].iter().any(|x| b.started().contains(x)));
 }
 
@@ -1431,6 +1465,53 @@ fn a_task_outside_a_goal_claims_a_slot_and_lands_on_the_slot_lane() {
     assert_eq!(lane(&b, t), ("slot".into(), "task".into()));
     assert!(log_text(&b.card(t)["log"]).contains("Works in a worktree slot: claimed slot-1"), "{}", b.card(t)["log"]);
     assert_eq!(b.post(&format!("tasks/T{t}/slot/claim"), json!({}))["slot"], "slot-1", "claiming again keeps it");
+}
+
+#[test]
+fn a_repeat_claim_hands_back_the_slot_the_task_holds_as_it_is() {
+    let b = new_board();
+    git_repo(&b);
+    let t = b.task("Loose", json!({}));
+    working(&b, t);
+    let first = b.post(&format!("tasks/T{t}/slot/claim"), json!({}));
+    assert_eq!(first["held"], Value::Null, "{first}");
+    std::fs::write(Path::new(&slot(&b, 1)).join("loose"), "x\n").unwrap();
+
+    let again = b.post(&format!("tasks/T{t}/slot/claim"), json!({}));
+    assert_eq!((again["slot"].clone(), again["path"].clone(), again["held"].clone()), (json!("slot-1"), json!(slot(&b, 1)), json!(true)), "{again}");
+    assert_eq!(b.app.db.q("SELECT id FROM worktree_slots", p![]).unwrap().len(), 1, "no second slot");
+    assert!(Path::new(&slot(&b, 1)).join("loose").exists(), "the slot is left as it was");
+    assert!(!b.card(t)["log"].to_string().contains("Back in its worktree slot"), "{}", b.card(t)["log"]);
+    assert_eq!(b.get(&format!("tasks/T{t}/slot"))["path"], json!(slot(&b, 1)));
+}
+
+#[test]
+fn claims_racing_for_one_task_end_in_the_same_slot() {
+    let b = new_board();
+    git_repo(&b);
+    let t = b.task("Loose", json!({}));
+    working(&b, t);
+    let claims: Vec<_> = (0..3)
+        .map(|_| {
+            let app = b.app.clone();
+            std::thread::spawn(move || api::dispatch(&app, "POST", &format!("tasks/T{t}/slot/claim"), &Query::new(), &json!({})).map_err(|e| e.message))
+        })
+        .collect();
+    let paths: Vec<Value> = claims.into_iter().map(|h| h.join().unwrap().unwrap()["path"].clone()).collect();
+    assert_eq!(paths, vec![json!(slot(&b, 1)); 3]);
+    assert_eq!(b.app.db.q("SELECT id FROM worktree_slots WHERE task_id = ?", p![t]).unwrap().len(), 1, "one slot for the task");
+}
+
+#[test]
+fn a_task_holding_no_slot_says_so() {
+    let b = new_board();
+    git_repo(&b);
+    let t = b.task("Loose", json!({}));
+    let none = b.get(&format!("tasks/T{t}/slot"));
+    assert_eq!((none["path"].clone(), none["held"].clone()), (Value::Null, json!(false)));
+    b.post(&format!("tasks/T{t}/slot/claim"), json!({}));
+    b.post(&format!("tasks/T{t}/slot/release"), json!({}));
+    assert_eq!(b.get(&format!("tasks/T{t}/slot"))["path"], Value::Null, "given back");
 }
 
 #[test]
@@ -1744,6 +1825,95 @@ fn a_restart_rebases_a_clean_unpushed_branch_onto_the_base() {
     assert_eq!(git(d, &["merge-base", "HEAD", "origin/main"]), git(d, &["rev-parse", "origin/main"]), "on top of the base");
     assert_eq!(git(d, &["rev-list", "--count", "origin/main..HEAD"]), "1", "its commit kept");
     assert!(log_text(&b.card(one)["log"]).contains("Rebased feature/one in slot-1 onto origin/main: it was 1 commit behind origin/main"), "{}", b.card(one)["log"]);
+}
+
+fn slot_of(b: &Board, t: i64) -> String {
+    b.app.db.q1("SELECT path FROM worktree_slots WHERE task_id = ?", p![t]).unwrap().unwrap().st("path")
+}
+
+fn commit_file(dir: &Path, file: &str) {
+    std::fs::write(dir.join(file), format!("{file}\n")).unwrap();
+    git(dir, &["add", file]);
+    git(dir, &["commit", "-q", "-m", &format!("Add {file}")]);
+}
+
+/// Two head-merges into One's branch: its slot was taken at origin/main (One's branch wasn't pushed
+/// yet), and its own branch, unpushed, sits on One's. One's PR is open. Main then moves on.
+fn head_merge_child(b: &Board, push_parent: bool) -> (String, i64, String) {
+    git_repo(b);
+    let g = b.side_by_side();
+    b.post(&format!("goals/G{g}"), json!({"worktree_base": "origin/main"}));
+    let one = b.task("One", json!({"goal_id": g}));
+    let two = b.task("Two", json!({"goal_id": g}));
+    runner::start_queued(&b.app).unwrap();
+    let (one_dir, two_dir) = (slot_of(b, one), slot_of(b, two));
+    let (one_at, two_at) = (Path::new(&one_dir), Path::new(&two_dir));
+    git(one_at, &["switch", "-q", "-c", "feature/one"]);
+    commit_file(one_at, "one.txt");
+    let flow = json!({"rec": {"branch": "feature/one"}}).to_string();
+    b.app.db.x("UPDATE tasks SET status = 'done', pr_num = 1, pr_state = 'OPEN', pr_flow = ? WHERE id = ?", p![flow, one]).unwrap();
+    b.app.db.x("UPDATE tasks SET pr_after = ?, stack_merge = 'head' WHERE id = ?", p![one, two]).unwrap();
+    if push_parent {
+        git(one_at, &["push", "-q", "origin", "feature/one"]);
+        git(two_at, &["fetch", "-q", "origin"]);
+        git(two_at, &["switch", "-q", "-c", "feature/two", "--no-track", "origin/feature/one"]);
+    } else {
+        git(two_at, &["switch", "-q", "-c", "feature/two", "feature/one"]);
+    }
+    commit_file(two_at, "two.txt");
+    advance_main(b, "later.txt", "from main\n");
+    (one_dir, two, two_dir)
+}
+
+#[test]
+fn a_restart_rebases_a_head_merge_task_onto_its_parent_s_branch_not_the_default() {
+    let b = new_board();
+    let (one_dir, two, dir) = head_merge_child(&b, true);
+    let d = Path::new(&dir);
+    commit_file(Path::new(&one_dir), "one-more.txt");
+    git(Path::new(&one_dir), &["push", "-q", "origin", "feature/one"]);
+
+    lose_and_restart(&b, two);
+    assert_eq!(b.start_job(two).st("cwd"), dir, "started again in its slot");
+    assert_eq!(git(d, &["merge-base", "HEAD", "origin/feature/one"]), git(d, &["rev-parse", "origin/feature/one"]), "on top of its parent's branch");
+    assert_eq!(git(d, &["rev-list", "--count", "origin/feature/one..HEAD"]), "1", "its commit kept");
+    assert_ne!(git(d, &["merge-base", "HEAD", "origin/main"]), git(d, &["rev-parse", "origin/main"]), "never moved onto main");
+    let log = b.card(two)["log"].to_string();
+    assert!(log.contains("Rebased feature/two in slot-2 onto origin/feature/one: it was 1 commit behind origin/feature/one"), "{log}");
+}
+
+#[test]
+fn a_head_merge_branch_tracking_main_is_pointed_at_its_parent_s_branch_so_a_pull_keeps_it_there() {
+    let b = new_board();
+    let (_, two, dir) = head_merge_child(&b, true);
+    let d = Path::new(&dir);
+    // Made the way agents often do: from origin/main, so it tracks main.
+    git(d, &["branch", "-q", "--set-upstream-to=origin/main", "feature/two"]);
+    b.add_session("s2");
+    b.open_for("s2", two);
+    b.report("hook.prompt", "s2", json!({"prompt": b.start_job(two).st("prompt")}));
+    b.report("hook.commit", "s2", json!({"cwd": dir, "command": "git commit -m 'Add two.txt'", "output": "[feature/two abc] Add two.txt"}));
+    assert_eq!(git(d, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]), "origin/feature/one");
+    let log = b.card(two)["log"].to_string();
+    assert!(log.contains("Pointed feature/two's upstream at origin/feature/one"), "{log}");
+    // A session-start hook's pull --rebase now keeps it on its parent's branch, off main.
+    git(d, &["-c", "user.name=t", "-c", "user.email=t@t", "pull", "-q", "--rebase"]);
+    assert_eq!(git(d, &["merge-base", "HEAD", "origin/feature/one"]), git(d, &["rev-parse", "origin/feature/one"]), "still on its parent's branch");
+    assert_eq!(git(d, &["rev-list", "--count", "origin/feature/one..HEAD"]), "1", "only its own commit on top");
+    assert_ne!(git(d, &["merge-base", "HEAD", "origin/main"]), git(d, &["rev-parse", "origin/main"]), "never moved onto main");
+}
+
+#[test]
+fn a_restart_leaves_a_head_merge_task_alone_while_its_parent_s_branch_isn_t_pushed() {
+    let b = new_board();
+    let (_, two, dir) = head_merge_child(&b, false);
+    let d = Path::new(&dir);
+    let before = git(d, &["rev-parse", "HEAD"]);
+
+    lose_and_restart(&b, two);
+    assert_eq!(b.start_job(two).st("cwd"), dir, "started again in its slot");
+    assert_eq!(git(d, &["rev-parse", "HEAD"]), before, "left as it was");
+    assert!(!b.card(two)["log"].to_string().contains("onto origin/main"), "{}", b.card(two)["log"]);
 }
 
 #[test]

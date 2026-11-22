@@ -67,10 +67,18 @@ fn mins(secs: f64) -> f64 {
 
 // ------------------------------------------------------------------ working out a day
 
+/// Whether a task in `needs` with this reason is waiting on the owner's answer. A human task is the
+/// owner's own work, not an agent held up, and a lost terminal waits on nobody; neither counts.
+pub(crate) fn waits_on_owner(reason: Option<&str>) -> bool {
+    !matches!(reason, Some("lost") | Some(crate::human::NEEDS))
+}
+
 /// A stretch of one task in one status, clipped to the day.
 #[derive(Clone, Debug)]
 struct Seg {
     task: i64,
+    /// When the stretch really began, before clipping to the day.
+    start: f64,
     from: f64,
     to: f64,
     /// `working` or `needs`.
@@ -90,7 +98,7 @@ const AWAY_BACK_SECS: f64 = 14.0 * 86400.0;
 
 /// The stretches in `[from, to)` that don't count as waiting on the owner, merged and in order: the
 /// Mac asleep, the owner away from it (no input), and outside the work hours when they're on.
-fn away(app: &App, from: f64, to: f64) -> Vec<(f64, f64)> {
+pub(crate) fn away(app: &App, from: f64, to: f64) -> Vec<(f64, f64)> {
     let from = from.max(to - AWAY_BACK_SECS);
     let mut v = clock::away_spans(from, to);
     let h = hours::get(app);
@@ -138,7 +146,7 @@ fn cut(a: f64, b: f64, gaps: &[(f64, f64)]) -> Vec<(f64, f64, bool)> {
 }
 
 /// Seconds of `[a, b)` outside `gaps`.
-fn counted(a: f64, b: f64, gaps: &[(f64, f64)]) -> f64 {
+pub(crate) fn counted(a: f64, b: f64, gaps: &[(f64, f64)]) -> f64 {
     cut(a, b, gaps).iter().filter(|p| !p.2).map(|p| p.1 - p.0).sum()
 }
 
@@ -207,7 +215,7 @@ fn segments(app: &App, from: f64, to: f64, now: f64) -> Result<Vec<Seg>> {
                 } else {
                     (stop.min(now) - start, Vec::new())
                 };
-                out.push(Seg { task, from: a, to: b, status, end, whole, open, pieces });
+                out.push(Seg { task, start, from: a, to: b, status, end, whole, open, pieces });
             }
         }
     }
@@ -312,6 +320,7 @@ fn work_out(app: &App, date: NaiveDate, now: f64) -> Result<(BTreeMap<String, Va
         prs: i64,
         commits: i64,
         waits: Vec<Value>,
+        wait_spans: Vec<(f64, f64)>,
         running: Vec<i64>,
         hourly: Vec<i64>,
         tasks: BTreeMap<i64, (f64, f64, String)>,
@@ -336,9 +345,15 @@ fn work_out(app: &App, date: NaiveDate, now: f64) -> Result<(BTreeMap<String, Va
             }
             entry.2 = s.end.clone();
         } else {
-            entry.1 += s.pieces.iter().filter(|x| !x.2).map(|x| x.1 - x.0).sum::<f64>();
             entry.2 = "needs".into();
-            if s.from >= from {
+            // Only the day's own counted stretch adds up; the wait's full length shows once, on the
+            // day it began (a wait carried over from yesterday starts the day clipped, not new).
+            if waits_on_owner(Some(&s.end)) {
+                let here: Vec<(f64, f64)> = s.pieces.iter().filter(|x| !x.2).map(|x| (x.0, x.1)).collect();
+                entry.1 += here.iter().map(|x| x.1 - x.0).sum::<f64>();
+                p.wait_spans.extend(here);
+            }
+            if s.start >= from && waits_on_owner(Some(&s.end)) {
                 p.waits.push(json!({"task": s.task, "ref": rf("task", s.task), "at": iso(s.from), "min": mins(s.whole), "open": s.open, "reason": s.end}));
             }
         }
@@ -393,11 +408,20 @@ fn work_out(app: &App, date: NaiveDate, now: f64) -> Result<(BTreeMap<String, Va
         out.insert(
             name,
             json!({"agent_min": mins(p.agent), "human_min": p.human, "est_agent_min": p.est_agent, "done": p.done, "prs": p.prs,
-                   "commits": p.commits, "waits": p.waits, "running": p.running, "hourly": p.hourly, "tasks": tasks_json, "bars": p.bars,
+                   "commits": p.commits, "waits": p.waits, "wait_spans": spans_json(&clock::merge(p.wait_spans)), "running": p.running, "hourly": p.hourly, "tasks": tasks_json, "bars": p.bars,
                    "finished": p.finished}),
         );
     }
     Ok((out, mks))
+}
+
+/// Wait stretches as `[[from, to], ...]` in epoch seconds, kept so projects can be merged.
+fn spans_json(v: &[(f64, f64)]) -> Value {
+    json!(v.iter().map(|&(a, b)| json!([a, b])).collect::<Vec<_>>())
+}
+
+fn spans_of(v: &Value) -> Vec<(f64, f64)> {
+    v["wait_spans"].as_array().into_iter().flatten().filter_map(|x| Some((x[0].as_f64()?, x[1].as_f64()?))).collect()
 }
 
 /// A day's rows by project: worked out now for today, read back (or worked out once and kept) for
@@ -421,7 +445,10 @@ fn day(app: &App, date: NaiveDate, cache: &mut HashMap<NaiveDate, BTreeMap<Strin
 fn stored(app: &App, date: NaiveDate) -> Result<BTreeMap<String, Value>> {
     let key = date_str(date);
     let rows = app.db.q("SELECT project, data FROM day_stats WHERE date = ?", p![key])?;
-    if !rows.is_empty() {
+    // Rows kept before `wait_spans` added up waits wrongly (each day re-added open waits whole, and
+    // tasks side by side stacked): work those days out again.
+    let stale = rows.iter().any(|r| r.s("project") != Some(EMPTY_ROW) && !r.s("data").unwrap_or("").contains("\"wait_spans\""));
+    if !rows.is_empty() && !stale {
         return Ok(rows
             .iter()
             .filter(|r| r.s("project") != Some(EMPTY_ROW))
@@ -430,6 +457,7 @@ fn stored(app: &App, date: NaiveDate) -> Result<BTreeMap<String, Value>> {
     }
     let (v, _) = work_out(app, date, now_ts())?;
     app.db.tx(|| {
+        app.db.x("DELETE FROM day_stats WHERE date = ?", p![key])?;
         if v.is_empty() {
             app.db.x("INSERT OR REPLACE INTO day_stats(date, project, data, at) VALUES(?, ?, '{}', ?)", p![key, EMPTY_ROW, now_iso()])?;
         }
@@ -439,6 +467,31 @@ fn stored(app: &App, date: NaiveDate) -> Result<BTreeMap<String, Value>> {
         Ok(())
     })?;
     Ok(v)
+}
+
+/// Forgets the kept days task `id` shows on, so each is worked out again under the task's project
+/// now (after a move). Only days whose log is still whole are: from the day after History's detail
+/// cut and the task's first kept status change, to its last one (yesterday while it's open). An
+/// older day's summary is all that's left of it, and stays. Returns the days forgotten.
+pub fn forget_task(app: &App, id: i64) -> Result<i64> {
+    let Some(t) = app.db.q1("SELECT status FROM tasks WHERE id = ?", p![id])? else { return Ok(0) };
+    let r = app
+        .db
+        .q1(
+            "SELECT (SELECT MIN(at) FROM task_states WHERE task_id = ?) AS first, \
+             MAX((SELECT MAX(at) FROM task_states WHERE task_id = ?), COALESCE((SELECT MAX(at) FROM events WHERE task_id = ?), '')) AS last",
+            p![id, id, id],
+        )?
+        .unwrap_or_default();
+    let day_of = |k: &str| r.s(k).and_then(parse_iso).map(|t| local_dt(t).date_naive());
+    let Some(first) = day_of("first") else { return Ok(0) };
+    let yesterday = today() - Duration::days(1);
+    let last = if t.s("status") == Some("done") { day_of("last").unwrap_or(first).min(yesterday) } else { yesterday };
+    let from = first.max(today() - Duration::days(detail_days(app)) + Duration::days(1));
+    if from > last {
+        return Ok(0);
+    }
+    app.db.changed("DELETE FROM day_stats WHERE date >= ? AND date <= ?", p![date_str(from), date_str(last)])
 }
 
 // ------------------------------------------------------------------ adding projects up
@@ -456,6 +509,7 @@ struct Sum {
     prs: f64,
     commits: f64,
     wait: f64,
+    wait_spans: Vec<(f64, f64)>,
     questions: f64,
     running: Vec<i64>,
     hourly: Vec<i64>,
@@ -474,10 +528,8 @@ fn sum(rows: &BTreeMap<String, Value>, hide: &HashSet<String>) -> Sum {
         s.done += f(v, "done");
         s.prs += f(v, "prs");
         s.commits += f(v, "commits");
-        for w in v["waits"].as_array().into_iter().flatten() {
-            s.wait += f(w, "min");
-            s.questions += 1.0;
-        }
+        s.wait_spans.extend(spans_of(v));
+        s.questions += v["waits"].as_array().map_or(0, |w| w.len()) as f64;
         for (k, n) in v["running"].as_array().into_iter().flatten().enumerate().take(SLOTS) {
             s.running[k] += n.as_i64().unwrap_or(0);
         }
@@ -486,6 +538,8 @@ fn sum(rows: &BTreeMap<String, Value>, hide: &HashSet<String>) -> Sum {
         }
         s.by_project.insert(proj.clone(), json!(f(v, "agent_min")));
     }
+    // Waiting on you is the time at least one task waited: tasks waiting side by side count once.
+    s.wait = clock::merge(std::mem::take(&mut s.wait_spans)).iter().map(|&(a, b)| (b - a) / 60.0).sum::<f64>() + 0.0;
     s
 }
 
@@ -832,17 +886,54 @@ pub fn history(app: &App) -> Result<Value> {
     }))
 }
 
-/// `POST /history {detail_days, summary_days}`.
+/// `POST /history {detail_days, summary_days}`. With `preview`, saves nothing and says what the next
+/// cleanup would remove under those settings instead.
 pub fn set_history(app: &App, body: &Value) -> Result<Value> {
+    let mut detail = None;
+    let mut summary = None;
     if let Some(v) = body.get("detail_days").filter(|v| !v.is_null()) {
-        let n = v.as_i64().filter(|n| DETAIL_CHOICES.contains(n)).ok_or_else(|| ApiError::new(400, "Keep every event for 30, 90, 180 or 365 days."))?;
-        app.db.set_setting(DETAIL_KEY, Some(&n.to_string()))?;
+        detail = Some(v.as_i64().filter(|n| DETAIL_CHOICES.contains(n)).ok_or_else(|| ApiError::new(400, "Keep every event for 30, 90, 180 or 365 days."))?);
     }
     if let Some(v) = body.get("summary_days").filter(|v| !v.is_null()) {
-        let n = v.as_i64().filter(|n| SUMMARY_CHOICES.contains(n)).ok_or_else(|| ApiError::new(400, "Keep day summaries for 180, 365 or 730 days, or 0 for always."))?;
+        summary = Some(v.as_i64().filter(|n| SUMMARY_CHOICES.contains(n)).ok_or_else(|| ApiError::new(400, "Keep day summaries for 180, 365 or 730 days, or 0 for always."))?);
+    }
+    if body["preview"] == true {
+        let (detail, summary) = (detail.unwrap_or_else(|| detail_days(app)), summary.unwrap_or_else(|| summary_days(app)));
+        return Ok(json!({"preview": true, "detail_days": detail, "summary_days": summary, "removes": would_remove(app, detail, summary)?}));
+    }
+    if let Some(n) = detail {
+        app.db.set_setting(DETAIL_KEY, Some(&n.to_string()))?;
+    }
+    if let Some(n) = summary {
         app.db.set_setting(SUMMARY_KEY, Some(&n.to_string()))?;
     }
     history(app)
+}
+
+/// What a cleanup would remove keeping events `detail` days and summaries `summary` days (0 for always),
+/// counted as `cleanup` counts it, plus the days whose summaries would go.
+fn would_remove(app: &App, detail: i64, summary: i64) -> Result<Value> {
+    let today = today();
+    let before = iso(start_of(today - Duration::days(detail)));
+    let done = "SELECT id FROM tasks WHERE status = 'done'";
+    let events = app.db.count(&format!("SELECT COUNT(*) FROM events WHERE at < ? AND task_id IN ({done})"), p![before])?;
+    let states = app.db.count(
+        &format!("SELECT COUNT(*) FROM task_states WHERE at < ? AND task_id IN ({done}) AND id NOT IN (SELECT MAX(id) FROM task_states GROUP BY task_id)"),
+        p![before],
+    )?;
+    let lines = app.db.count("SELECT COUNT(*) FROM session_events WHERE at < ?", p![before])?;
+    let (rows, days) = match summary {
+        0 => (0, 0),
+        n => {
+            let cut = date_str(today - Duration::days(n));
+            (
+                app.db.count("SELECT COUNT(*) FROM day_stats WHERE date < ?", p![cut])?,
+                app.db.count("SELECT COUNT(DISTINCT date) FROM day_stats WHERE date < ? AND project != ''", p![cut])?,
+            )
+        }
+    };
+    Ok(json!({"events": events, "status_changes": states, "terminal_lines": lines, "day_rows": rows, "days": days,
+              "events_total": events + states + lines}))
 }
 
 /// Remove what's older than the History settings allow: events (and status changes and terminal
@@ -886,8 +977,13 @@ pub fn cleanup(app: &App) -> Result<Value> {
     Ok(json!({"removed": {"events": events, "status_changes": states, "terminal_lines": lines, "day_rows": days}, "history": history(app)?}))
 }
 
-/// Once a day, after 3 AM local time, clean up.
+/// Once a day, after 3 AM local time, clean up. First, on start, earlier moves carry their history.
 pub fn cleanup_loop(app: std::sync::Arc<App>) {
+    match crate::reproject::carry_earlier_moves(&app) {
+        Ok(0) => {}
+        Ok(n) => app.info(format!("history: {n} moved tasks' merges and days now count under their project")),
+        Err(e) => app.info(format!("history: carrying moved tasks' history failed: {}", e.message)),
+    }
     while !app.stopping() {
         let now = local_now();
         let last = app.db.get_setting(LAST_CLEANUP_KEY).ok().flatten().and_then(|s| parse_iso(&s)).map(|t| local_dt(t).date_naive());
@@ -956,6 +1052,15 @@ mod tests {
             app.db.x("INSERT INTO session_events(session_id, at, kind, text) VALUES('s1', ?, 'line', 'x')", p![old.clone()]).unwrap();
         }
         app.db.x("INSERT INTO day_stats(date, project, data) VALUES('2020-01-01', '', '')", p![]).unwrap();
+
+        let shorter = set_history(&app, &json!({"detail_days": 30, "summary_days": 180, "preview": true})).unwrap();
+        assert_eq!(shorter["preview"], true);
+        assert_eq!(shorter["removes"], json!({"events": 3, "status_changes": 2, "terminal_lines": 4, "day_rows": 1, "days": 0, "events_total": 9}));
+        assert_eq!(detail_days(&app), DETAIL_DAYS, "a preview saves nothing");
+        let longer = set_history(&app, &json!({"detail_days": 365, "summary_days": 0, "preview": true})).unwrap();
+        assert_eq!(longer["removes"]["events_total"], 0);
+        assert_eq!(longer["removes"]["day_rows"], 0, "0 keeps summaries always");
+        assert_eq!(set_history(&app, &json!({"detail_days": 7, "preview": true})).unwrap_err().status, 400);
 
         let out = cleanup(&app).unwrap();
         assert_eq!(out["removed"], json!({"events": 3, "status_changes": 2, "terminal_lines": 4, "day_rows": 1}));

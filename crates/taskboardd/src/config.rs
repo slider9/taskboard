@@ -52,6 +52,7 @@ pub struct FileConfig {
     pub quiet: crate::quiet::QuietConfig,
     pub spans: crate::spans::SpansConfig,
     pub review: crate::review::ReviewConfig,
+    pub recap: crate::recap::RecapConfig,
     pub reviewers: crate::reviewers::ReviewersConfig,
     pub feed: crate::feed::FeedConfig,
     /// `[hosts.<host>]`: each PR host's call budget (`prhost/limit.rs`).
@@ -60,6 +61,7 @@ pub struct FileConfig {
     pub pr_builds: crate::prbuilds::PrBuildsConfig,
     pub master: crate::breaks::MasterConfig,
     pub code_review: crate::code_review::CodeReviewConfig,
+    pub agent_starts: crate::agent_starts::AgentStartsConfig,
     /// The owner's commit emails: their own pushes (`prbuilds.rs`) and commits on a red default branch.
     pub owner_emails: Vec<String>,
 }
@@ -154,12 +156,19 @@ pub struct Questions {
     pub timeout_secs: u64,
     /// Extra rule files (markdown) the screener reads, e.g. the owner's memory notes.
     pub rules: Vec<String>,
+    /// The model that screens an agent's new human task (`screen` turns it off too): whether only the
+    /// owner can do it. Empty: `model`'s.
+    pub human_model: String,
+    /// Screen a `tb question` from a terminal with no task too. Off: it goes straight to the owner.
+    pub no_task: bool,
 }
 
 impl Default for Questions {
     fn default() -> Self {
         Questions {
             screen: true,
+            human_model: "sonnet".into(),
+            no_task: true,
             model: "claude-haiku-5-5".into(),
             budget_usd: "0.30".into(),
             timeout_secs: 75,
@@ -223,6 +232,9 @@ pub struct PrConfig {
     /// A green PR waits for the owner's own look ("Waiting on your review") before it moves on. Off:
     /// the board marks it reviewed for them. Unset: on.
     pub owner_review: Option<bool>,
+    /// The Review step on projects that don't say: off skips it, so a PR goes to merge without
+    /// reviewers or approvals. Unset: on.
+    pub review: Option<bool>,
     /// When `tb pr status` and a failed check's wake tell the agent to rebase onto the base.
     pub rebase: RebasePolicy,
     pub gh: String,
@@ -231,6 +243,9 @@ pub struct PrConfig {
     /// Seconds after a stream review or comment hint before its PR is read once more: a review's
     /// changes request often follows its comments as its own event, or none. 0: no second read.
     pub comment_settle_secs: f64,
+    /// Seconds before each new try when the host refuses a merge for a passing reason (its base moved
+    /// under it, a merge already running, a 502): `tb pr merge` tries again itself. Empty: no new tries.
+    pub merge_retry_secs: Vec<f64>,
     /// The timed poll reads a PR less often the longer it stays the same, and outside work hours only
     /// the PRs that can move at night at that pace (`prpace.rs`). Off: every PR on every poll.
     pub pace_polls: bool,
@@ -253,10 +268,12 @@ impl Default for PrConfig {
             wake: true,
             agents_merge: None,
             owner_review: None,
+            review: None,
             rebase: RebasePolicy::default(),
             gh: "gh".into(),
             no_checks_after_mins: 15.0,
             comment_settle_secs: 90.0,
+            merge_retry_secs: vec![3.0, 8.0, 15.0],
             pace_polls: true,
             bitbucket_api: "https://api.bitbucket.org/2.0".into(),
             azure_token_env: "AZURE_DEVOPS_EXT_PAT".into(),
@@ -282,6 +299,11 @@ impl PrConfig {
         self.owner_review.unwrap_or(true)
     }
 
+    /// `review`, on when unset.
+    pub fn review_on(&self) -> bool {
+        self.review.unwrap_or(true)
+    }
+
     /// The rebase policy for a project: its own `rebase`, else `pr.rebase`.
     pub fn rebase_for(&self, name: Option<&str>) -> RebasePolicy {
         self.project(name).rebase.unwrap_or(self.rebase)
@@ -303,7 +325,7 @@ pub enum RebasePolicy {
 }
 
 /// One project's PR rules. Every key is optional; unset keys keep the board-wide behaviour. `tb project
-/// set` changes `approvals`, `expected` and `expected_wait_mins` on the board, over these
+/// set` changes `approvals`, `expected`, `expected_wait_mins` and `required` on the board, over these
 /// (`projects::pr_rules`).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -316,6 +338,9 @@ pub struct PrProject {
     pub expected: Option<Vec<String>>,
     /// How long to wait for the expected checks to post, in minutes.
     pub expected_wait_mins: Option<f64>,
+    /// The checks, or stages and jobs inside a check's build, that must pass to merge (#928): another
+    /// failed or cancelled check or stage doesn't hold the PR. Unset or empty: every failed check holds it.
+    pub required: Option<Vec<String>>,
     /// A command that says, per push, which checks that push starts (`prflow::note_expected`): run with
     /// `/bin/sh -c` once per new head with TB_PR_URL, TB_PR_REPO, TB_PR_NUM, TB_HEAD, TB_BASE, TB_BRANCH
     /// and TB_WORKTREE (when the task has one). A JSON list takes the place of `expected` for that push
@@ -332,7 +357,7 @@ pub struct PrProject {
     pub swap: Option<bool>,
     /// The `ask` stage after the owner's review. Unset: `[reviewers] ask_stage`.
     pub ask_stage: Option<bool>,
-    /// The Review step: off skips it, so a PR goes to merge without reviewers. Unset: on.
+    /// The Review step: off skips it, so a PR goes to merge without reviewers. Unset: `pr.review`.
     pub review: Option<bool>,
     /// Agents may merge this project's PRs once they're approved and green. Unset: `pr.agents_merge`.
     pub agents_merge: Option<bool>,
@@ -340,6 +365,17 @@ pub struct PrProject {
     pub owner_review: Option<bool>,
     /// When to rebase its PRs onto their base. Unset: `pr.rebase`.
     pub rebase: Option<RebasePolicy>,
+    /// The Azure DevOps project its Azure Pipelines checks build in: `org/project`, or a dev.azure.com
+    /// link into it. With `azure_pipelines`, the board asks Azure for a check the PR host hasn't shown
+    /// yet (`azure_checks.rs`): a queued or running build for the PR's head holds the merge until it
+    /// finishes, as the host shows a build only once it starts.
+    pub azure_project: Option<String>,
+    /// Checks that are Azure Pipelines builds: the check's name, with its pipeline's definition id
+    /// (`roon_mobile = 16`).
+    pub azure_pipelines: Option<BTreeMap<String, i64>>,
+    /// How long a stacked PR (one into a branch other than the repo's default) waits for expected
+    /// checks once Azure has no build for its head, in minutes. Unset: `expected_wait_mins`, as for any PR.
+    pub azure_stacked_wait_mins: Option<f64>,
 }
 
 /// Approvals a PR needs when neither the project nor `pr.approvals` says (the old board's 2).
@@ -582,17 +618,31 @@ pub struct TerminalsConfig {
     /// A task opens its terminal only while fewer than this many task terminals run across every project
     /// (`tb terminals --max` changes it on the board).
     pub global_max: i64,
+    /// Tools the board's terminals start without (`--disallowedTools`), so each turn carries less:
+    /// `mcp__<server>` drops a server's deferred tool names, `Agent(<type>)` one subagent's listing.
+    pub deny: Vec<String>,
 }
+
+/// What the board's terminals start without unless config.toml says: Midna's MCP server, whose tools
+/// do what the `midna` CLI does (about 2.4k tokens of names on every turn).
+pub const DENY: [&str; 1] = ["mcp__midna"];
 
 pub const PROJECT_MAX_TERMINALS: i64 = 5;
 pub const GLOBAL_MAX_TERMINALS: i64 = 8;
+/// The most a terminal cap (board-wide or a project's) or a project's worktree slots may be set to.
+pub const MAX_PARALLEL: i64 = 100;
 /// What opens in the background unless config.toml says: the Jira desk, and the terminals that need
 /// nobody watching them. A PR visit that fixes checks or answers review comments stays in its project's tabs.
 pub const BACKGROUND: [&str; 8] = ["jira_desk", "slots", "reopen", "pr:rebase", "pr:steps", "pr:merge", "pr:follow", "pr:note"];
 
 impl Default for TerminalsConfig {
     fn default() -> Self {
-        TerminalsConfig { background: BACKGROUND.map(String::from).to_vec(), project_max: PROJECT_MAX_TERMINALS, global_max: GLOBAL_MAX_TERMINALS }
+        TerminalsConfig {
+            background: BACKGROUND.map(String::from).to_vec(),
+            project_max: PROJECT_MAX_TERMINALS,
+            global_max: GLOBAL_MAX_TERMINALS,
+            deny: DENY.map(String::from).to_vec(),
+        }
     }
 }
 
@@ -736,6 +786,9 @@ pub struct Config {
     /// socket's peer, so they can't go through its CLI).
     pub midna_socket: PathBuf,
     pub midna_bundle: String,
+    /// How long each look at a terminal that just ended may take (`midna::exit_detail`): the hook that
+    /// reports it waits.
+    pub midna_exit_timeout: f64,
     pub open_midna: bool,
     pub notify: bool,
     /// The day weeks start on (the Days page, its `week` array and the hours menu): Sunday unless set.
@@ -772,6 +825,7 @@ pub struct Config {
     pub quiet: crate::quiet::QuietConfig,
     pub spans: crate::spans::SpansConfig,
     pub review: crate::review::ReviewConfig,
+    pub recap: crate::recap::RecapConfig,
     pub reviewers: crate::reviewers::ReviewersConfig,
     pub feed: crate::feed::FeedConfig,
     pub hosts: std::collections::BTreeMap<String, crate::prhost::limit::HostConfig>,
@@ -779,6 +833,7 @@ pub struct Config {
     pub pr_builds: crate::prbuilds::PrBuildsConfig,
     pub master: crate::breaks::MasterConfig,
     pub code_review: crate::code_review::CodeReviewConfig,
+    pub agent_starts: crate::agent_starts::AgentStartsConfig,
     pub owner_emails: Vec<String>,
     /// Accounts in memory instead of the Keychain, `gh` and git (tests, the sample board).
     pub accounts_sandbox: bool,
@@ -934,6 +989,7 @@ impl Config {
                 .or_else(|| env("MIDNA_HOME").map(|h| expand_home(&h).join("midnad.sock")))
                 .unwrap_or_else(|| midna_home().join("midnad.sock")),
             midna_bundle: f.midna_bundle.clone().unwrap_or_else(|| "com.mrgnhnt.midna".into()),
+            midna_exit_timeout: 0.3,
             open_midna: f.open_midna.unwrap_or(true),
             notify: f.notify.unwrap_or(true),
             first_weekday: f.first_weekday.as_deref().and_then(parse_weekday).unwrap_or(chrono::Weekday::Sun),
@@ -969,6 +1025,7 @@ impl Config {
             quiet: f.quiet,
             spans: f.spans,
             review: f.review,
+            recap: f.recap,
             reviewers: f.reviewers,
             feed: f.feed,
             hosts: f.hosts,
@@ -976,6 +1033,7 @@ impl Config {
             pr_builds: f.pr_builds,
             master: f.master,
             code_review: f.code_review,
+            agent_starts: f.agent_starts,
             owner_emails: f.owner_emails,
             accounts_sandbox: env("TASKBOARD_ACCOUNTS").as_deref() == Some("sandbox"),
             config_path,
@@ -1001,6 +1059,8 @@ impl Config {
         c.notify = false;
         c.midna = data.join("no-midna");
         c.midna_socket = data.join("no-midna.sock");
+        // A test's fake Midna is a shell script, slow to start on a loaded machine.
+        c.midna_exit_timeout = 10.0;
         c.questions.screen = false;
         c.backlog.ai = false;
         c.pr.watch = false;
