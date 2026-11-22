@@ -46,16 +46,17 @@ impl Board {
 }
 
 #[test]
-fn an_item_ref_reads_as_its_task_and_others_stay() {
+fn an_item_ref_reads_as_its_task_and_others_as_no_task() {
     let i = ItemTask { item: 3, task: 40 };
     assert_eq!(item_as_task("start B3", i), "start T40");
     assert_eq!(item_as_task("/start b3", i), "/start T40");
-    assert_eq!(item_as_task("start B31 and B4", i), "start B31 and B4");
+    assert_eq!(item_as_task("start B31 and B4", i), "start T0 and T0", "other items still read as a list of tasks");
+    assert_eq!(item_as_task("start B3 and B4", i), "start T40 and T0");
     assert_eq!(item_as_task("JIRAB3 is B3x", i), "JIRAB3 is B3x");
     for dictated in ["start B-3", "start B 3", "start B #3", "start b–3"] {
         assert_eq!(item_as_task(dictated, i), "start T40", "{dictated}");
     }
-    assert_eq!(item_as_task("start B-31", i), "start B-31");
+    assert_eq!(item_as_task("start B-31", i), "start T0");
 }
 
 #[test]

@@ -2047,7 +2047,9 @@ pub fn step(app: &App, t: &Row, rec: &Value) -> Result<bool> {
         }
     }
     let stalled = phase == "merge" && merge_stalled(&now_flow, &key);
-    let fresh = f.s("woke") != Some(key.as_str()) && f.s("handled") != Some(key.as_str());
+    // A phase change clears what the last visit handled, so a PR back in a phase it was handled in (a
+    // merge again once the watch on a running check is over) wakes now, not on the next read.
+    let fresh = now_flow.s("woke") != Some(key.as_str()) && now_flow.s("handled") != Some(key.as_str());
     let would_wake = may_wake
         && WAKE.contains(&phase.as_str())
         && t.s("status") == Some("done")

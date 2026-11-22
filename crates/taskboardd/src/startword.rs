@@ -147,6 +147,8 @@ static LEAVE_RE: Lazy<Regex> = Lazy::new(|| {
 static REPORTED_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?i)\b(?:says?|said|saying|reads?|wrote|writes|prints?|printed|shows?|showed|outputs?)\s*["“‘']?\s*$"#).unwrap()
 });
+/// A reminder asked for just before a start word, which puts the start off ("remind me to start T8").
+static REMIND_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\bremind\s+(?:me|us)\s+to\s+$").unwrap());
 /// The start words.
 const VERB: &str = r"(?:start|strat|satrt|queue|begin|launch|kick\s+off|get\s+going)(?:\s+up)?(?:\s+(?:work(?:ing)?\s+)?on)?";
 /// The start words that ask only with a task named ("run T8", "resume T8", "continue T8", "pick up T8",
@@ -1000,8 +1002,14 @@ fn sentence(k: &Kind, own: &str, base: usize, s: &str, asked: bool, steps: &mut 
             let after = &s[m.end..];
             // Told of, not asked for: "start T8 failed", "how do I start T8", "I'll start T8", "the log
             // says start T8".
-            let told = STORY_RE.is_match(after) || QUESTION_RE.is_match(lead) || (SPEAKER_RE.is_match(lead) && !LEAVE_RE.is_match(&s[..m.verb])) || REPORTED_RE.is_match(lead);
-            if m.soft && (told || !SOFT_TAIL_RE.is_match(after)) && !asked && !timed && !pending {
+            let told = STORY_RE.is_match(after)
+                || QUESTION_RE.is_match(lead)
+                || (SPEAKER_RE.is_match(lead) && !LEAVE_RE.is_match(&s[..m.verb]))
+                || REPORTED_RE.is_match(lead)
+                || REMIND_RE.is_match(lead);
+            // "T8 go" and "T8 now" ask only as the whole clause ("ok T8 now"), not inside one ("let T8 go").
+            let inside = m.verb == m.span.0 && !DASH_LEAD_RE.is_match(lead);
+            if m.soft && (told || inside || !SOFT_TAIL_RE.is_match(after)) && !asked && !timed && !pending {
                 continue;
             }
             let clean = !told && !asked && !pending && !timed && !quoted && negs_in(lead).is_empty();
@@ -1412,15 +1420,30 @@ static START_COMMAND_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)^\s*/(?:ta
 /// The same command as the transcript writes it: `<command-name>/start</command-name>` and its args.
 static START_TAG_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)<command-name>/?(?:task-board:)?start</command-name>").unwrap());
 static COMMAND_ARGS_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<command-args>(.*?)</command-args>").unwrap());
-/// A prompt that ends in a lone "go" ("make a task for the footer. go", "T8 go", "go"): its own token,
-/// after a stop, a comma, a dash or a ref, so "ready to go" and "where did it go?" aren't it.
-static GO_END_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(?:^|[.,;:!?—–\n]|\s-+|\b[TtGg]-?\d+)\s*(?P<go>go)[.!]*\s*$").unwrap());
+/// A prompt that ends in a lone "go" ("make a task for the footer. go", "T8 go"): its own token, after
+/// a stop, a comma, a dash or a ref, so "ready to go" and "where did it go?" aren't it.
+static GO_END_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)(?:^|[.,;:!?—–\n]|\s-+|(?P<ref>\b[TtGg]-?\d+))\s*(?P<go>go)[.!]*\s*$").unwrap());
+/// Where a clause ends, for what comes before a ref and its "go".
+static GO_CLAUSE_END_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[.,;:!?—–\n]|\s-+").unwrap());
+/// The refs listed just before the last one ("T8 and ", "T8, ").
+static REFS_BEFORE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)(?:\b[TtGg]-?\d+\s*(?:,|&|\band\b)?\s*)+$").unwrap());
+
+/// Whether the ref before a trailing "go", at `at` in `text`, opens its clause ("T8 go", "ok, T8 and T9
+/// go"), so the "go" is on it, and not inside one that says something else of it ("let T8 go", "how
+/// did T8 go").
+fn go_on_ref(text: &str, at: usize) -> bool {
+    let before = &text[..at];
+    let from = GO_CLAUSE_END_RE.find_iter(before).last().map_or(0, |m| m.end());
+    DASH_LEAD_RE.is_match(&REFS_BEFORE_RE.replace(&before[from..], ""))
+}
 
 /// What the owner's `/start` command or a prompt's trailing "go" asks, as a plain ask the check always
 /// takes ("start T8.", "run G2.", "start it."): both are the owner's word, whatever else the prompt
 /// says. `/start` with no task or goal means the terminal's own task or what the turn makes; with "the
 /// goal", the goal. A trailing "go" starts what the prompt before it makes ("make a task for X. go"),
-/// keeping that prompt, or else the tasks and goals it names, or else "it". `None` for any other prompt.
+/// keeping that prompt, or else the tasks and goals it names, or else "it". A prompt that's only "go"
+/// is a yes, which answers only the agent's question to start or run. `None` for any other prompt.
 pub fn start_command(text: &str) -> Option<String> {
     let (rest, refs) = if let Some(c) = START_COMMAND_RE.captures(text) {
         (None, c.name("args").map_or("", |m| m.as_str()).to_string())
@@ -1430,8 +1453,15 @@ pub fn start_command(text: &str) -> Option<String> {
         // Another command ("/review T8 go") is no one's word.
         return None;
     } else {
-        let go = GO_END_RE.captures(text)?.name("go")?.start();
+        let c = GO_END_RE.captures(text)?;
+        if c.name("ref").is_some_and(|r| !go_on_ref(text, r.start())) {
+            return None;
+        }
+        let go = c.name("go")?.start();
         let rest = &text[..go];
+        if rest.trim().is_empty() {
+            return None;
+        }
         // "T7 broke the footer, make a task for it. go" starts the task it makes, not T7.
         let makes = read(rest).makes || read_of(&GOALS, rest).makes;
         // Otherwise only the ask counts: what came before may be a question or a no ("should I start T8?").

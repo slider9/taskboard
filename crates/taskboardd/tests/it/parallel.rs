@@ -411,7 +411,7 @@ fn finish(b: &Board, t: i64) {
 }
 
 #[test]
-fn a_task_takes_the_free_slot_used_last_and_passes_over_a_dirty_one() {
+fn a_task_takes_the_free_slot_used_last_and_saves_what_was_left_in_it() {
     let b = new_board();
     git_repo(&b);
     let g = b.side_by_side();
@@ -438,8 +438,11 @@ fn a_task_takes_the_free_slot_used_last_and_passes_over_a_dirty_one() {
     std::fs::write(Path::new(&slot(&b, 2)).join("left"), "x\n").unwrap();
     let after = b.task("After", json!({"goal_id": g}));
     runner::start_queued(&b.app).unwrap();
-    assert_eq!(b.start_job(after).st("cwd"), slot(&b, 1), "a slot with uncommitted changes is passed over");
-    assert!(Path::new(&slot(&b, 2)).join("left").exists());
+    assert_eq!(b.start_job(after).st("cwd"), slot(&b, 2), "a slot left with uncommitted changes is still taken");
+    assert!(!Path::new(&slot(&b, 2)).join("left").exists(), "taken clean");
+    let wip = format!("wip/T{next}-slot-2");
+    assert_eq!(git(Path::new(&b.repo()), &["show", &format!("{wip}:left")]), "x", "what was left is saved on {wip}");
+    assert!(log_text(&b.card(next)["log"]).contains(&format!("to branch {wip}")), "{}", b.card(next)["log"]);
 }
 
 #[test]
@@ -572,7 +575,7 @@ fn queue_with_no_free_slot_queues_the_task_to_start_once_one_frees() {
 }
 
 #[test]
-fn a_full_pool_keeps_the_task_queued_and_a_dirty_free_slot_alerts_once() {
+fn a_full_pool_keeps_the_task_queued_and_a_free_slot_that_cant_be_cleaned_alerts_once() {
     let b = new_board();
     git_repo(&b);
     let g = b.side_by_side();
@@ -582,6 +585,9 @@ fn a_full_pool_keeps_the_task_queued_and_a_dirty_free_slot_alerts_once() {
     runner::start_queued(&b.app).unwrap();
     finish(&b, one);
     std::fs::write(Path::new(&slot(&b, 1)).join("left"), "x\n").unwrap();
+    // A stale lock: what was left can't be cleared off the slot, so no task can take it.
+    let lock = Path::new(&git(Path::new(&slot(&b, 1)), &["rev-parse", "--absolute-git-dir"])).join("index.lock");
+    std::fs::write(&lock, "").unwrap();
 
     let two = b.task("Two", json!({"goal_id": g}));
     for _ in 0..6 {
@@ -596,10 +602,11 @@ fn a_full_pool_keeps_the_task_queued_and_a_dirty_free_slot_alerts_once() {
     assert_eq!(slot_alerts.len(), 1, "one alert for the slot: {alerts:?}");
     assert!(!alerts.iter().any(|a| a["task"] == json!(format!("T{two}"))), "nothing for the task itself: {alerts:?}");
 
-    std::fs::remove_file(Path::new(&slot(&b, 1)).join("left")).unwrap();
+    std::fs::remove_file(&lock).unwrap();
     b.app.db.x("UPDATE tasks SET retry_at = NULL WHERE id = ?", p![two]).unwrap();
     runner::start_queued(&b.app).unwrap();
     assert_eq!(b.start_job(two).st("cwd"), slot(&b, 1));
+    assert!(!Path::new(&slot(&b, 1)).join("left").exists(), "taken clean");
     assert!(!dispatch::listing(&b.app).iter().any(|a| a["key"].as_str().is_some_and(|k| k.starts_with("slot-dirty:"))), "the alert goes once the slot is clean");
 }
 

@@ -896,9 +896,14 @@ pub fn has_git_account(cfg: &Config) -> bool {
 }
 
 /// `GH_TOKEN` for a `gh` the board runs itself, when Taskboard has a GitHub account (otherwise gh uses
-/// the Mac's own sign-in, read only).
+/// the Mac's own sign-in, read only). A sandbox board's gh keeps its config in the board's folder, so
+/// it never uses that sign-in, and each sandbox board is an account of its own to the PR hosts' limits
+/// (the tests run many boards in one process).
 pub fn gh_env(cfg: &Config) -> Vec<(String, String)> {
-    if cfg.accounts_sandbox || !load_who(cfg).contains_key(Provider::Github.id()) {
+    if cfg.accounts_sandbox {
+        return vec![("GH_CONFIG_DIR".into(), cfg.data.join("gh").to_string_lossy().into_owned()), ("GH_PROMPT_DISABLED".into(), "1".into())];
+    }
+    if !load_who(cfg).contains_key(Provider::Github.id()) {
         return vec![];
     }
     credentials(cfg, Provider::Github).map(|(_, t)| vec![("GH_TOKEN".to_string(), t)]).unwrap_or_default()

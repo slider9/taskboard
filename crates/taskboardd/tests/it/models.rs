@@ -38,11 +38,13 @@ impl Board {
         }
         self.post("/tasks", body).unwrap()["id"].as_i64().unwrap()
     }
-    /// The Claude flags the task's new terminal starts with.
+    /// The Claude flags the task's new terminal starts with. The start job is then marked done, since a
+    /// task starts in one terminal at a time and the next call starts it again.
     fn start_flags(&self, id: i64, flags: Option<&str>) -> Option<String> {
         let t = board::get_task(&self.app, id).unwrap();
         let jid = runner::start_task(&self.app, &t, "new", None, Some("go".into()), flags.map(str::to_string), None).unwrap();
         let job = self.app.db.q("SELECT * FROM jobs WHERE id = ?", taskboardd::p![jid]).unwrap().remove(0);
+        self.app.db.x("UPDATE jobs SET state = 'done' WHERE id = ?", taskboardd::p![jid]).unwrap();
         board::job_args(&job).s("flags").map(str::to_string)
     }
 }

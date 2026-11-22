@@ -991,6 +991,8 @@ impl Config {
         c.claude_projects = data.join("claude-projects");
         // Tests never run the real claude (QA comments, screening and wave plans would ask it).
         c.claude = data.join("no-claude").to_string_lossy().to_string();
+        // Nor the owner's gh, which is signed in as them: a test that needs one sets its own.
+        c.pr.gh = data.join("no-gh").to_string_lossy().to_string();
         c.runner = false;
         // No `--model` in started terminals' flags unless a test turns it on.
         c.models.enabled = false;
