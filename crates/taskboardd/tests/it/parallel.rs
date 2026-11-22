@@ -1190,6 +1190,35 @@ fn review_fixes_reclaim_a_slot_on_the_pushed_branch() {
     assert!(log_text(&b.card(one)["log"]).contains(&format!("Made worktree slot-2 at {}, on its branch feature/one", slot(&b, 2))), "{}", b.card(one)["log"]);
 }
 
+#[test]
+fn a_reclaimed_slot_starts_at_the_head_pushed_from_another_worktree() {
+    // The owner pushed to the task's branch from a worktree of their own. The slot's local branch stayed
+    // at the task's last commit, and a visit that started there would rebase it and push over theirs.
+    let b = new_board();
+    git_repo(&b);
+    let g = b.side_by_side();
+    b.post(&format!("goals/G{g}"), json!({"worktree_base": "origin/main"}));
+    let one = b.task("One", json!({"goal_id": g}));
+    runner::start_queued(&b.app).unwrap();
+    commit_in(&slot(&b, 1), "feature/one", true);
+    b.run_to_done(one, "s1");
+
+    let theirs = b.dir.path().join("theirs");
+    git(Path::new(&b.repo()), &["worktree", "add", "-q", "--detach", &theirs.to_string_lossy(), "origin/feature/one"]);
+    std::fs::write(theirs.join("fix"), "theirs\n").unwrap();
+    git(&theirs, &["add", "fix"]);
+    git(&theirs, &["commit", "-q", "-m", "Their fix"]);
+    git(&theirs, &["push", "-q", "origin", "HEAD:feature/one"]);
+    let pushed = git(&theirs, &["rev-parse", "HEAD"]);
+
+    let out = b.post(&format!("tasks/T{one}/slot/claim"), json!({}));
+    assert_eq!(out["slot"], "slot-1");
+    assert_eq!(git(Path::new(&slot(&b, 1)), &["rev-parse", "--abbrev-ref", "HEAD"]), "feature/one");
+    assert_eq!(git(Path::new(&slot(&b, 1)), &["rev-parse", "HEAD"]), pushed, "on the pushed head, not the slot's old one");
+    let log = log_text(&b.card(one)["log"]);
+    assert!(log.contains("on its branch feature/one (fast-forwarded feature/one to origin/feature/one: it was 1 commit behind)"), "{log}");
+}
+
 /// A slot whose worktree was removed under it, its empty folder left behind.
 fn lose_worktree(b: &Board, n: i64) {
     git(Path::new(&b.repo()), &["worktree", "remove", "--force", &slot(&b, n)]);

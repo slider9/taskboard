@@ -650,7 +650,7 @@ pub fn merge_gates(app: &App, t: &Row, rec: &Value, owner_approved: bool) -> Res
         if !running.is_empty() {
             out.push(Gate::soft(format!("checks are still running: {}", running.join(", "))));
         }
-        let stopped: Vec<String> = checks.iter().filter(|c| c["state"] == "stopped").filter_map(|c| c["name"].as_str().map(|s| s.to_string())).collect();
+        let stopped = prflow::stopped_checks(rec);
         if !stopped.is_empty() {
             out.push(Gate::soft(format!("builds were stopped: {} (run them again, or tb pr skip-checks)", stopped.join(", "))));
         }
@@ -897,7 +897,17 @@ pub fn merge(app: &App, id: i64, body: &Value) -> Result<Value> {
                 prflow::note_merge_conflict(app, &t, &rec, board::BOARD)?;
                 prflow::step(app, &board::get_task(app, id)?, &rec).map(|_| ())
             })?;
-            return err(409, format!("PR #{} can't merge: it conflicts with its base branch {}. Rebase onto it, resolve the conflicts, push with git push --force-with-lease, then run tb pr wait.{}", pr.num, rec["base"].as_str().unwrap_or("main"), prflow::KEEP_BASE));
+            return err(
+                409,
+                format!(
+                    "PR #{} can't merge: it conflicts with its base branch {}. Rebase onto it, resolve the conflicts, push with {}, then run tb pr wait.{}{}",
+                    pr.num,
+                    rec["base"].as_str().unwrap_or("main"),
+                    prflow::FORCE_PUSH,
+                    prflow::PUSH_REFUSED,
+                    prflow::KEEP_BASE
+                ),
+            );
         }
         prflow::note_merge_refused(app, id, &rec, &format!("{site} wouldn't merge it: {e}"))?;
         return Err(prflow::wait_out_limit(app, id, &pr, body, "merge", ApiError::new(502, format!("Couldn't merge PR #{}: {e}.", pr.num))));
@@ -1287,7 +1297,7 @@ pub fn status(app: &App, id: i64) -> Result<Value> {
         Some(why) => Some(format!("Checks skipped for this push: {why}")),
         None if crate::prbuilds::stopped(app) => Some("PR builds are stopped: its checks count as passed".into()),
         None => {
-            let on_host: Vec<String> = rec["checks"].as_array().cloned().unwrap_or_default().iter().filter(|c| c["state"] == "stopped").filter_map(|c| c["name"].as_str().map(|s| s.to_string())).collect();
+            let on_host = prflow::stopped_checks(&rec);
             (!on_host.is_empty()).then(|| format!("Builds stopped: {}", on_host.join(", ")))
         }
     };
@@ -1381,7 +1391,8 @@ pub fn rebase_commands(remote: &str, base: &str, branch: &str, gate: &[String], 
     }
     let mut out = vec![format!("git fetch {remote} {base} && git rebase {remote}/{base}"), "run the tests covering your change again (not the whole suite)".into()];
     out.extend(gate.iter().cloned());
-    out.push(if branch.is_empty() { "git push --force-with-lease".into() } else { format!("git push --force-with-lease {remote} {branch}") });
+    let push = prflow::FORCE_PUSH;
+    out.push(if branch.is_empty() { push.into() } else { format!("{push} {remote} {branch} (refused as stale: someone else pushed; fetch and build on theirs, never force over it)") });
     out.extend(republish.iter().cloned());
     out.push("Don't push only to rebase.".into());
     out
@@ -1444,10 +1455,10 @@ mod tests {
         let cmds = rebase_commands("origin", "main", "feat/x", &gate, &republish);
         assert_eq!(cmds[0], "git fetch origin main && git rebase origin/main");
         assert_eq!(cmds[2], gate[0], "the owner's review gate runs before the push");
-        assert_eq!(cmds[3], "git push --force-with-lease origin feat/x");
+        assert!(cmds[3].starts_with("git push --force-with-lease --force-if-includes origin feat/x (refused as stale"), "{}", cmds[3]);
         assert_eq!(cmds[4], republish[0], "the owner's review is republished for the pushed head");
         assert_eq!(cmds[5], "Don't push only to rebase.");
-        assert_eq!(rebase_commands("origin", "main", "", &[], &[])[2], "git push --force-with-lease");
+        assert_eq!(rebase_commands("origin", "main", "", &[], &[])[2], "git push --force-with-lease --force-if-includes");
         assert_eq!(rebase_commands("origin", "main", "feat/x", &gate, &[])[4], "Don't push only to rebase.");
         assert!(rebase_commands("origin", "", "feat/x", &[], &[]).is_empty());
     }

@@ -163,6 +163,43 @@ fn done_moves_the_terminal_on_to_the_next_task_in_its_line() {
 }
 
 #[test]
+fn a_terminal_left_in_its_last_tasks_slot_is_told_where_the_next_task_works() {
+    // The terminal moves on still sitting in the worktree slot its last task used, which the board gives
+    // to other tasks: the next task cut its branch there, under the task that had just taken the slot.
+    let b = new_board();
+    let repo = b.dir.path().join("webapp").to_string_lossy().to_string();
+    let slot = b.dir.path().join("webapp/.claude/worktrees/slot-1").to_string_lossy().to_string();
+    std::fs::create_dir_all(&slot).unwrap();
+    let t1 = b.on_task("s1", "Fix the header");
+    let t2 = b.split("s1", "Make the footer sticky", "next")["created"][0].as_str().unwrap().to_string();
+    let t3 = b.split("s1", "Tidy the nav", "next")["created"][0].as_str().unwrap().to_string();
+    board::update_task(&b.app, id(&t3), fields!["lane" => "slot"]).unwrap();
+    let in_slot = || b.app.db.x("UPDATE sessions SET cwd = ? WHERE id = 's1'", p![slot.clone()]).unwrap();
+
+    in_slot();
+    let out = b.report("tb.done", "s1", json!({"summary": "Fixed it.", "no_pr": "Test"}));
+    let c = out["context"].as_str().unwrap();
+    assert!(c.contains(&format!("This terminal is still in {slot}, the worktree slot its last task used. It isn't {t2}'s")), "{c}");
+    assert!(c.contains(&format!("{t2} works in the project's shared checkout: cd \"{repo}\" and work there.")), "{c}");
+    assert!(c.starts_with(&format!("[task-board:{t2}] {t1} is done")), "the move comes first: {c}");
+
+    in_slot();
+    let out = b.report("tb.done", "s1", json!({"summary": "Done.", "no_pr": "Test"}));
+    let c = out["context"].as_str().unwrap();
+    assert!(c.contains(&format!("{t3} works in a slot of its own: run ")) && c.contains(" slot claim, then cd to the folder it prints"), "{c}");
+}
+
+#[test]
+fn a_terminal_in_the_shared_checkout_moves_on_without_being_told_to_move() {
+    let b = new_board();
+    b.on_task("s1", "Fix the header");
+    b.split("s1", "Make the footer sticky", "next");
+    let out = b.report("tb.done", "s1", json!({"summary": "Fixed it.", "no_pr": "Test"}));
+    let c = out["context"].as_str().unwrap();
+    assert!(c.contains("moves on to") && !c.contains("worktree slot its last task used"), "{c}");
+}
+
+#[test]
 fn the_owner_marking_it_done_sends_the_next_task_to_the_terminal() {
     let b = new_board();
     let t1 = b.on_task("s1", "Fix the header");

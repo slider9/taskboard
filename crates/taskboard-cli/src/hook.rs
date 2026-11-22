@@ -853,7 +853,8 @@ fn branch_move(cmd: &str, cwd: &str) -> Option<(String, PathBuf)> {
 
 /// `PreToolUse`: refuses a `git switch`, or a `git checkout` of a branch, in a project's main checkout
 /// while another terminal works there, on a task or not: the branch would move under it, and its next
-/// commit would land on a branch it never chose. A worktree slot has one terminal; no board: carry on.
+/// commit would land on a branch it never chose. In a worktree slot, refuses one unless this terminal's
+/// task holds the slot (`slot_taken_refused`). No board: carry on.
 fn shared_branch_refused(payload: &Value, session: &str, cfg: &Config, cwd: &str) -> bool {
     if !is_shell(payload["tool_name"].as_str().unwrap_or("")) {
         return false;
@@ -863,7 +864,7 @@ fn shared_branch_refused(payload: &Value, session: &str, cfg: &Config, cwd: &str
     let Some((_, top)) = repo_of(&dir) else { return false };
     // A linked worktree's `.git` is a file; only the main checkout's is a folder.
     if !top.join(".git").is_dir() {
-        return false;
+        return slot_taken_refused(cfg, session, &verb, &top);
     }
     let path = format!("/slots/sharing?path={}&session={}", crate::tb::qv(&top.to_string_lossy()), crate::tb::qv(session));
     let Ok(v) = board_call(cfg, "GET", &path, None, hook_timeout()) else { return false };
@@ -898,6 +899,29 @@ fn branch_refusal(own: Option<&str>, verb: &str, top: &Path, names: &[String], t
         top.display(),
         names.join(", ")
     )
+}
+
+/// A branch move in a worktree slot another task holds: the slot is that task's checkout, and the move
+/// takes its branch from under it, as when a terminal moved on to the next task in its line still sits
+/// in the slot its last task gave back. A slot no task holds, or this terminal's task's own: carry on.
+fn slot_taken_refused(cfg: &Config, session: &str, verb: &str, top: &Path) -> bool {
+    let Some(holder) = slot_holder(cfg, top) else { return false };
+    let own = steps(cfg, session, "").and_then(|(v, _)| v["task"].as_str().map(str::to_string));
+    if own.as_deref() == Some(holder.as_str()) {
+        return false;
+    }
+    deny(&slot_refusal(own.as_deref(), verb, top, &holder, &tb_path()));
+    true
+}
+
+/// The refusal for a branch move in a worktree slot `holder` holds.
+fn slot_refusal(own: Option<&str>, verb: &str, top: &Path, holder: &str, tb: &str) -> String {
+    let who = own.unwrap_or("This terminal");
+    let instead = match own {
+        Some(_) => format!("Work in a slot of your own: {tb} slot claim gives you one and prints its path; cd there and make the branch with git switch -c <branch>."),
+        None => format!("Work somewhere of your own: {tb} task new \"<title>\" --detail \"…\" --here --lane slot, then {tb} slot claim, which prints the slot's path."),
+    };
+    format!("{who} can't git {verb} in {}: it's a worktree slot {holder} holds, and a git {verb} moves {holder}'s branch under it. Leave it alone. {instead}", top.display())
 }
 
 /// `git worktree add` and the rest of its command, up to the next `;`, `&` or `|`.
@@ -2226,6 +2250,13 @@ mod tests {
         let shown = branch_refusal(Some("T4"), "checkout", Path::new("/r"), &["A (T1)".into(), "B".into()], "tb");
         assert!(shown.starts_with("T4 can't git checkout in /r: A (T1), B work in"), "{shown}");
         assert!(shown.contains("tb slot claim --bring <files>"), "{shown}");
+
+        // A slot another task holds: the terminal that moved on from the task it was given for.
+        let shown = slot_refusal(Some("T96"), "switch", Path::new("/r/.claude/worktrees/slot-1"), "T75", "tb");
+        assert!(shown.starts_with("T96 can't git switch in /r/.claude/worktrees/slot-1: it's a worktree slot T75 holds"), "{shown}");
+        assert!(shown.contains("tb slot claim gives you one"), "{shown}");
+        let shown = slot_refusal(None, "checkout", Path::new("/s"), "T75", "tb");
+        assert!(shown.starts_with("This terminal can't git checkout in /s") && shown.contains("--lane slot, then tb slot claim"), "{shown}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

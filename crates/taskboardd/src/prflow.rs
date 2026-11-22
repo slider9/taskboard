@@ -598,15 +598,25 @@ fn retry_later(f: &Row) -> bool {
     f.s("retry_at").map(|r| r > now_iso().as_str()).unwrap_or(false)
 }
 
+/// The push for a branch a rebase rewrote. `--force-if-includes` refuses it when the remote branch has
+/// commits this branch never had, as when someone pushed to it from another worktree while it was
+/// rebased: a bare lease checks only the remote-tracking ref, which every worktree of the repo shares
+/// and their push moved too, so it overwrote their work (#58).
+pub const FORCE_PUSH: &str = "git push --force-with-lease --force-if-includes";
+
+/// What to do when that push is refused (with its leading space).
+pub const PUSH_REFUSED: &str = " If the push is refused as stale, someone else pushed to the branch meanwhile: never force it \
+     over them. git fetch, look at what they pushed, and build on it.";
+
 /// The fix wake's sentence on rebasing, by policy (with its leading space).
-fn rebase_advice(policy: RebasePolicy) -> &'static str {
+fn rebase_advice(policy: RebasePolicy) -> String {
     match policy {
-        RebasePolicy::Moved => " If the base branch has moved, rebase onto it before you push (git push --force-with-lease).",
-        RebasePolicy::Conflicts => {
+        RebasePolicy::Moved => format!(" If the base branch has moved, rebase onto it before you push ({FORCE_PUSH}).{PUSH_REFUSED}"),
+        RebasePolicy::Conflicts => format!(
             " Don't rebase onto the base branch unless the PR conflicts with it (a rebase starts the builds again); when it \
-             does, rebase before you push (git push --force-with-lease)."
-        }
-        RebasePolicy::Never => " Don't rebase onto the base branch.",
+             does, rebase before you push ({FORCE_PUSH}).{PUSH_REFUSED}"
+        ),
+        RebasePolicy::Never => " Don't rebase onto the base branch.".into(),
     }
 }
 
@@ -637,14 +647,14 @@ fn prompt(app: &App, t: &Row, phase: &str, rec: &Value) -> String {
             if failed.is_empty() { "see the PR".to_string() } else { failed.join(", ") },
             num = t.i0("pr_num"),
             rebase = match rebase_policy(app, t) {
-                RebasePolicy::Never => rebase_advice(RebasePolicy::Never).to_string(),
+                RebasePolicy::Never => rebase_advice(RebasePolicy::Never),
                 policy => format!("{}{KEEP_BASE}", rebase_advice(policy)),
             }
         ),
         "rebase" => format!(
             "It conflicts with its base branch {base}, so it can't merge. In this task's worktree, rebase onto {base} \
              ({tb} pr status {r} lists the commands), resolve the conflicts, run the tests covering the files you \
-             resolved (not the whole suite), and push with git push --force-with-lease. The checks run again.{KEEP_BASE}",
+             resolved (not the whole suite), and push with {FORCE_PUSH}. The checks run again.{PUSH_REFUSED}{KEEP_BASE}",
             base = rec["base"].as_str().filter(|b| !b.is_empty()).unwrap_or("the base branch")
         ),
         "comments" => format!(
@@ -937,7 +947,7 @@ pub fn follow_wake(app: &App, t: &Row, text: &str) -> Result<Option<i64>> {
     let tb = board::tb_cmd(app);
     let r = rf("task", t.id());
     let args = json!({"cwd": cwd, "title": short(&format!("PR #{}: {}", t.i0("pr_num"), t.st("title")), 40), "queue": false, "visit": "follow",
-                      "prompt": format!("{text}\nPush with git push --force-with-lease, then run {tb} pr wait {r}. Don't take another task here, and don't run tb submit: the task is already submitted.")});
+                      "prompt": format!("{text}\nPush with {FORCE_PUSH}, then run {tb} pr wait {r}.{PUSH_REFUSED} Don't take another task here, and don't run tb submit: the task is already submitted.")});
     let args = resume_or_fresh(app, t, args)?;
     Ok(Some(board::create_job(app, "agent", args, Some(t.id()), "pr", None)?))
 }
@@ -1326,6 +1336,23 @@ pub fn failing(app: &App, f: &Row, rec: &Value) -> Vec<String> {
     str_list(&rec["failed"]).into_iter().filter(|c| !cleared.iter().chain(&stopped).any(|x| x.eq_ignore_ascii_case(c))).collect()
 }
 
+/// The checks whose build was stopped on this push and not run again: a stopped run of a check that has
+/// another run on the push (passed, failed or running, as when a newer workflow run cancels an older one
+/// for the same commit) was superseded, and the newer run is the one that counts.
+pub fn stopped_checks(rec: &Value) -> Vec<String> {
+    let checks = rec["checks"].as_array().cloned().unwrap_or_default();
+    let named = |c: &Value, name: &str| c["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name));
+    let mut out: Vec<String> = vec![];
+    for c in checks.iter().filter(|c| c["state"] == "stopped") {
+        let Some(name) = c["name"].as_str() else { continue };
+        let superseded = checks.iter().any(|o| named(o, name) && o["state"] != "stopped");
+        if !superseded && !out.iter().any(|x| x.eq_ignore_ascii_case(name)) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
 /// The failed checks that are builds the board stopped, which count as passed: a cancelled build reads
 /// as failed on the host. While PR builds are stopped (`prbuilds.rs`) that's every failed check; after
 /// a resume, the ones `tb pr skip-checks` counted as stopped on this push (its entry's `stopped`).
@@ -1664,14 +1691,16 @@ pub fn phase_of(app: &App, t: &Row, rec: &Value) -> String {
     let answered = f.get("answered_changes").map(|a| *a == rec["changes_at"]).unwrap_or(false);
     let new_comments = if has_threads(rec) { !open_threads(&f, rec).is_empty() } else { rec["comments"].as_i64().unwrap_or(0) > seen };
     let comments_open = (review.changes && !answered) || new_comments;
+    // A conflict comes before the checks (a failed check's wake already says to rebase): a host runs no
+    // checks on a PR that conflicts (GitHub posts none for its pushes), and any still going test a merge
+    // that can't happen, so waiting on them held the PR until the expected checks' wait ran out. The agent
+    // rebases before anyone reviews or merges it.
+    if rebase_policy(app, t) != RebasePolicy::Never && conflicting(&f, rec) {
+        return "rebase".into();
+    }
     // Review comments don't wait for the checks (#869): the agent answers them while the build runs.
     if !comments_open && !skipped && (checks_waiting(app, t, &f, rec) || running_on_host(&f, rec)) {
         return "checks".into();
-    }
-    // A conflict holds everything after the checks (a failed check's wake already says to rebase): the
-    // agent rebases before anyone reviews or merges it.
-    if rebase_policy(app, t) != RebasePolicy::Never && conflicting(&f, rec) {
-        return "rebase".into();
     }
     if comments_open {
         return "comments".into();

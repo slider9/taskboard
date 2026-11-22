@@ -164,13 +164,41 @@ pub fn advance(app: &App, sid: &str, claude: Option<&str>, why: &str) -> Result<
     app.db.x("UPDATE sessions SET ctx_task = ?, ctx_version = ? WHERE id = ?", p![next.id(), next.v("ctx_version"), sid])?;
     let r = rf("task", next.id());
     let how = if resuming { "picks up where it left off on" } else { "moves on to" };
+    let place = where_to_work(app, &s, &next)?.map(|w| format!("\n\n{w}")).unwrap_or_default();
     let text = format!(
-        "{} {why}; this terminal {how} {r} “{}”, next in its line.\n\n{}",
+        "{} {why}; this terminal {how} {r} “{}”, next in its line.{place}\n\n{}",
         handoff::marker(next.id()),
         next.st("title"),
         handoff::build(app, next.id())?
     );
     Ok(Some((next, text)))
+}
+
+/// Where `next` works when its terminal sits in a worktree slot `next` doesn't hold: the slot its last
+/// task used, which the board gives to other tasks, so switching its branch there takes another task's
+/// worktree from under it. Its own slot, else a slot it claims (slot lane), else the project's shared
+/// checkout. None when the terminal isn't in such a slot.
+fn where_to_work(app: &App, s: &Row, next: &Row) -> Result<Option<String>> {
+    let cwd = s.s("cwd").filter(|c| !c.is_empty()).or(s.s("project_path"));
+    let Some(slot) = crate::worktrees::root_of(cwd).filter(|p| crate::slots::is_slot(p)) else { return Ok(None) };
+    let r = rf("task", next.id());
+    if let Some(own) = crate::slots::held(app, next)? {
+        let path = own.st("path");
+        if crate::util::path_key(&path) == crate::util::path_key(&slot) {
+            return Ok(None);
+        }
+        return Ok(Some(format!("This terminal is in {slot}, a worktree slot {r} doesn't hold. {r} has its own: cd \"{path}\" and work there.")));
+    }
+    let left = format!(
+        "This terminal is still in {slot}, the worktree slot its last task used. It isn't {r}'s: the board gives it to \
+         other tasks, so don't switch its branch or work there."
+    );
+    let shared = crate::worktrees::repo_of(app, next)?.filter(|p| !crate::slots::is_slot(p) && std::path::Path::new(p).is_dir());
+    let tb = board::tb_cmd(app);
+    Ok(Some(match (crate::worklane::pick(app, next)?.as_str(), shared) {
+        ("slot", _) | (_, None) => format!("{left} {r} works in a slot of its own: run {tb} slot claim, then cd to the folder it prints and work there."),
+        (_, Some(repo)) => format!("{left} {r} works in the project's shared checkout: cd \"{repo}\" and work there."),
+    }))
 }
 
 /// `advance`, its text sent to the terminal (by its next hook, or typed in once it's idle).

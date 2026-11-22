@@ -436,9 +436,9 @@ fn claim_on(app: &App, t: &Row, repo: &str, start: &str, branch: Option<&str>) -
         }
         crate::dispatch::clear_alert_key(app, &dirty_key(&path))?;
         let n = s.i("n").unwrap_or(0);
-        let at = check_out(&path, start, branch)?;
+        let (at, note) = check_out(&path, start, branch)?;
         crate::progress::stage(&format!("Switched slot-{n} to {at}"));
-        take(app, t, s.id(), &path, &format!("Took worktree slot-{n} at {path}, {}", at_text(&at, start)), start)?;
+        take(app, t, s.id(), &path, &format!("Took worktree slot-{n} at {path}, {}{}", at_text(&at, start), caught_up_text(&note)), start)?;
         return Ok(path);
     }
     let have = rows(app, repo)?;
@@ -455,11 +455,15 @@ fn claim_on(app: &App, t: &Row, repo: &str, start: &str, branch: Option<&str>) -
         "worktree_slots",
         vec![("repo", json!(repo)), ("n", json!(n)), ("path", json!(path)), ("project", t.v("project")), ("made_at", json!(now))],
     )?;
-    let at = match branch {
+    let (at, note) = match branch {
         Some(_) => check_out(&path, start, branch)?,
-        None => start.to_string(),
+        None => (start.to_string(), None),
     };
-    let text = if at == start { format!("Made worktree slot-{n} from {start} at {path}") } else { format!("Made worktree slot-{n} at {path}, on its branch {at}") };
+    let text = if at == start {
+        format!("Made worktree slot-{n} from {start} at {path}")
+    } else {
+        format!("Made worktree slot-{n} at {path}, on its branch {at}{}", caught_up_text(&note))
+    };
     take(app, t, id, &path, &text, start)?;
     Ok(path)
 }
@@ -607,19 +611,28 @@ fn at_text(at: &str, start: &str) -> String {
 }
 
 /// Puts a slot on `branch` (a task's pushed branch, which every worktree of the repo shares), else
-/// detached at `start`. Where it is.
-fn check_out(path: &str, start: &str, branch: Option<&str>) -> Result<String> {
+/// detached at `start`. Where it is, and what bringing the branch up to its pushed head did. The local
+/// branch is fast-forwarded to origin's first: the branch may have been pushed from somewhere else (the
+/// owner's own worktree, another slot), and a visit that started on the old local head would rebase and
+/// push that over the newer work (#58).
+fn check_out(path: &str, start: &str, branch: Option<&str>) -> Result<(String, Option<String>)> {
     if let Some(b) = branch.filter(|b| !b.is_empty()) {
+        let caught_up = crate::default_sync::freshen(path, b, false);
         let local = git(path, &["switch", b], GIT_SECS);
         if local.code == 0 || git(path, &["switch", "-c", b, "--track", &format!("origin/{b}")], GIT_SECS).code == 0 {
-            return Ok(b.to_string());
+            return Ok((b.to_string(), caught_up));
         }
     }
     let r = crate::progress::waiting("git switch", crate::progress::WAITING_EVERY, || git(path, &["switch", "--detach", start], GIT_SECS));
     if r.code != 0 {
         return err(409, format!("Couldn't switch its worktree {path} to {start}: {}", last_line(&r.err)));
     }
-    Ok(start.to_string())
+    Ok((start.to_string(), None))
+}
+
+/// " (what bringing the branch up to its pushed head did)", or "".
+fn caught_up_text(note: &Option<String>) -> String {
+    note.as_ref().map(|n| format!(" ({n})")).unwrap_or_default()
 }
 
 /// Review fixes, a rebase or a failing check on a task that gave its slot back: claims a slot again

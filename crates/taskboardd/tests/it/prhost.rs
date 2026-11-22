@@ -1369,7 +1369,8 @@ fn status_shows_failed_steps_base_failures_reviewers_threads_and_what_blocks_the
     assert_eq!(live["base_moved"], true);
     assert_eq!(live["conflicts"], true);
     let rebase: Vec<&str> = live["rebase"].as_array().unwrap().iter().filter_map(|c| c.as_str()).collect();
-    assert_eq!(rebase[rebase.len() - 2..], ["git push --force-with-lease origin feat", "Don't push only to rebase."], "{rebase:?}");
+    assert!(rebase[rebase.len() - 2].starts_with("git push --force-with-lease --force-if-includes origin feat"), "{rebase:?}");
+    assert_eq!(rebase[rebase.len() - 1], "Don't push only to rebase.", "{rebase:?}");
     let f =&live["failures"][0];
     assert_eq!(f["check"], "e2e");
     assert_eq!(f["base_fails"], true);
@@ -1748,7 +1749,8 @@ fn a_green_approved_pr_that_conflicts_goes_to_rebase_not_merge() {
     assert_eq!(b.phase(id), "rebase");
     let w = wakes(&b, id);
     assert_eq!(w.len(), 1, "{w:?}");
-    assert!(w[0].contains("It conflicts with its base branch main") && w[0].contains("git push --force-with-lease") && w[0].contains("pr wait"), "{}", w[0]);
+    assert!(w[0].contains("It conflicts with its base branch main") && w[0].contains("git push --force-with-lease --force-if-includes") && w[0].contains("pr wait"), "{}", w[0]);
+    assert!(w[0].contains("refused as stale, someone else pushed to the branch meanwhile: never force it"), "{}", w[0]);
     let e = b.try_post(&format!("/tasks/T{id}/pr/merge"), json!({"agent": true})).unwrap_err();
     assert!(e.contains("it conflicts with its base branch main"), "{e}");
     assert!(!h.calls().iter().any(|c| c.starts_with("merge ")), "{:?}", h.calls());
@@ -1782,6 +1784,56 @@ fn a_conflict_goes_to_rebase_with_the_review_step_off() {
     h.rec.lock().mergeable = json!("MERGEABLE");
     poll(&b);
     assert_eq!(b.phase(id), "merge");
+}
+
+#[test]
+fn a_conflict_goes_to_rebase_without_waiting_on_checks_that_wont_come() {
+    // GitHub runs no checks on a PR that conflicts: the expected ones never post, and any still queued
+    // test a merge that can't happen. The agent rebases now, not once the expected checks' wait runs out.
+    let b = board_with(|c| {
+        c.pr.wake = true;
+        expects_e2e(c);
+    });
+    let id = b.pr_task(BB);
+    let mut rec = conflicting(green());
+    rec.checks = vec![check("build", "running")];
+    let h = fake(&b, rec);
+    b.post("/projects/webapp", json!({"review": "off", "agents_merge": "on"}));
+    poll(&b);
+    assert_eq!(b.phase(id), "rebase", "not checks: e2e hasn't posted and build is still queued");
+    let w = wakes(&b, id);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("It conflicts with its base branch main"), "{}", w[0]);
+
+    // The rebased push merges cleanly: now its checks count.
+    visits_done(&b, id);
+    {
+        let mut r = h.rec.lock();
+        r.head = "h2".into();
+        r.mergeable = json!("MERGEABLE");
+    }
+    poll(&b);
+    assert_eq!(b.phase(id), "checks", "the rebased push waits for build and e2e");
+}
+
+#[test]
+fn a_stopped_build_that_ran_again_on_the_push_doesnt_hold_the_merge() {
+    // A newer workflow run for the same commit cancels the older one: each check then has a stopped run
+    // and the run that counts.
+    let b = board_with(|_| {});
+    let id = b.pr_task(BB);
+    let mut rec = green();
+    rec.checks = vec![check("build", "stopped"), check("lint", "stopped"), check("build", "passed")];
+    let h = fake(&b, rec);
+    b.post("/projects/webapp", json!({"review": "off", "agents_merge": "on"}));
+    poll(&b);
+    let e = b.try_post(&format!("/tasks/T{id}/pr/merge"), json!({"agent": true})).unwrap_err();
+    assert!(e.contains("builds were stopped: lint") && !e.contains("build,") && !e.contains("stopped: build"), "only lint never ran again: {e}");
+
+    h.rec.lock().checks.push(check("lint", "passed"));
+    poll(&b);
+    b.post(&format!("/tasks/T{id}/pr/merge"), json!({"agent": true}));
+    assert_eq!(b.phase(id), "merged");
 }
 
 #[test]

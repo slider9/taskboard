@@ -667,7 +667,7 @@ pub fn check_branch(cfg: &PrBodyConfig, dir: &str, base: &str, given: Option<&st
     if given.is_none() {
         let (_, head, _) = git(dir, &["rev-parse", "HEAD"], 10.0)?;
         if there != head {
-            return Err(format!("{remote}/{branch} isn't this commit: push it (git push --force-with-lease after a rebase), then run tb submit again."));
+            return Err(format!("{remote}/{branch} isn't this commit: push it ({} after a rebase), then run tb submit again.", crate::prflow::FORCE_PUSH));
         }
     }
     if cfg.rebased {
@@ -675,13 +675,14 @@ pub fn check_branch(cfg: &PrBodyConfig, dir: &str, base: &str, given: Option<&st
         let base_ref = format!("{remote}/{base}");
         let (on_top, _, _) = git(dir, &["merge-base", "--is-ancestor", &base_ref, &tip], 10.0)?;
         if !on_top {
-            return Err(format!("{branch} isn't rebased on {base_ref}: git rebase {base_ref}, push with --force-with-lease, then run tb submit again."));
+            return Err(format!("{branch} isn't rebased on {base_ref}: git rebase {base_ref}, push with {}, then run tb submit again.", crate::prflow::FORCE_PUSH));
         }
         let (_, merges, _) = git(dir, &["rev-list", "--merges", &format!("{base_ref}..{tip}")], 10.0)?;
         if !merges.is_empty() {
             return Err(format!(
-                "{branch} has {} on top of {base_ref}: rebase instead (git rebase {base_ref}), push with --force-with-lease, then run tb submit again.",
-                plural(merges.lines().count() as i64, "merge commit")
+                "{branch} has {} on top of {base_ref}: rebase instead (git rebase {base_ref}), push with {}, then run tb submit again.",
+                plural(merges.lines().count() as i64, "merge commit"),
+                crate::prflow::FORCE_PUSH
             ));
         }
     }
