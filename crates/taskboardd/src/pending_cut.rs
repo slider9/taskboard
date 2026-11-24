@@ -339,17 +339,21 @@ fn git(dir: &str, args: &[&str]) -> Option<String> {
     Some(o.stdout.trim().to_string())
 }
 
-/// Runs the release script in the cut's checkout, which must be on main or a release/* branch and is
-/// fast-forwarded to origin's copy of it first, as `tb release cut` does. Why it didn't go out, if it didn't.
+/// Runs the release script in the cut's checkout, which must be on the project's release branch (main or a
+/// release/* branch unless it set one) and is fast-forwarded to origin's copy of it first, as `tb release cut` does. Why it didn't go out, if it didn't.
 fn run_script(app: &App, r: &Row, script: &str) -> Option<String> {
     let name = r.st("name");
     let dir = r.s("dir").map(str::to_string).or_else(|| crate::projects::project_path(app, Some(r.s("project")?)).ok().flatten());
     let Some(dir) = dir.filter(|d| std::path::Path::new(d).is_dir()) else { return Some("its checkout is gone".into()) };
     let top = git(&dir, &["rev-parse", "--show-toplevel"]).filter(|t| !t.is_empty()).map(|t| crate::util::native(&t)).unwrap_or(dir);
     let branch = git(&top, &["branch", "--show-current"]).unwrap_or_default();
-    if branch != "main" && !branch.starts_with("release/") {
+    let allowed = match crate::releases::release_branch(app, &r.st("project")) {
+        Ok(a) => a,
+        Err(e) => return Some(format!("the board couldn't read its release branch: {e}")),
+    };
+    if !crate::releases::on_release_branch(allowed.as_deref(), &branch) {
         let on = if branch.is_empty() { "a detached HEAD".to_string() } else { branch };
-        return Some(format!("{top} is on {on}, and the release script only runs on main or a release/* branch"));
+        return Some(format!("{top} is on {on}, and the release script only runs on {}", crate::releases::release_branch_text(allowed.as_deref())));
     }
     match crate::default_sync::catch_up(&top, &branch) {
         Err(why) => return Some(why),

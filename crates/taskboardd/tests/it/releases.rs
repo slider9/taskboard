@@ -676,6 +676,39 @@ fn a_cut_now_runs_its_script_in_the_background_and_shows_its_output() {
 }
 
 #[test]
+fn a_release_branch_is_a_project_setting_the_cut_runs_its_script_from() {
+    let (d, app) = new_board();
+    let webapp = checkout_with_script(d.path(), &app, "echo cut $1 #");
+    assert_eq!(project(&app, "webapp")["release_branch"], Value::Null);
+    for bad in ["has space", "-x", "a..b", "x/", "*", "a*b", "ship/*/x"] {
+        assert_eq!(try_call(&app, "POST", "/projects/webapp", &[], json!({"release_branch": bad})).unwrap_err().0, 400, "{bad}");
+    }
+    let v = call(&app, "POST", "/projects/webapp", json!({"release_branch": " feat/windows-native "}));
+    assert_eq!(v["release_branch"], "feat/windows-native");
+    assert_eq!(project(&app, "api")["release_branch"], Value::Null);
+    let v = call(&app, "POST", "/releases", json!({"name": "v1", "project": "webapp", "check": true}));
+    assert_eq!(v["release_branch"], "feat/windows-native", "the check hands it to tb release cut");
+
+    let cwd = webapp.to_string_lossy().to_string();
+    call(&app, "POST", "/releases", json!({"name": "v1", "project": "webapp", "cwd": cwd, "now": true}));
+    let ready = taskboardd::pending_cut::check(&app).unwrap();
+    assert_eq!(taskboardd::pending_cut::fire(&app, &ready[0]).unwrap(), None, "main isn't its release branch");
+    let why = get(&app, "/releases", "webapp")["dropped"]["why"].as_str().unwrap().to_string();
+    assert!(why.contains("is on main, and the release script only runs on feat/windows-native"), "{why}");
+
+    git(&webapp, &["switch", "-q", "-c", "feat/windows-native"]);
+    git(&webapp, &["push", "-q", "origin", "feat/windows-native"]);
+    call(&app, "POST", "/releases", json!({"name": "v1", "project": "webapp", "cwd": cwd, "now": true}));
+    let ready = taskboardd::pending_cut::check(&app).unwrap();
+    assert!(taskboardd::pending_cut::fire(&app, &ready[0]).unwrap().is_some(), "{:?}", get(&app, "/releases", "webapp")["dropped"]);
+    let log = std::fs::read_to_string(taskboardd::pending_cut::log_path(&app, "webapp")).unwrap();
+    assert!(log.contains("cut v1"), "{log}");
+
+    let v = call(&app, "POST", "/projects/webapp", json!({"release_branch": "default"}));
+    assert_eq!(v["release_branch"], Value::Null);
+}
+
+#[test]
 fn a_running_cut_shows_the_end_of_its_log() {
     let (d, app) = new_board();
     let webapp = checkout_with_script(d.path(), &app, "true");

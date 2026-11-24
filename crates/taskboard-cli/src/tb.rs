@@ -2102,6 +2102,9 @@ enum ProjectCmd {
         /// A command tb release cut runs in the checkout, with the release name, before recording the release (none: no script)
         #[arg(long = "release-script")]
         release_script: Option<String>,
+        /// The branch its release script runs from, or a pattern like release/* (default: main or a release/* branch)
+        #[arg(long = "release-branch")]
+        release_branch: Option<String>,
         /// The reviewer the board runs on a task's code before its PR (docs/REVIEW-PROTOCOL.md): a command, none, or default (config.toml's [code_review] command)
         #[arg(long = "code-review")]
         code_review: Option<String>,
@@ -4770,7 +4773,7 @@ enum ReleaseCut {
 /// `branch_ok` checks the checkout the script would run in.
 fn cut_release(
     call: &mut dyn FnMut(Value) -> Result<Value, String>,
-    branch_ok: &mut dyn FnMut(Option<&str>) -> Result<(), String>,
+    branch_ok: &mut dyn FnMut(Option<&str>, Option<&str>) -> Result<(), String>,
     mut body: Value,
     no_script: bool,
 ) -> Result<ReleaseCut, String> {
@@ -4779,7 +4782,7 @@ fn cut_release(
         check["check"] = json!(true);
         let v = call(check)?;
         if v["script"].is_string() {
-            branch_ok(v["dir"].as_str())?;
+            branch_ok(v["dir"].as_str(), v["release_branch"].as_str())?;
             body["now"] = json!(true);
             return call(body).map(ReleaseCut::Started);
         }
@@ -4932,13 +4935,16 @@ fn release_run(c: &Ctx, v: &Value, tries: usize) -> Option<String> {
     None
 }
 
-/// Releases come from main or a release/* branch: a cut from a feature branch would tag work that hasn't merged.
-fn need_release_branch(branch: &str) -> Result<(), String> {
-    if branch == "main" || branch.starts_with("release/") {
+/// Releases come from the project's release branch, main or a release/* branch unless it set one: a cut from a
+/// feature branch would tag work that hasn't merged.
+fn need_release_branch(allowed: Option<&str>, branch: &str) -> Result<(), String> {
+    use taskboardd::releases::{on_release_branch, release_branch_text};
+    if on_release_branch(allowed, branch) {
         return Ok(());
     }
     let on = if branch.is_empty() { "a detached HEAD".to_string() } else { branch.to_string() };
-    Err(format!("release cut only runs on main or a release/* branch, and this checkout is on {on}. Switch to one and run it again."))
+    let to = if allowed.is_some_and(|a| !a.ends_with("/*")) { "it" } else { "one" };
+    Err(format!("release cut only runs on {}, and this checkout is on {on}. Switch to {to} and run it again.", release_branch_text(allowed)))
 }
 
 /// The checkout a release script runs in: the folder's git top level, else the folder.
@@ -4964,9 +4970,10 @@ fn checkout_branch(top: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Whether the checkout a release script would run in is on main or a release/* branch.
-fn release_branch_ok(dir: Option<&str>) -> Result<(), String> {
-    need_release_branch(&checkout_branch(&release_checkout(dir)))
+/// Whether the checkout a release script would run in is on the project's release branch (`allowed`, else main
+/// or a release/* branch).
+fn release_branch_ok(dir: Option<&str>, allowed: Option<&str>) -> Result<(), String> {
+    need_release_branch(allowed, &checkout_branch(&release_checkout(dir)))
 }
 
 fn release_cmd(c: &Ctx, action: ReleaseCmd) -> Result<i32, String> {
@@ -8081,7 +8088,8 @@ fn project_line(p: &Value) -> String {
         String::new()
     };
     let tags = p["release_tags"].as_str().map(|t| format!(", cut by tags {t}")).unwrap_or_default()
-        + &p["release_script"].as_str().map(|s| format!(", release script {s}")).unwrap_or_default();
+        + &p["release_script"].as_str().map(|s| format!(", release script {s}")).unwrap_or_default()
+        + &p["release_branch"].as_str().map(|b| format!(" from {b}")).unwrap_or_default();
     let releases = match p["releases"].as_bool() {
         Some(on) => format!(" · releases {}{}", if on { "on" } else { "off" }, if on { tags.as_str() } else { "" }),
         None => String::new(),
@@ -8177,7 +8185,7 @@ fn project_cmd(c: &Ctx, action: ProjectCmd) -> Result<i32, String> {
             }
             Ok(0)
         }
-        ProjectCmd::Set { name, pr_flow, approvals, expected_check, required_check, expected_wait, ask_stage, swap, review, agents_merge, owner_review, max_terminals, min_slots, max_slots, idle_trim_days, idle_remove_days, low_disk_gb, waits_on, stack_merge_default, devices, releases, release_tags, release_script, code_review } => {
+        ProjectCmd::Set { name, pr_flow, approvals, expected_check, required_check, expected_wait, ask_stage, swap, review, agents_merge, owner_review, max_terminals, min_slots, max_slots, idle_trim_days, idle_remove_days, low_disk_gb, waits_on, stack_merge_default, devices, releases, release_tags, release_script, release_branch, code_review } => {
             let mut body = project_rules(approvals, expected_check, expected_wait, required_check)?;
             for (key, flag, v) in [
                 ("min_slots", "--min-slots", min_slots),
@@ -8222,6 +8230,9 @@ fn project_cmd(c: &Ctx, action: ProjectCmd) -> Result<i32, String> {
             }
             if let Some(s) = release_script {
                 body.insert("release_script".into(), json!(s));
+            }
+            if let Some(b) = release_branch {
+                body.insert("release_branch".into(), json!(b));
             }
             if let Some(s) = code_review {
                 body.insert("code_review".into(), json!(s));
@@ -10260,23 +10271,24 @@ mod tests {
         assert_eq!(pr_hint("GET", "repositories/acme/web/src/main/README.md", None), None);
     }
 
-    /// `cut_release` against a fake board: the result, the bodies it posted, and the checkouts it checked.
-    fn cut_with(script: Option<&str>, branch: Result<(), String>, no_script: bool) -> (Result<ReleaseCut, String>, Vec<Value>, Vec<Option<String>>) {
+    /// `cut_release` against a fake board whose project's release branch is feat/windows-native: the result, the
+    /// bodies it posted, and the checkouts it checked with the release branch it checked them against.
+    fn cut_with(script: Option<&str>, branch: Result<(), String>, no_script: bool) -> (Result<ReleaseCut, String>, Vec<Value>, Vec<(Option<String>, Option<String>)>) {
         let mut posted = vec![];
         let mut checked = vec![];
         let r = cut_release(
             &mut |b| {
                 posted.push(b.clone());
                 Ok(if b["check"] == true {
-                    json!({"project": "webapp", "name": "v1.4", "script": script, "dir": "/repo"})
+                    json!({"project": "webapp", "name": "v1.4", "script": script, "release_branch": "feat/windows-native", "dir": "/repo"})
                 } else if b["now"] == true {
                     json!({"name": "v1.4", "now": true, "after": []})
                 } else {
                     json!({"ref": "R1", "name": "v1.4"})
                 })
             },
-            &mut |d| {
-                checked.push(d.map(str::to_string));
+            &mut |d, allowed| {
+                checked.push((d.map(str::to_string), allowed.map(str::to_string)));
                 branch.clone()
             },
             json!({"name": "v1.4", "cwd": "/repo"}),
@@ -10298,7 +10310,7 @@ mod tests {
     fn release_cut_hands_a_script_cut_to_the_board_to_run_in_the_background() {
         let (r, posted, checked) = cut_with(Some("scripts/release.sh"), Ok(()), false);
         assert!(matches!(r, Ok(ReleaseCut::Started(v)) if v["name"] == "v1.4"));
-        assert_eq!(checked, vec![Some("/repo".to_string())], "it checks the branch the script would run on");
+        assert_eq!(checked, vec![(Some("/repo".to_string()), Some("feat/windows-native".to_string()))], "it checks the branch the script would run on against the project's");
         assert_eq!(posted.len(), 2);
         assert_eq!(posted[0]["check"], true, "it asks before handing it over");
         assert_eq!(posted[1]["now"], true);
@@ -10369,16 +10381,29 @@ mod tests {
 
     #[test]
     fn release_cut_runs_only_on_main_or_a_release_branch() {
-        assert!(need_release_branch("main").is_ok());
-        assert!(need_release_branch("release/1.4").is_ok());
-        assert!(need_release_branch("feat/t1-x").unwrap_err().contains("on feat/t1-x"));
-        assert!(need_release_branch("").unwrap_err().contains("detached HEAD"));
+        assert!(need_release_branch(None, "main").is_ok());
+        assert!(need_release_branch(None, "release/1.4").is_ok());
+        assert!(need_release_branch(None, "feat/t1-x").unwrap_err().contains("on feat/t1-x"));
+        assert!(need_release_branch(None, "").unwrap_err().contains("detached HEAD"));
+    }
+
+    #[test]
+    fn release_cut_runs_on_the_release_branch_a_project_sets() {
+        let w = Some("feat/windows-native");
+        assert!(need_release_branch(w, "feat/windows-native").is_ok());
+        let err = need_release_branch(w, "main").unwrap_err();
+        assert!(err.contains("only runs on feat/windows-native, and this checkout is on main. Switch to it"), "{err}");
+        let p = Some("ship/*");
+        assert!(need_release_branch(p, "ship/1.2").is_ok());
+        assert!(need_release_branch(p, "ship").is_err());
+        let err = need_release_branch(p, "release/1.2").unwrap_err();
+        assert!(err.contains("only runs on a ship/* branch") && err.contains("Switch to one"), "{err}");
     }
 
     #[test]
     fn release_cut_stops_when_the_board_refuses_the_check() {
         let mut checked = false;
-        let r = cut_release(&mut |_| Err("Nothing to release".into()), &mut |_| { checked = true; Ok(()) }, json!({"name": "v1"}), false);
+        let r = cut_release(&mut |_| Err("Nothing to release".into()), &mut |_, _| { checked = true; Ok(()) }, json!({"name": "v1"}), false);
         assert_eq!(r.err().as_deref(), Some("Nothing to release"));
         assert!(!checked, "a doomed cut is never handed over");
     }

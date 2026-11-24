@@ -515,6 +515,7 @@ pub fn describe(app: &App, p: &Value) -> Result<Value> {
     o.insert("releases_set".into(), json!(crate::releases::setting(app, name)?));
     o.insert("release_tags".into(), json!(crate::release_tags::pattern(app, name)?));
     o.insert("release_script".into(), json!(crate::releases::script(app, name)?));
+    o.insert("release_branch".into(), json!(crate::releases::release_branch(app, name)?));
     o.insert("code_review".into(), json!(crate::code_review::command(app, name)?));
     o.insert("code_review_set".into(), json!(crate::code_review::setting(app, name)?));
     o.insert("waits_on".into(), json!(waits_on(app, name)));
