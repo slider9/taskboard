@@ -45,6 +45,9 @@ const SETTING: &str = "project_releases";
 /// `tb project set --release-script`: name → the command `tb release cut` runs first.
 const SCRIPT_SETTING: &str = "project_release_script";
 const SCRIPT_MAX: usize = 500;
+/// `tb project set --release-branch`: name → the branch, or `prefix/*`, its release script runs from.
+const BRANCH_SETTING: &str = "project_release_branch";
+const BRANCH_MAX: usize = 100;
 
 /// A done task that goes in the next cut: not failed, in no release, its PR merged or with no PR.
 const RELEASABLE: &str = "status = 'done' AND COALESCE(failed, 0) = 0 AND release_id IS NULL
@@ -311,6 +314,75 @@ pub fn set_script(app: &App, project: &str, body: &Value) -> Result<bool> {
     Ok(true)
 }
 
+fn branches(app: &App) -> Result<Row> {
+    Ok(jloads_obj(app.db.get_setting(BRANCH_SETTING)?.as_deref()))
+}
+
+/// The branch, or `prefix/*`, the project's release script runs from, if it set one (else main or release/*).
+pub fn release_branch(app: &App, project: &str) -> Result<Option<String>> {
+    Ok(branches(app)?.get(project).and_then(|v| v.as_str()).map(str::to_string))
+}
+
+/// Whether a release script may run on `branch`: the project's release branch (exactly, or under its
+/// `prefix/*`), or main or a release/* branch when it set none.
+pub fn on_release_branch(set: Option<&str>, branch: &str) -> bool {
+    let fits = |p: &str| match p.strip_suffix("/*") {
+        Some(prefix) => branch.strip_prefix(prefix).and_then(|r| r.strip_prefix('/')).is_some_and(|r| !r.is_empty()),
+        None => branch == p,
+    };
+    match set {
+        Some(p) => fits(p),
+        None => fits("main") || fits("release/*"),
+    }
+}
+
+/// The branches a release script may run on, as a refusal says them.
+pub fn release_branch_text(set: Option<&str>) -> String {
+    match set {
+        Some(p) if p.ends_with("/*") => format!("a {p} branch"),
+        Some(p) => p.to_string(),
+        None => "main or a release/* branch".into(),
+    }
+}
+
+/// Sets a project's release branch from a body's `release_branch` (null, "", "none" or "default": main or
+/// release/*). False when the body doesn't name it.
+pub fn set_release_branch(app: &App, project: &str, body: &Value) -> Result<bool> {
+    let Some(v) = body.get("release_branch") else { return Ok(false) };
+    let bad = || err(400, format!("release_branch is a branch like main, or a pattern like release/*, {BRANCH_MAX} characters at most; or default."));
+    let to = match v {
+        Value::Null => None,
+        Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() || s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("default") {
+                None
+            } else {
+                let name = s.strip_suffix("/*").unwrap_or(s);
+                let ok = s.chars().count() <= BRANCH_MAX
+                    && !name.is_empty()
+                    && !name.starts_with(['-', '/'])
+                    && !name.ends_with(['/', '.'])
+                    && !name.contains("..")
+                    && !name.contains("//")
+                    && !name.contains("@{")
+                    && !name.chars().any(|c| c.is_whitespace() || c.is_control() || "~^:?*[\\".contains(c));
+                if !ok {
+                    return bad();
+                }
+                Some(s.to_string())
+            }
+        }
+        _ => return bad(),
+    };
+    let mut all = branches(app)?;
+    match to {
+        Some(s) => all.insert(project.into(), json!(s)),
+        None => all.remove(project),
+    };
+    app.db.set_setting(BRANCH_SETTING, Some(&jdumps(&Value::Object(all))))?;
+    Ok(true)
+}
+
 /// A changelog ready to paste: the release's name and date, its notes, then its tasks under their goals.
 fn markdown(title: &str, notes: Option<&str>, groups: &[Value]) -> String {
     let mut out = format!("## {title}\n");
@@ -432,7 +504,7 @@ fn cut(app: &App, body: &Value) -> Result<Value> {
         let dir = script_dir(app, body, &project)?;
         // `replaces`: the script may move the failed release's tag instead of refusing it.
         let replaces = failed_named(app, &project, &name)?;
-        return Ok(json!({"project": project, "name": name, "unreleased": tasks.len(), "script": script(app, &project)?, "dir": dir, "replaces": replaces}));
+        return Ok(json!({"project": project, "name": name, "unreleased": tasks.len(), "script": script(app, &project)?, "release_branch": release_branch(app, &project)?, "dir": dir, "replaces": replaces}));
     }
     let who = board::caller(app, body, board::OWNER);
     let id = put_in_release(app, &project, &name, notes, &tasks, &who)?;
