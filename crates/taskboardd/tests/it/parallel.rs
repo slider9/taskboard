@@ -293,7 +293,7 @@ fn making_a_worktree_says_each_stage_on_the_progress_stream() {
 }
 
 #[test]
-fn a_worktree_base_is_checked_and_a_missing_one_fails_the_start_with_retries() {
+fn a_worktree_base_is_checked_and_a_missing_one_starts_from_the_default_branch() {
     let b = new_board();
     git_repo(&b);
     let g = b.side_by_side();
@@ -304,15 +304,13 @@ fn a_worktree_base_is_checked_and_a_missing_one_fails_the_start_with_retries() {
     b.post(&format!("goals/G{g}"), json!({"worktree_base": "off"}));
     assert!(b.get(&format!("goals/G{g}"))["worktree_base"].is_null());
 
+    // A base that's gone doesn't fail the start: the slot starts from the default branch (or HEAD) instead.
     b.post(&format!("goals/G{g}"), json!({"worktree_base": "origin/nope"}));
     let t = b.task("Fix", json!({"goal_id": g}));
     runner::start_queued(&b.app).unwrap();
-    assert!(b.started().is_empty());
     let row = board::get_task(&b.app, t).unwrap();
-    assert!(row.s("retry_at").is_some(), "it tries again later");
-    assert!(row.st("latest").contains("Couldn't make its worktree from origin/nope"), "{}", row.st("latest"));
-    runner::start_queued(&b.app).unwrap();
-    assert!(b.started().is_empty(), "it waits for the retry");
+    assert!(row.s("retry_at").is_none(), "{}", row.st("latest"));
+    assert_eq!(b.start_job(t).st("cwd"), slot(&b, 1));
 }
 
 #[test]

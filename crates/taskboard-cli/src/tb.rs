@@ -10182,7 +10182,7 @@ mod tests {
         assert!(Cli::try_parse_from(["tb", "alert", "clear", "main:web"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "pr", "status"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "token", "bitbucket", "--user"]).is_ok());
-        assert!(Cli::try_parse_from(["tb", "token", "jira"]).is_err());
+        assert!(Cli::try_parse_from(["tb", "token", "jira"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "jira"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "jira", "J12", "ok", "key=PROJ-1", "status=To Do", "found=yes"]).is_ok());
         assert!(Cli::try_parse_from(["tb", "jira", "J12", "fail", "no", "such", "project"]).is_ok());

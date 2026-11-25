@@ -163,8 +163,8 @@ fn a_week_reports_merged_released_and_human_work_apart_and_leaves_out_closed_prs
     assert_eq!(f["agent"]["categories"][0], json!({"name": "build", "minutes": 10.0}));
 
     let w = &f["waiting"];
-    assert_eq!(w["minutes"], 30.0);
-    assert_eq!((w["tasks"][0]["task"].clone(), w["tasks"][0]["human"].clone()), (json!(format!("H{mine}")), json!(true)));
+    assert_eq!(w["minutes"], 0.0, "the owner's own task waiting on them isn't waiting on the owner");
+    assert!(w["tasks"].as_array().unwrap().is_empty(), "{w}");
     assert_eq!(f["usage"], Value::Null, "no usage samples were taken");
 
     let wed_row = f["days"].as_array().unwrap().iter().find(|d| d["date"] == "2026-10-07").unwrap();

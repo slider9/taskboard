@@ -3409,6 +3409,12 @@ mod tests {
             ctx.insert("worktree_base".into(), json!(base));
             board::save_context(&app, id, &ctx, false).unwrap();
         };
+        // A base that's gone no longer fails a claim (the slot starts from the default branch or HEAD instead),
+        // so the claims fail here for want of any commit to start from.
+        let repo = dir.path().join("repo").to_str().unwrap().to_string();
+        let git = |args: &[&str]| crate::worktrees::git(&repo, args, 30.0);
+        let branch = git(&["symbolic-ref", "--short", "HEAD"]).out.trim().to_string();
+        assert_eq!(git(&["symbolic-ref", "HEAD", "refs/heads/unborn"]).code, 0);
         set_base("origin/gone");
         board::update_task(&app, id, fields!["pr_phase" => "comments"]).unwrap();
         let said = || app.db.count("SELECT COUNT(*) FROM events WHERE task_id = ? AND text LIKE 'Couldn''t get a worktree slot%'", p![id]).unwrap();
@@ -3424,8 +3430,8 @@ mod tests {
         }
         let a = dispatch::alerts(&app).into_iter().find(|a| a["key"] == claim_alert_key(id)).unwrap();
         assert!(!claim_alert_resolved(&app, &a).unwrap(), "it holds while the claims fail");
-        set_base("HEAD");
-        assert!(follow_wake(&app, &board::get_task(&app, id).unwrap(), "Rebase").unwrap().is_some(), "the claim works again");
+        assert_eq!(git(&["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")]).code, 0);
+        assert!(follow_wake(&app, &board::get_task(&app, id).unwrap(), "Rebase").unwrap().is_some(), "the claim works again: a gone base starts from HEAD");
         let t = board::get_task(&app, id).unwrap();
         assert!(!flow(&t).contains_key("claim_fails") && !flow(&t).contains_key("claim_error"));
         assert_eq!(alerted(), 0);
