@@ -541,18 +541,22 @@ fn removing_a_device_tasks_or_goals_still_need_is_refused_unless_forced() {
 
 #[test]
 fn a_focus_that_fails_says_why() {
-    let b = board_with(|c| c.devices.focus_timeout_secs = Some(1.0));
+    // A roomy limit for the commands that end at once: a loaded machine (Git Bash on Windows in a full
+    // run) can take over a second just to start the shell.
+    let b = board_with(|c| c.devices.focus_timeout_secs = Some(60.0));
     b.post("devices", json!({"name": "sim-a", "focus": "echo 'sim-a is not running.' >&2; exit 3"}));
     b.post("devices", json!({"name": "sim-b", "focus": "exit 4"}));
-    b.post("devices", json!({"name": "sim-c", "focus": "sleep 5"}));
     b.post("devices", json!({"name": "sim-d", "focus": "true"}));
     let (code, msg) = b.post_err("devices/sim-a/focus", json!({}));
     assert_eq!((code, msg.as_str()), (409, "Couldn't bring up sim-a: sim-a is not running."));
     let (_, msg) = b.post_err("devices/sim-b/focus", json!({}));
     assert_eq!(msg, "Couldn't bring up sim-b: its focus command exited 4");
-    let (_, msg) = b.post_err("devices/sim-c/focus", json!({}));
-    assert_eq!(msg, "Couldn't bring up sim-c: its focus command took over 1 seconds");
     assert_eq!(b.post("devices/sim-d/focus", json!({}))["ok"], true);
+
+    let slow = board_with(|c| c.devices.focus_timeout_secs = Some(1.0));
+    slow.post("devices", json!({"name": "sim-c", "focus": "sleep 5"}));
+    let (_, msg) = slow.post_err("devices/sim-c/focus", json!({}));
+    assert_eq!(msg, "Couldn't bring up sim-c: its focus command took over 1 seconds");
 }
 
 #[test]
