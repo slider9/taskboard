@@ -1403,7 +1403,8 @@ fn deny(reason: &str) {
 ///
 /// Not in auto mode either. There Claude Code gives no verdict on a call a hook changed, so Claude
 /// has to send the changed command again, every time, and a worktree session's guard then turns the
-/// group down as too complex to check. A stray read there waits for the Bash tool's time limit.
+/// group down as too complex to check. There [`stdin_refused`] turns down a command that would read
+/// its input with nothing giving it any, unchanged, and says how to send it instead.
 ///
 /// In a board terminal (`session`), a command that builds in a pool slot also builds into the slot's
 /// own `target/` (`builds::slot_target`), whatever folder the terminal opened in: a task that claimed
@@ -1448,6 +1449,690 @@ fn stdin_closed(command: &str, target: Option<&str>) -> Option<String> {
 /// `s` as one single-quoted shell word.
 fn shell_quoted(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// `PreToolUse` on Bash in auto mode: refuses a command that reads its standard input with nothing in
+/// it giving any (`cat > notes.txt`, `python -`, `read x`), with a reason that says how to send it
+/// instead. Such a command waits for typing that never comes until the Bash tool's time limit. In the
+/// other modes [`close_stdin`] gives it /dev/null; in auto mode the hook can't change the command
+/// (Claude Code gives no verdict on a changed call), so it refuses it, unchanged. True when it refused.
+fn stdin_refused(payload: &Value) -> bool {
+    let Some(reason) = stdin_refusal(payload) else { return false };
+    deny(&reason);
+    true
+}
+
+/// Why [`stdin_refused`] turns this call down, or None to let it run.
+fn stdin_refusal(payload: &Value) -> Option<String> {
+    if payload["tool_name"] != "Bash" || payload["permission_mode"] != "auto" {
+        return None;
+    }
+    let reader = stdin_reader(payload["tool_input"]["command"].as_str()?)?;
+    Some(format!(
+        "Not run: `{reader}` reads its standard input, and nothing in the command gives it any. In auto mode nobody \
+         types into it, so it would wait until the Bash tool's time limit and then fail. Send the command again with \
+         its input in it: a heredoc (`python - <<'EOF'` … with `EOF` alone on the last line) or a pipe for text it \
+         should read, `< file` for a file, or `< /dev/null` when it needs none. A long script is surer written to a \
+         file with the Write tool and run from there."
+    ))
+}
+
+/// The first simple command in `command` that reads its standard input with nothing in the command
+/// giving it any, as its words. A pipe, an input redirection (`<`, a heredoc, `<<<`) on it or on a
+/// group around it, `&` (a background job's input is /dev/null) or an `exec <` before it all give it
+/// input. Which commands read it is [`reads_stdin`]'s list; anything else is left alone.
+fn stdin_reader(command: &str) -> Option<String> {
+    let mut lexer = ShLexer { c: command.chars().collect(), i: 0, heredocs: Vec::new(), want_delim: None };
+    let toks = lexer.tokens(None);
+    let mut parser = ShParser { t: &toks, i: 0 };
+    let mut cmds = Vec::new();
+    // A stray `)` ends a list early: carry on past it.
+    while parser.i < toks.len() {
+        cmds.extend(parser.list(&[]));
+        parser.i += 1;
+    }
+    cmds.into_iter().find(|s| !s.fed && reads_stdin(&s.words)).map(|s| clip(&s.words.join(" "), 80))
+}
+
+/// A Bash command's tokens, as [`stdin_reader`] needs them: quotes taken off words, heredoc bodies
+/// skipped, comments dropped.
+#[derive(Debug, Clone, PartialEq)]
+enum Sh {
+    Word(String),
+    /// `|`, `|&`, `||`, `&&`, `&`, `;` (a line's end too), `;;`, `(` or `)`.
+    Op(&'static str),
+    /// A redirection, true when it gives the command its standard input (`<`, `<<`, `<<<`, `0<&`…). The
+    /// word after it is its target.
+    Redir(bool),
+    /// A command substitution (`$(…)`, `` `…` ``) or a process substitution (`<(…)`, `>(…)`); true
+    /// when the command around it feeds it (`>(…)`, which reads what the command writes).
+    Sub(Vec<Sh>, bool),
+}
+
+struct ShLexer {
+    c: Vec<char>,
+    i: usize,
+    /// Heredocs whose bodies start at the next line's start: the end word, and whether tabs before it
+    /// are dropped (`<<-`).
+    heredocs: Vec<(String, bool)>,
+    /// After `<<` or `<<-`: the next word is a heredoc's end word.
+    want_delim: Option<bool>,
+}
+
+impl ShLexer {
+    fn at(&self, k: usize) -> Option<char> {
+        self.c.get(self.i + k).copied()
+    }
+
+    /// Tokens up to the end, or up to the `stop` that closes a substitution (consumed).
+    // `flush!` resets `in_word` for the next character, also where no character follows.
+    #[allow(unused_assignments)]
+    fn tokens(&mut self, stop: Option<char>) -> Vec<Sh> {
+        let mut out = Vec::new();
+        let mut word = String::new();
+        let mut in_word = false;
+        let mut depth = 0usize;
+        macro_rules! flush {
+            () => {
+                if in_word {
+                    if let Some(dash) = self.want_delim.take() {
+                        self.heredocs.push((word.clone(), dash));
+                    }
+                    out.push(Sh::Word(std::mem::take(&mut word)));
+                    in_word = false;
+                }
+            };
+        }
+        while let Some(ch) = self.at(0) {
+            match ch {
+                '\\' => {
+                    if let Some(n) = self.at(1).filter(|n| *n != '\n') {
+                        word.push(n);
+                        in_word = true;
+                    }
+                    self.i += 2;
+                }
+                '\'' => {
+                    self.i += 1;
+                    while let Some(q) = self.at(0) {
+                        self.i += 1;
+                        if q == '\'' {
+                            break;
+                        }
+                        word.push(q);
+                    }
+                    in_word = true;
+                }
+                '"' => {
+                    self.i += 1;
+                    in_word = true;
+                    while let Some(q) = self.at(0) {
+                        match q {
+                            '"' => {
+                                self.i += 1;
+                                break;
+                            }
+                            '\\' => {
+                                word.extend(self.at(1));
+                                self.i += 2;
+                            }
+                            '$' if self.at(1) == Some('(') => {
+                                self.i += 2;
+                                out.push(Sh::Sub(self.tokens(Some(')')), false));
+                                word.push('$');
+                            }
+                            '`' => {
+                                self.i += 1;
+                                out.push(Sh::Sub(self.tokens(Some('`')), false));
+                                word.push('$');
+                            }
+                            _ => {
+                                word.push(q);
+                                self.i += 1;
+                            }
+                        }
+                    }
+                }
+                '$' if self.at(1) == Some('(') => {
+                    self.i += 2;
+                    out.push(Sh::Sub(self.tokens(Some(')')), false));
+                    word.push('$');
+                    in_word = true;
+                }
+                '$' if self.at(1) == Some('{') => {
+                    while let Some(q) = self.at(0) {
+                        word.push(q);
+                        self.i += 1;
+                        if q == '}' {
+                            break;
+                        }
+                    }
+                    in_word = true;
+                }
+                '`' if stop == Some('`') => {
+                    flush!();
+                    self.i += 1;
+                    return out;
+                }
+                '`' => {
+                    self.i += 1;
+                    out.push(Sh::Sub(self.tokens(Some('`')), false));
+                    word.push('$');
+                    in_word = true;
+                }
+                '#' if !in_word => {
+                    while self.at(0).is_some_and(|q| q != '\n') {
+                        self.i += 1;
+                    }
+                }
+                ' ' | '\t' | '\r' => {
+                    flush!();
+                    self.i += 1;
+                }
+                '\n' => {
+                    flush!();
+                    out.push(Sh::Op(";"));
+                    self.i += 1;
+                    self.skip_heredocs();
+                }
+                '<' | '>' if self.at(1) == Some('(') && !(in_word && word.chars().all(|d| d.is_ascii_digit())) => {
+                    // A process substitution: a file name the command reads or writes. What `>(…)` runs
+                    // reads what the command writes there.
+                    flush!();
+                    self.i += 2;
+                    out.push(Sh::Sub(self.tokens(Some(')')), ch == '>'));
+                    out.push(Sh::Word("/dev/fd/63".into()));
+                }
+                '<' | '>' => {
+                    let fd = if in_word && !word.is_empty() && word.chars().all(|d| d.is_ascii_digit()) {
+                        in_word = false;
+                        Some(std::mem::take(&mut word))
+                    } else {
+                        flush!();
+                        None
+                    };
+                    let input = ch == '<' && fd.as_deref().is_none_or(|f| f == "0");
+                    let (two, three) = (self.at(1), self.at(2));
+                    self.i += match (ch, two, three) {
+                        ('<', Some('<'), Some('<')) => 3,
+                        ('<', Some('<'), Some('-')) => {
+                            self.want_delim = Some(true);
+                            3
+                        }
+                        ('<', Some('<'), _) => {
+                            self.want_delim = Some(false);
+                            2
+                        }
+                        ('<', Some('&' | '>'), _) | ('>', Some('>' | '&' | '|'), _) => 2,
+                        _ => 1,
+                    };
+                    out.push(Sh::Redir(input));
+                }
+                '|' => {
+                    flush!();
+                    let (op, n) = match self.at(1) {
+                        Some('|') => ("||", 2),
+                        Some('&') => ("|&", 2),
+                        _ => ("|", 1),
+                    };
+                    self.i += n;
+                    out.push(Sh::Op(op));
+                }
+                '&' => {
+                    flush!();
+                    match self.at(1) {
+                        Some('&') => {
+                            self.i += 2;
+                            out.push(Sh::Op("&&"));
+                        }
+                        Some('>') => {
+                            self.i += if self.at(2) == Some('>') { 3 } else { 2 };
+                            out.push(Sh::Redir(false));
+                        }
+                        _ => {
+                            self.i += 1;
+                            out.push(Sh::Op("&"));
+                        }
+                    }
+                }
+                ';' => {
+                    flush!();
+                    let two = matches!(self.at(1), Some(';' | '&'));
+                    self.i += if two { 2 } else { 1 };
+                    out.push(Sh::Op(if two { ";;" } else { ";" }));
+                }
+                '(' => {
+                    flush!();
+                    depth += 1;
+                    self.i += 1;
+                    out.push(Sh::Op("("));
+                }
+                ')' => {
+                    flush!();
+                    self.i += 1;
+                    if stop == Some(')') && depth == 0 {
+                        return out;
+                    }
+                    depth = depth.saturating_sub(1);
+                    out.push(Sh::Op(")"));
+                }
+                _ => {
+                    word.push(ch);
+                    in_word = true;
+                    self.i += 1;
+                }
+            }
+        }
+        flush!();
+        out
+    }
+
+    /// Past the bodies of the heredocs the line just ended opened, each up to its end word's line (or
+    /// the end, for one that never closes).
+    fn skip_heredocs(&mut self) {
+        for (end, dash) in std::mem::take(&mut self.heredocs) {
+            while self.i < self.c.len() {
+                let from = self.i;
+                while self.at(0).is_some_and(|q| q != '\n') {
+                    self.i += 1;
+                }
+                let line: String = self.c[from..self.i].iter().collect();
+                self.i += 1;
+                let line = line.trim_end_matches('\r');
+                if (if dash { line.trim_start_matches('\t') } else { line }) == end {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// A simple command [`stdin_reader`] found: its words (redirections and assignments' targets left
+/// out), and whether the command gives it input.
+struct Simple {
+    words: Vec<String>,
+    fed: bool,
+}
+
+struct ShParser<'a> {
+    t: &'a [Sh],
+    i: usize,
+}
+
+impl<'a> ShParser<'a> {
+    fn peek(&self) -> Option<&'a Sh> {
+        self.t.get(self.i)
+    }
+
+    fn word_is(&self, w: &[&str]) -> bool {
+        matches!(self.peek(), Some(Sh::Word(x)) if w.contains(&x.as_str()))
+    }
+
+    /// The simple commands of a list, up to a `)` or one of `closers` in a command's place.
+    fn list(&mut self, closers: &[&str]) -> Vec<Simple> {
+        let mut out = Vec::new();
+        let mut after_exec = false;
+        loop {
+            while matches!(self.peek(), Some(Sh::Op(";" | ";;" | "&&" | "||" | "&"))) || self.word_is(&["do", "then", "else", "elif"]) {
+                self.i += 1;
+            }
+            if self.peek().is_none() || self.peek() == Some(&Sh::Op(")")) || self.word_is(closers) {
+                return out;
+            }
+            let start = out.len();
+            let mut first_end = None;
+            let mut piped = false;
+            loop {
+                let from = out.len();
+                let own = self.unit(&mut out);
+                if own && out.len() == from + 1 && out[from].words == ["exec"] {
+                    after_exec = true;
+                }
+                if own || piped || after_exec {
+                    out[from..].iter_mut().for_each(|s| s.fed = true);
+                }
+                first_end.get_or_insert(out.len());
+                if !matches!(self.peek(), Some(Sh::Op("|" | "|&"))) {
+                    break;
+                }
+                self.i += 1;
+                piped = true;
+            }
+            // A background job reads /dev/null.
+            if self.peek() == Some(&Sh::Op("&")) {
+                out[start..first_end.unwrap_or(start)].iter_mut().for_each(|s| s.fed = true);
+            }
+        }
+    }
+
+    /// A list inside a group or compound command, up to `close` (consumed).
+    fn inside(&mut self, out: &mut Vec<Simple>, close: &str) {
+        out.extend(self.list(&[close]));
+        if self.word_is(&[close]) {
+            self.i += 1;
+        }
+    }
+
+    /// One command of a pipeline into `out`; true when its own redirections give it input.
+    fn unit(&mut self, out: &mut Vec<Simple>) -> bool {
+        match self.peek() {
+            Some(Sh::Op("(")) => {
+                self.i += 1;
+                out.extend(self.list(&[]));
+                if self.peek() == Some(&Sh::Op(")")) {
+                    self.i += 1;
+                }
+            }
+            Some(Sh::Word(w)) => match w.as_str() {
+                "{" => {
+                    self.i += 1;
+                    self.inside(out, "}");
+                }
+                "while" | "until" => {
+                    self.i += 1;
+                    self.inside(out, "done");
+                }
+                "if" => {
+                    self.i += 1;
+                    self.inside(out, "fi");
+                }
+                "for" | "select" => {
+                    while self.peek().is_some() && !self.word_is(&["do"]) {
+                        self.i += 1;
+                    }
+                    self.inside(out, "done");
+                }
+                "case" => {
+                    // Its patterns' `)` aren't groups: its commands are left alone.
+                    let mut depth = 0;
+                    while let Some(t) = self.peek() {
+                        self.i += 1;
+                        match t {
+                            Sh::Word(x) if x == "case" => depth += 1,
+                            Sh::Word(x) if x == "esac" => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "!" => {
+                    self.i += 1;
+                    return self.unit(out);
+                }
+                "function" => {
+                    self.i += 2;
+                    if self.peek() == Some(&Sh::Op("(")) {
+                        self.i += 2;
+                    }
+                    self.function_body();
+                    return false;
+                }
+                _ => return self.simple(out),
+            },
+            _ => return self.simple(out),
+        }
+        self.redirections()
+    }
+
+    /// Past a function's body: it runs where the function is called, not where it's defined.
+    fn function_body(&mut self) {
+        while self.peek() == Some(&Sh::Op(";")) {
+            self.i += 1;
+        }
+        self.unit(&mut Vec::new());
+    }
+
+    fn redirections(&mut self) -> bool {
+        let mut own = false;
+        while let Some(Sh::Redir(input)) = self.peek() {
+            own |= *input;
+            self.i += 1;
+            if let Some(Sh::Word(_)) = self.peek() {
+                self.i += 1;
+            }
+        }
+        own
+    }
+
+    fn simple(&mut self, out: &mut Vec<Simple>) -> bool {
+        let mut words = Vec::new();
+        let mut own = false;
+        let mut subs = Vec::new();
+        loop {
+            match self.peek() {
+                None | Some(Sh::Op(_)) => break,
+                Some(Sh::Redir(_)) => own |= self.redirections(),
+                Some(Sh::Sub(t, fed)) => {
+                    let mut p = ShParser { t, i: 0 };
+                    while p.i < t.len() {
+                        subs.extend(p.list(&[]).into_iter().map(|s| Simple { fed: s.fed || *fed, ..s }));
+                        p.i += 1;
+                    }
+                    self.i += 1;
+                }
+                Some(Sh::Word(w)) => {
+                    words.push(w.clone());
+                    self.i += 1;
+                }
+            }
+        }
+        if words.len() == 1 && self.peek() == Some(&Sh::Op("(")) && self.t.get(self.i + 1) == Some(&Sh::Op(")")) {
+            self.i += 2;
+            self.function_body();
+            return false;
+        }
+        if !words.is_empty() {
+            out.push(Simple { words, fed: false });
+        }
+        out.extend(subs);
+        own
+    }
+}
+
+/// Whether a simple command with nothing feeding it reads its standard input: one of a short list of
+/// commands that do when they're given no file (`cat`, `grep foo`, `python`, `python -`, `bash -s`…)
+/// or always (`read`, `xargs`, `tee`, `tr`). `bash -c` and `eval` are judged by what they run.
+fn reads_stdin(words: &[String]) -> bool {
+    let mut w: Vec<&str> = words.iter().map(String::as_str).collect();
+    let assignment = |s: &str| s.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !k.starts_with(|c: char| c.is_ascii_digit()));
+    loop {
+        while w.first().is_some_and(|s| assignment(s)) {
+            w.remove(0);
+        }
+        let Some(first) = w.first() else { return false };
+        let (skip_valued, then_one): (&[&str], bool) = match command_name(first).as_str() {
+            "env" => (&["-u", "-C", "-S"], false),
+            "command" | "builtin" | "exec" | "nohup" | "time" | "stdbuf" => (&[], false),
+            "nice" => (&["-n"], false),
+            "sudo" => (&["-u", "-g", "-C", "-D"], false),
+            "timeout" => (&["-s", "-k", "--signal", "--kill-after"], true),
+            _ => break,
+        };
+        w.remove(0);
+        while let Some(o) = w.first().copied().filter(|o| o.starts_with('-')) {
+            let valued = skip_valued.contains(&o);
+            w.remove(0);
+            if valued && !w.is_empty() {
+                w.remove(0);
+            }
+        }
+        if then_one && !w.is_empty() {
+            w.remove(0);
+        }
+    }
+    let name = command_name(w[0]);
+    let args = &w[1..];
+    if args.iter().any(|a| *a == "--version" || *a == "--help") {
+        return false;
+    }
+    let split = |valued: &[&str], two: &[&str]| sh_operands(args, valued, two);
+    let short_has = |opts: &[&str], c: char| opts.iter().any(|o| o.starts_with('-') && !o.starts_with("--") && o[1..].contains(c));
+    let none_or_dash = |ops: &[&str]| ops.first().is_none_or(|o| *o == "-" || *o == "/dev/stdin");
+    match name.as_str() {
+        "cat" | "tac" | "head" | "tail" | "wc" | "sort" | "uniq" | "nl" | "less" | "more" | "base64" | "md5sum" | "sha1sum" | "sha256sum" | "cut" | "rev" | "xxd" | "od" => {
+            let valued: &[&str] = match name.as_str() {
+                "head" => &["-n", "-c"],
+                "tail" => &["-n", "-c", "-s", "--pid"],
+                "sort" => &["-k", "-t", "-o", "-S", "-T", "--key", "--output"],
+                "uniq" => &["-f", "-s", "-w"],
+                "cut" => &["-d", "-f", "-c", "-b"],
+                "xxd" => &["-c", "-l", "-s", "-g"],
+                "od" => &["-t", "-A", "-j", "-N"],
+                "base64" => &["-w"],
+                _ => &[],
+            };
+            let (_, ops) = split(valued, &[]);
+            ops.is_empty() || ops.iter().any(|o| *o == "-" || *o == "/dev/stdin")
+        }
+        "grep" | "egrep" | "fgrep" => {
+            let (opts, ops) = split(&["-e", "-f", "-m", "-A", "-B", "-C", "-d", "-D", "--regexp", "--file", "--max-count", "--context"], &[]);
+            if short_has(&opts, 'r') || short_has(&opts, 'R') || opts.iter().any(|o| o.starts_with("--recursive") || o.starts_with("--dereference-recursive")) {
+                return false;
+            }
+            let given = opts.iter().any(|o| matches!(*o, "-e" | "-f") || o.starts_with("--regexp") || o.starts_with("--file"));
+            ops.len() <= usize::from(!given) || ops.iter().skip(usize::from(!given)).any(|o| *o == "-")
+        }
+        "sed" => {
+            let (opts, ops) = split(&["-e", "-f", "-l", "--expression", "--file"], &[]);
+            if opts.iter().any(|o| o.starts_with("-i") || o.starts_with("--in-place")) {
+                return false;
+            }
+            let given = opts.iter().any(|o| matches!(*o, "-e" | "-f") || o.starts_with("--expression") || o.starts_with("--file"));
+            ops.len() <= usize::from(!given)
+        }
+        "awk" | "gawk" | "mawk" | "nawk" => {
+            let (opts, ops) = split(&["-F", "-v", "-f"], &[]);
+            let given = opts.contains(&"-f");
+            if !given && ops.first().is_some_and(|p| awk_begin_only(p)) {
+                return false;
+            }
+            ops.len() <= usize::from(!given)
+        }
+        "jq" => {
+            let (opts, ops) = split(&["-f", "--from-file", "--indent", "-L"], &["--arg", "--argjson", "--slurpfile", "--rawfile"]);
+            if short_has(&opts, 'n') || opts.contains(&"--null-input") {
+                return false;
+            }
+            let given = opts.iter().any(|o| *o == "-f" || *o == "--from-file");
+            ops.len() <= usize::from(!given)
+        }
+        "python" | "python3" | "python2" | "py" | "pythonw" => {
+            let (opts, ops) = split(&["-W", "-X", "-Q"], &[]);
+            !(short_has(&opts, 'c') || short_has(&opts, 'm') || short_has(&opts, 'V') || short_has(&opts, 'h')) && none_or_dash(&ops)
+        }
+        "node" | "deno" | "bun" => {
+            let (opts, ops) = split(&["-r", "--require", "--import", "--loader"], &[]);
+            !opts.iter().any(|o| matches!(*o, "-e" | "-p" | "-v" | "-h" | "-c" | "--eval" | "--print" | "--check" | "--test")) && none_or_dash(&ops) && (name == "node" || args.is_empty())
+        }
+        "perl" | "ruby" => {
+            let (opts, ops) = split(&["-I", "-M", "-r"], &[]);
+            // Each option's letters, without a value written onto it (`-MData::Dumper`, `-rjson`,
+            // `-i.bak`, `-0777`), so a value's letters aren't read as options.
+            let (rest, digits, program) = if name == "perl" { ("MmIFixC", "0l", "eE") } else { ("rIFixCEKW", "0T", "e") };
+            let letters: Vec<String> = opts
+                .iter()
+                .filter(|o| !o.starts_with("--"))
+                .map(|o| {
+                    let mut l = String::new();
+                    let mut cs = o[1..].chars().peekable();
+                    while let Some(c) = cs.next() {
+                        l.push(c);
+                        if rest.contains(c) || (c == 'd' && cs.peek() == Some(&':')) {
+                            break;
+                        }
+                        if digits.contains(c) {
+                            while cs.next_if(|d| d.is_ascii_digit()).is_some() {}
+                        }
+                    }
+                    l
+                })
+                .collect();
+            let has = |c: char| letters.iter().any(|l| l.contains(c));
+            if has('v') || has('V') {
+                return false;
+            }
+            let programs = letters.iter().filter(|l| l.contains(|c| program.contains(c))).count();
+            if programs > 0 {
+                // A program on the line (each -e takes the next word) reads input only when -n or -p
+                // loops over it, and no file is named.
+                return (has('n') || has('p')) && ops.len() <= programs;
+            }
+            none_or_dash(&ops)
+        }
+        "php" => {
+            let (opts, ops) = split(&["-d", "-c"], &[]);
+            !opts.iter().any(|o| matches!(*o, "-r" | "-v" | "-h" | "-l" | "--version")) && none_or_dash(&ops)
+        }
+        "bash" | "sh" | "zsh" | "dash" | "ksh" => {
+            let (opts, ops) = split(&["-o", "-O", "--rcfile", "--init-file"], &[]);
+            if short_has(&opts, 'c') {
+                return ops.first().is_some_and(|c| stdin_reader(c).is_some());
+            }
+            short_has(&opts, 's') || none_or_dash(&ops)
+        }
+        "pwsh" | "powershell" => args.is_empty(),
+        "eval" => stdin_reader(&args.join(" ")).is_some(),
+        "read" | "mapfile" | "readarray" => !args.iter().any(|a| a.starts_with("-u")),
+        "xargs" => !args.iter().any(|a| a.starts_with("-a") || a.starts_with("--arg-file")),
+        "tee" | "tr" => true,
+        "dd" => !args.iter().any(|a| a.starts_with("if=")),
+        _ => false,
+    }
+}
+
+/// A command word's name: no folder, no `.exe`, lower case.
+fn command_name(word: &str) -> String {
+    let base = word.rsplit(['/', '\\']).next().unwrap_or(word).to_lowercase();
+    base.strip_suffix(".exe").map(str::to_string).unwrap_or(base)
+}
+
+/// A command's arguments split into options and operands: `valued` options take the next word,
+/// `two` the next two; `-` alone is an operand, and everything after `--` is.
+fn sh_operands<'a>(args: &[&'a str], valued: &[&str], two: &[&str]) -> (Vec<&'a str>, Vec<&'a str>) {
+    let (mut opts, mut ops) = (Vec::new(), Vec::new());
+    let mut k = 0;
+    while k < args.len() {
+        let a = args[k];
+        k += 1;
+        if a == "--" {
+            ops.extend_from_slice(&args[k..]);
+            break;
+        }
+        if a.starts_with('-') && a != "-" {
+            opts.push(a);
+            k += if two.contains(&a) { 2 } else { usize::from(valued.contains(&a)) };
+        } else {
+            ops.push(a);
+        }
+    }
+    (opts, ops)
+}
+
+/// Whether an awk program is only a `BEGIN { … }` block, which reads no input (unless it uses getline).
+fn awk_begin_only(program: &str) -> bool {
+    let Some(rest) = program.trim().strip_prefix("BEGIN") else { return false };
+    let rest = rest.trim_start();
+    if !rest.starts_with('{') || program.contains("getline") {
+        return false;
+    }
+    let mut depth = 0;
+    for (k, c) in rest.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return rest[k + 1..].trim().trim_matches(';').trim().is_empty();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 static GIT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bgit\b(?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+(commit|push)\b").unwrap());
@@ -1648,10 +2333,12 @@ pub fn run(event_arg: Option<&str>) -> i32 {
             return 0;
         }
         if session.is_empty() {
-            close_stdin(&payload, &session);
+            if !stdin_refused(&payload) {
+                close_stdin(&payload, &session);
+            }
             return 0;
         }
-        if !pre_tool_use(&payload, &session) {
+        if !pre_tool_use(&payload, &session) && !stdin_refused(&payload) {
             close_stdin(&payload, &session);
             tool_window(&payload, &session, "hook.tool_start");
         }
@@ -2132,6 +2819,191 @@ mod tests {
         assert_eq!(stdin_closed_input(&call("auto", "Bash"), ""), None, "auto mode gives no verdict on a changed call");
         assert_eq!(stdin_closed_input(&call("default", "PowerShell"), ""), None);
         assert!(stdin_closed_input(&json!({"tool_name": "Bash", "tool_input": {"command": "echo hi"}}), "").is_some(), "a hook input without a mode, as before");
+    }
+
+    #[test]
+    fn auto_mode_refuses_a_command_that_would_wait_on_its_input_and_says_what_to_send() {
+        let call = |mode: &str, tool: &str, c: &str| json!({"tool_name": tool, "permission_mode": mode, "tool_input": {"command": c, "description": "d"}});
+        let why = stdin_refusal(&call("auto", "Bash", "cd out && cat > notes.txt")).expect("refused");
+        assert!(why.contains("`cat`") && why.contains("< /dev/null") && why.contains("heredoc") && why.contains("Write tool"), "{why}");
+        assert_eq!(stdin_closed_input(&call("auto", "Bash", "cat > notes.txt"), ""), None, "the command is never changed in auto mode");
+        assert_eq!(stdin_refusal(&call("auto", "Bash", "cat notes.txt")), None);
+        assert_eq!(stdin_refusal(&call("auto", "Bash", "python - <<'EOF'\nprint(1)\nEOF")), None);
+        for mode in ["default", "acceptEdits", "plan", "bypassPermissions"] {
+            assert_eq!(stdin_refusal(&call(mode, "Bash", "cat > notes.txt")), None, "{mode}: its input from /dev/null covers it");
+            assert!(stdin_closed_input(&call(mode, "Bash", "cat > notes.txt"), "").is_some(), "{mode}");
+        }
+        assert_eq!(stdin_refusal(&json!({"tool_name": "Bash", "tool_input": {"command": "cat"}})), None, "no mode: the input from /dev/null, as before");
+        assert_eq!(stdin_refusal(&call("auto", "PowerShell", "cat")), None, "PowerShell's syntax isn't Bash's");
+        assert_eq!(stdin_refusal(&call("auto", "Read", "cat")), None);
+    }
+
+    #[test]
+    fn a_command_reading_input_nothing_gives_it_is_found() {
+        for c in [
+            "cat",
+            "cat > out.txt",
+            "cat -n",
+            "cat - a.txt",
+            "/usr/bin/cat",
+            "python -",
+            "python3",
+            "python -u -",
+            "python.exe -",
+            "FOO=1 python",
+            "node",
+            "bash -s",
+            "sh",
+            "bash -c 'cat > f'",
+            "eval cat",
+            "read -r line",
+            "x=$(cat)",
+            "echo \"$(cat)\"",
+            "echo `cat`",
+            "echo hi && cat > f",
+            "cd dir; wc -l",
+            "grep foo",
+            "grep -c foo",
+            "sed -n 1p",
+            "awk '{print $1}'",
+            "jq -r .name",
+            "xargs echo",
+            "tee log",
+            "tr a b",
+            "while true; do read x; done",
+            "timeout 5 cat",
+            "env A=b cat",
+            "{ cat; }",
+            "(cat)",
+            "perl -ne 'print'",
+            "perl -MList::Util=sum -lne 'print sum(split)'",
+            "ruby -rjson -ne 'puts $_'",
+            "diff <(cat) a.txt",
+            "cat f | sort; sort",
+            "echo a | (cat); cat",
+            "python - <<'EOF'\nprint(1)\nEOF\ncat",
+            "cat 2> err.txt",
+        ] {
+            assert!(stdin_reader(c).is_some(), "{c}");
+        }
+        assert_eq!(stdin_reader("cd a && cat -n > out.txt").as_deref(), Some("cat -n"), "the command as it was written");
+    }
+
+    #[test]
+    fn a_command_given_its_input_or_reading_none_is_left_alone() {
+        for c in [
+            "cat a.txt",
+            "cat \"$f\"",
+            "cat <<'EOF' > f\nhello\nEOF",
+            "cat <<-EOF\n\tcat\n\tEOF",
+            "python - <<'EOF'\nimport sys\nprint(sys.stdin.read())\nEOF\necho after",
+            "python - << \"END\"\ncat\nEND",
+            "python script.py",
+            "python -c 'print(1)'",
+            "python -m pytest -q",
+            "python -X utf8 run.py",
+            "node -e 1",
+            "node app.js",
+            "bash script.sh",
+            "bash -c 'echo hi'",
+            "bash -lc 'cat a'",
+            "echo hi | cat",
+            "echo hi |& cat",
+            "cat < in.txt",
+            "cat 0<in.txt",
+            "cat <<< hi",
+            "read x <<< hi",
+            "while read l; do echo $l; done < f",
+            "echo a | while read l; do echo $l; done",
+            "for f in *.rs; do wc -l \"$f\"; done",
+            "if true; then cat a; else cat b; fi",
+            "{ cat; } < /dev/null",
+            "{ cat\n} < /dev/null",
+            "(cat) < /dev/null",
+            "cat &",
+            "cat < /dev/null",
+            "cat <&-",
+            "exec < /dev/null; cat",
+            "grep foo a.txt",
+            "grep -r foo",
+            "grep -rn foo",
+            "grep -e foo b.txt",
+            "sed -n 1p f",
+            "sed -i s/a/b/",
+            "awk 'BEGIN { print 1+2 }'",
+            "awk -F, '{print $1}' data.csv",
+            "jq -n '1+1'",
+            "jq . f.json",
+            "head -n 5 f",
+            "sort -k 2 f",
+            "tail -f log",
+            "diff <(echo a) <(echo b)",
+            "echo 'cat'",
+            "echo cat; echo read",
+            "git log | head",
+            "# cat\necho hi",
+            "echo hi # | cat",
+            "f() { cat; }; echo x | f",
+            "perl -e 'print 1'",
+            "dd if=a of=b",
+            "xargs -a list echo",
+            "cargo test -p taskboard-cli 2>&1 | tail -5",
+            "echo hi > out.txt",
+            "case $x in a) cat;; esac",
+            "x=$(echo hi | cat)",
+            "perl -MData::Dumper -e 'print Dumper(1)'",
+            "perl -MJSON::PP -le 'print 1'",
+            "perl -lne 'print' f.txt",
+            "perl -0777 -pe 's/a/b/' f.txt",
+            "perl -i.bak -pe 's/a/b/' f.txt",
+            "ruby -rjson -e 'puts 1'",
+            "ruby -rnet/http -e 'puts 1'",
+            "make 2>&1 > >(tee build.log)",
+            "cargo build 2> >(grep -v warning >&2)",
+            "jq --version",
+            "grep --help",
+            "sed --version",
+            "awk --version",
+            "cat --version",
+            "tee --help",
+            "tr --version",
+            "git commit -m \"$(cat <<'EOF'\nfix: a (b) \"c\" 'd'\n\nCo-Authored-By: x\nEOF\n)\"",
+            "gh pr view 8 --json body | jq -r .body",
+            "ls -la && git status --short",
+            "",
+        ] {
+            assert_eq!(stdin_reader(c), None, "{c}");
+        }
+    }
+
+    #[test]
+    fn what_the_check_finds_waits_on_its_input_and_what_it_leaves_does_not() {
+        use std::process::{Command, Stdio};
+        // Run with an open input that never says anything, as the Bash tool's is.
+        // Whether `c` exits within `limit`. A slow machine only makes one that doesn't wait take longer,
+        // so it gets a generous limit; one that waits never exits, so a short limit tells it.
+        let exits_within = |c: &str, limit: Duration| {
+            let mut child = Command::new("sh").arg("-c").arg(c).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            let start = Instant::now();
+            let exited = loop {
+                if child.try_wait().unwrap().is_some() {
+                    break true;
+                }
+                if start.elapsed() >= limit {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+            exited
+        };
+        for c in ["cat > /dev/null", "read x", "wc -l"] {
+            assert!(stdin_reader(c).is_some() && !exits_within(c, Duration::from_millis(500)), "{c}");
+        }
+        for c in ["cat <<'EOF'\nhi\nEOF", "echo hi | wc -l", "cat < /dev/null", "{ read x; } < /dev/null", "cat &"] {
+            assert!(stdin_reader(c).is_none() && exits_within(c, Duration::from_secs(30)), "{c}");
+        }
     }
 
     #[test]
