@@ -340,7 +340,7 @@ impl Board {
     }
 
     fn slot_holder(&self, cwd: &str) -> Option<i64> {
-        self.slots.iter().find(|(path, _)| cwd == path || cwd.starts_with(&format!("{path}/"))).map(|(_, t)| *t)
+        self.slots.iter().find(|(path, _)| Path::new(cwd).starts_with(path)).map(|(_, t)| *t)
     }
 
     /// Still working: active, or done with a PR visit on it.

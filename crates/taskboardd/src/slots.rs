@@ -1755,7 +1755,9 @@ mod tests {
         assert_eq!((one["held_by"].clone(), one["busy"].clone()), (Value::Null, json!("a rebase")), "not listed free");
     }
 
+    // Seeding clones with APFS (`slot_seed::clone`).
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_new_slot_starts_with_a_free_build_of_its_dependencies_but_not_a_held_slots() {
         let dir = tempfile::tempdir().unwrap();
         let app = App::for_tests(Config::for_tests(dir.path()));

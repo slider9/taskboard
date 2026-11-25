@@ -198,7 +198,9 @@ mod tests {
 
         // A terminal that opened in the shared checkout, then claimed the slot: its commands there build in the slot's target.
         let (main_dir, slot_dir, sub) = (repo.to_str().unwrap(), slot.to_str().unwrap(), slot.join("crates/app"));
-        let want = Some(format!("{slot_dir}/target"));
+        // Either separator: a `cd` comes back with Windows' own.
+        let want = Some(format!("{slot_dir}/target").replace('\\', "/"));
+        let slot_target = |cfg: &BuildsConfig, cmd: &str, cwd: &str| slot_target(cfg, cmd, cwd).map(|t| t.replace('\\', "/"));
         assert_eq!(slot_target(&on, "cargo test -p app", sub.to_str().unwrap()), want, "cd'd into the slot");
         assert_eq!(slot_target(&on, &format!("cd {slot_dir} && cargo build"), main_dir), want, "cd's there in the command");
         assert_eq!(slot_target(&on, "cd .claude/worktrees/slot-2/crates/app; cargo build", main_dir), want, "a relative cd");

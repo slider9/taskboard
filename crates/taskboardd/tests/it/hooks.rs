@@ -1,7 +1,7 @@
 //! The owner's hooks at each step of the flow: announced after a step, or run before a stoppable one,
 //! which they can stop or (for PR checks) skip.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -310,7 +310,8 @@ fn a_slow_hook_keeps_the_progress_stream_alive() {
 fn hooks_run_in_the_projects_new_folder_after_it_moves() {
     let b = board(json!({"hooks": {}}));
     let wrote = b.dir.path().join("cwd");
-    let pwd = format!("pwd -P >> {}", wrote.display());
+    // `-W`: Git Bash's own `-P` gives `/d/…`, not a path Windows reads.
+    let pwd = format!("pwd {} >> '{}'", if cfg!(windows) { "-W" } else { "-P" }, wrote.display());
     std::fs::write(hooks::path(&b.app.cfg), json!({"hooks": {"task.working": cmd(&pwd), "goal.paused": cmd(&pwd)}}).to_string()).unwrap();
     let gid = b.post("/goals", json!({"name": "Login", "project": "webapp"})).unwrap()["id"].as_i64().unwrap();
     let id = b.new_task(json!({}));
@@ -323,6 +324,7 @@ fn hooks_run_in_the_projects_new_folder_after_it_moves() {
     b.report("tb.take", json!({"task": rf(id)})).unwrap();
     b.post(&format!("/goals/G{gid}"), json!({"paused": true})).unwrap();
     let ran = std::fs::read_to_string(&wrote).unwrap();
-    let here = std::fs::canonicalize(&new).unwrap();
-    assert_eq!(ran.lines().collect::<Vec<_>>(), [here.to_str().unwrap(); 2], "the task's and the goal's hooks run in the project's new folder");
+    let here = taskboardd::util::canonical(&new).unwrap();
+    let ran: Vec<_> = ran.lines().map(|l| taskboardd::util::canonical(Path::new(l)).unwrap()).collect();
+    assert_eq!(ran, [here.clone(), here], "the task's and the goal's hooks run in the project's new folder");
 }

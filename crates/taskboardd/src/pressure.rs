@@ -344,6 +344,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_kernel_gives_a_reading() {
         let r = local().expect("getloadavg");
         assert!(r.cpus >= 1 && r.load1 >= 0.0, "{r:?}");

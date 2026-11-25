@@ -208,5 +208,5 @@ fn the_prompt_lists_only_the_components_that_fit_and_the_schema_names_every_one(
     assert!(!p.contains("Your last page was turned down"));
     let ids = recap_page::schema()["properties"]["components"]["items"]["properties"]["component"]["enum"].as_array().unwrap().len();
     assert_eq!(ids, recap_page::CATALOG.len());
-    assert_eq!(ids, 29);
+    assert_eq!(ids, 30);
 }
