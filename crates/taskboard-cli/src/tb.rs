@@ -2680,7 +2680,7 @@ static STDOUT_GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// beside it on Windows), then wait for a new pid to answer.
 fn daemon_restart(cfg: &taskboardd::config::Config) -> Result<i32, String> {
     let before = client::request(cfg, "GET", "/info", None, 2.0).ok();
-    let why_slow = if cfg!(windows) { restart_beside(before.as_ref())? } else { kickstart(before.as_ref())? };
+    let why_slow = if cfg!(windows) { restart_beside(cfg, before.as_ref())? } else { kickstart(before.as_ref())? };
     let old_pid = before.as_ref().and_then(|i| i["pid"].as_u64());
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
@@ -2712,13 +2712,27 @@ fn kickstart(before: Option<&Value>) -> Result<String, String> {
 
 /// Windows: `taskboard-app.exe --restart-daemon`, the installed app beside the daemon, which ends
 /// the daemon and its supervisor and starts them again. Ok: what to say if it doesn't answer in time.
-fn restart_beside(before: Option<&Value>) -> Result<String, String> {
+fn restart_beside(cfg: &taskboardd::config::Config, before: Option<&Value>) -> Result<String, String> {
+    use std::process::Stdio;
     let app = restarter(before)?;
-    let run = Command::new(&app).arg("--restart-daemon").stdin(std::process::Stdio::null()).output().map_err(|e| format!("couldn't run {}: {e}", app.display()))?;
-    if !run.status.success() {
-        return Err(restart_failed(&app, run.status.code(), &String::from_utf8_lossy(&run.stderr)));
+    // No pipes, and not tb's own stdio either: the supervisor it starts inherits the app's handles
+    // and keeps them open, so a reader waiting for their end (tb, or whoever runs tb) would wait for
+    // good. The app's reason is in app.log instead.
+    let log = cfg.data.join("app.log");
+    let from = std::fs::metadata(&log).map_or(0, |m| m.len());
+    let run = Command::new(&app).arg("--restart-daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let run = run.map_err(|e| format!("couldn't run {}: {e}", app.display()))?;
+    if !run.success() {
+        return Err(restart_failed(&app, run.code(), &written_since(&log, from)));
     }
     Ok(NOT_ANSWERING_YET.into())
+}
+
+/// What `log` gained past its first `from` bytes; all of it when it rolled over meanwhile.
+fn written_since(log: &Path, from: u64) -> String {
+    let bytes = std::fs::read(log).unwrap_or_default();
+    let start = usize::try_from(from).ok().filter(|&f| f <= bytes.len()).unwrap_or(0);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
 }
 
 const APP_EXE: &str = "taskboard-app.exe";
@@ -2733,10 +2747,10 @@ fn restarter(info: Option<&Value>) -> Result<PathBuf, String> {
     app.ok_or_else(|| format!("the daemon isn't run by the Taskboard app here (no {APP_EXE} beside {}), so restart it the way you started it", exe.display()))
 }
 
-/// `--restart-daemon` exited with an error: its own words (on stderr, as `taskboard-app: …`), else
-/// the exit code and where the app logs.
-fn restart_failed(app: &Path, code: Option<i32>, stderr: &str) -> String {
-    let said = stderr.lines().map(|l| l.trim().trim_start_matches("taskboard-app:").trim()).rfind(|l| !l.is_empty());
+/// `--restart-daemon` exited with an error: its own words (its last line in app.log, after the
+/// `<date> <time>`), else the exit code and where the app logs.
+fn restart_failed(app: &Path, code: Option<i32>, logged: &str) -> String {
+    let said = logged.lines().map(|l| l.trim().splitn(3, ' ').nth(2).unwrap_or("").trim()).rfind(|l| !l.is_empty());
     match said {
         Some(why) => format!("{} --restart-daemon failed: {why}", app.display()),
         None => format!("{} --restart-daemon failed (exit {}): app.log in the board's data folder shows why", app.display(), code.map_or("?".into(), |c| c.to_string())),
@@ -8931,9 +8945,20 @@ mod tests {
     #[test]
     fn a_failed_restart_says_what_the_app_said() {
         let app = Path::new(r"C:\Taskboard\taskboard-app.exe");
-        assert_eq!(restart_failed(app, Some(1), "taskboard-app: restarting the daemon failed: the daemon's supervisor didn't stop\r\n"), format!("{} --restart-daemon failed: restarting the daemon failed: the daemon's supervisor didn't stop", app.display()));
+        let logged = "2026-11-24 10:00:01 restarting the daemon failed: the daemon's supervisor didn't stop\r\n";
+        assert_eq!(restart_failed(app, Some(1), logged), format!("{} --restart-daemon failed: restarting the daemon failed: the daemon's supervisor didn't stop", app.display()));
         assert_eq!(restart_failed(app, Some(2), ""), format!("{} --restart-daemon failed (exit 2): app.log in the board's data folder shows why", app.display()));
         assert_eq!(restart_failed(app, None, "  \n"), format!("{} --restart-daemon failed (exit ?): app.log in the board's data folder shows why", app.display()));
+
+        let dir = std::env::temp_dir().join(format!("tb-applog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        let older = "2026-11-24 09:00:00 an older run\n";
+        std::fs::write(&log, format!("{older}2026-11-24 10:00:01 this run\n")).unwrap();
+        assert_eq!(written_since(&log, older.len() as u64), "2026-11-24 10:00:01 this run\n", "only what this run wrote");
+        assert_eq!(written_since(&log, 999), format!("{older}2026-11-24 10:00:01 this run\n"), "it rolled over meanwhile");
+        assert_eq!(written_since(&dir.join("none.log"), 0), "");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
