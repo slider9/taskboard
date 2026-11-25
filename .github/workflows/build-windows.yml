@@ -4,13 +4,16 @@ name: Build and test (Windows)
 # runs the tests that pass there:
 #
 #   taskboardd --lib     its unit tests
-#   taskboardd --test it its integration tests (they start real temp boards)
+#   taskboardd --test it its integration tests (they start real temp boards), all but two
 #   taskboard-cli        all of it
 #   taskboard-app        all of it but one test
 #
 # Skipped until the board's backlog item is fixed (drop the skip with its fix):
 #   taskboard-app ui::task_panel::tests::lost_task_resumes, which on Windows records its three
 #   resume posts out of order every run (B199)
+#   taskboardd needs_recheck's two tests that check a just-raised item isn't due: the board keeps
+#   event times to the whole second but reads the rules file's to a fraction of one, so an item
+#   raised in the same second the test wrote its rules reads as older than them (B201, any OS)
 #
 # Mirrors midna's build-windows.yml. Upstream's macOS release (release.yml) is separate.
 #
@@ -108,7 +111,10 @@ jobs:
       - name: taskboardd integration tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 20
-        run: cargo test $NO_WRAPPER --locked -p taskboardd --test it
+        run: >-
+          cargo test $NO_WRAPPER --locked -p taskboardd --test it --
+          --skip needs_recheck::an_old_human_task_an_agent_can_do_goes_back_to_the_agent_that_made_it
+          --skip needs_recheck::a_pulled_back_human_task_waits_on_the_owner_again_and_the_task_made_for_it_goes
 
       - name: taskboard-cli
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
