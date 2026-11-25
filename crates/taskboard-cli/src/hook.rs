@@ -1504,8 +1504,9 @@ enum Sh {
     /// A redirection, true when it gives the command its standard input (`<`, `<<`, `<<<`, `0<&`…). The
     /// word after it is its target.
     Redir(bool),
-    /// A command substitution (`$(…)`, `` `…` ``) or a process substitution (`<(…)`).
-    Sub(Vec<Sh>),
+    /// A command substitution (`$(…)`, `` `…` ``) or a process substitution (`<(…)`, `>(…)`); true
+    /// when the command around it feeds it (`>(…)`, which reads what the command writes).
+    Sub(Vec<Sh>, bool),
 }
 
 struct ShLexer {
@@ -1577,12 +1578,12 @@ impl ShLexer {
                             }
                             '$' if self.at(1) == Some('(') => {
                                 self.i += 2;
-                                out.push(Sh::Sub(self.tokens(Some(')'))));
+                                out.push(Sh::Sub(self.tokens(Some(')')), false));
                                 word.push('$');
                             }
                             '`' => {
                                 self.i += 1;
-                                out.push(Sh::Sub(self.tokens(Some('`'))));
+                                out.push(Sh::Sub(self.tokens(Some('`')), false));
                                 word.push('$');
                             }
                             _ => {
@@ -1594,7 +1595,7 @@ impl ShLexer {
                 }
                 '$' if self.at(1) == Some('(') => {
                     self.i += 2;
-                    out.push(Sh::Sub(self.tokens(Some(')'))));
+                    out.push(Sh::Sub(self.tokens(Some(')')), false));
                     word.push('$');
                     in_word = true;
                 }
@@ -1615,7 +1616,7 @@ impl ShLexer {
                 }
                 '`' => {
                     self.i += 1;
-                    out.push(Sh::Sub(self.tokens(Some('`'))));
+                    out.push(Sh::Sub(self.tokens(Some('`')), false));
                     word.push('$');
                     in_word = true;
                 }
@@ -1635,10 +1636,11 @@ impl ShLexer {
                     self.skip_heredocs();
                 }
                 '<' | '>' if self.at(1) == Some('(') && !(in_word && word.chars().all(|d| d.is_ascii_digit())) => {
-                    // A process substitution: a file name the command reads or writes.
+                    // A process substitution: a file name the command reads or writes. What `>(…)` runs
+                    // reads what the command writes there.
                     flush!();
                     self.i += 2;
-                    out.push(Sh::Sub(self.tokens(Some(')'))));
+                    out.push(Sh::Sub(self.tokens(Some(')')), ch == '>'));
                     out.push(Sh::Word("/dev/fd/63".into()));
                 }
                 '<' | '>' => {
@@ -1904,10 +1906,10 @@ impl<'a> ShParser<'a> {
             match self.peek() {
                 None | Some(Sh::Op(_)) => break,
                 Some(Sh::Redir(_)) => own |= self.redirections(),
-                Some(Sh::Sub(t)) => {
+                Some(Sh::Sub(t, fed)) => {
                     let mut p = ShParser { t, i: 0 };
                     while p.i < t.len() {
-                        subs.extend(p.list(&[]));
+                        subs.extend(p.list(&[]).into_iter().map(|s| Simple { fed: s.fed || *fed, ..s }));
                         p.i += 1;
                     }
                     self.i += 1;
@@ -1964,6 +1966,9 @@ fn reads_stdin(words: &[String]) -> bool {
     }
     let name = command_name(w[0]);
     let args = &w[1..];
+    if args.iter().any(|a| *a == "--version" || *a == "--help") {
+        return false;
+    }
     let split = |valued: &[&str], two: &[&str]| sh_operands(args, valued, two);
     let short_has = |opts: &[&str], c: char| opts.iter().any(|o| o.starts_with('-') && !o.starts_with("--") && o[1..].contains(c));
     let none_or_dash = |ops: &[&str]| ops.first().is_none_or(|o| *o == "-" || *o == "/dev/stdin");
@@ -2017,22 +2022,44 @@ fn reads_stdin(words: &[String]) -> bool {
         }
         "python" | "python3" | "python2" | "py" | "pythonw" => {
             let (opts, ops) = split(&["-W", "-X", "-Q"], &[]);
-            !(short_has(&opts, 'c') || short_has(&opts, 'm') || short_has(&opts, 'V') || short_has(&opts, 'h') || opts.iter().any(|o| *o == "--version" || *o == "--help")) && none_or_dash(&ops)
+            !(short_has(&opts, 'c') || short_has(&opts, 'm') || short_has(&opts, 'V') || short_has(&opts, 'h')) && none_or_dash(&ops)
         }
         "node" | "deno" | "bun" => {
             let (opts, ops) = split(&["-r", "--require", "--import", "--loader"], &[]);
-            !opts.iter().any(|o| matches!(*o, "-e" | "-p" | "-v" | "-h" | "-c" | "--eval" | "--print" | "--version" | "--help" | "--check" | "--test")) && none_or_dash(&ops) && (name == "node" || args.is_empty())
+            !opts.iter().any(|o| matches!(*o, "-e" | "-p" | "-v" | "-h" | "-c" | "--eval" | "--print" | "--check" | "--test")) && none_or_dash(&ops) && (name == "node" || args.is_empty())
         }
         "perl" | "ruby" => {
             let (opts, ops) = split(&["-I", "-M", "-r"], &[]);
-            if short_has(&opts, 'v') || short_has(&opts, 'V') || opts.iter().any(|o| *o == "--version" || *o == "--help") {
+            // Each option's letters, without a value written onto it (`-MData::Dumper`, `-rjson`,
+            // `-i.bak`, `-0777`), so a value's letters aren't read as options.
+            let (rest, digits, program) = if name == "perl" { ("MmIFixC", "0l", "eE") } else { ("rIFixCEKW", "0T", "e") };
+            let letters: Vec<String> = opts
+                .iter()
+                .filter(|o| !o.starts_with("--"))
+                .map(|o| {
+                    let mut l = String::new();
+                    let mut cs = o[1..].chars().peekable();
+                    while let Some(c) = cs.next() {
+                        l.push(c);
+                        if rest.contains(c) || (c == 'd' && cs.peek() == Some(&':')) {
+                            break;
+                        }
+                        if digits.contains(c) {
+                            while cs.next_if(|d| d.is_ascii_digit()).is_some() {}
+                        }
+                    }
+                    l
+                })
+                .collect();
+            let has = |c: char| letters.iter().any(|l| l.contains(c));
+            if has('v') || has('V') {
                 return false;
             }
-            let programs = opts.iter().filter(|o| !o.starts_with("--") && (o.contains('e') || o.contains('E'))).count();
+            let programs = letters.iter().filter(|l| l.contains(|c| program.contains(c))).count();
             if programs > 0 {
                 // A program on the line (each -e takes the next word) reads input only when -n or -p
                 // loops over it, and no file is named.
-                return (short_has(&opts, 'n') || short_has(&opts, 'p')) && ops.len() <= programs;
+                return (has('n') || has('p')) && ops.len() <= programs;
             }
             none_or_dash(&ops)
         }
@@ -2044,9 +2071,6 @@ fn reads_stdin(words: &[String]) -> bool {
             let (opts, ops) = split(&["-o", "-O", "--rcfile", "--init-file"], &[]);
             if short_has(&opts, 'c') {
                 return ops.first().is_some_and(|c| stdin_reader(c).is_some());
-            }
-            if opts.iter().any(|o| *o == "--version" || *o == "--help") {
-                return false;
             }
             short_has(&opts, 's') || none_or_dash(&ops)
         }
@@ -2852,6 +2876,9 @@ mod tests {
             "{ cat; }",
             "(cat)",
             "perl -ne 'print'",
+            "perl -MList::Util=sum -lne 'print sum(split)'",
+            "ruby -rjson -ne 'puts $_'",
+            "diff <(cat) a.txt",
             "cat f | sort; sort",
             "echo a | (cat); cat",
             "python - <<'EOF'\nprint(1)\nEOF\ncat",
@@ -2924,6 +2951,22 @@ mod tests {
             "echo hi > out.txt",
             "case $x in a) cat;; esac",
             "x=$(echo hi | cat)",
+            "perl -MData::Dumper -e 'print Dumper(1)'",
+            "perl -MJSON::PP -le 'print 1'",
+            "perl -lne 'print' f.txt",
+            "perl -0777 -pe 's/a/b/' f.txt",
+            "perl -i.bak -pe 's/a/b/' f.txt",
+            "ruby -rjson -e 'puts 1'",
+            "ruby -rnet/http -e 'puts 1'",
+            "make 2>&1 > >(tee build.log)",
+            "cargo build 2> >(grep -v warning >&2)",
+            "jq --version",
+            "grep --help",
+            "sed --version",
+            "awk --version",
+            "cat --version",
+            "tee --help",
+            "tr --version",
             "git commit -m \"$(cat <<'EOF'\nfix: a (b) \"c\" 'd'\n\nCo-Authored-By: x\nEOF\n)\"",
             "gh pr view 8 --json body | jq -r .body",
             "ls -la && git status --short",
@@ -2937,19 +2980,29 @@ mod tests {
     fn what_the_check_finds_waits_on_its_input_and_what_it_leaves_does_not() {
         use std::process::{Command, Stdio};
         // Run with an open input that never says anything, as the Bash tool's is.
-        let waits = |c: &str| {
+        // Whether `c` exits within `limit`. A slow machine only makes one that doesn't wait take longer,
+        // so it gets a generous limit; one that waits never exits, so a short limit tells it.
+        let exits_within = |c: &str, limit: Duration| {
             let mut child = Command::new("sh").arg("-c").arg(c).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-            std::thread::sleep(Duration::from_millis(300));
-            let still = child.try_wait().unwrap().is_none();
+            let start = Instant::now();
+            let exited = loop {
+                if child.try_wait().unwrap().is_some() {
+                    break true;
+                }
+                if start.elapsed() >= limit {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
             let _ = child.kill();
             let _ = child.wait();
-            still
+            exited
         };
         for c in ["cat > /dev/null", "read x", "wc -l"] {
-            assert!(stdin_reader(c).is_some() && waits(c), "{c}");
+            assert!(stdin_reader(c).is_some() && !exits_within(c, Duration::from_millis(500)), "{c}");
         }
         for c in ["cat <<'EOF'\nhi\nEOF", "echo hi | wc -l", "cat < /dev/null", "{ read x; } < /dev/null", "cat &"] {
-            assert!(stdin_reader(c).is_none() && !waits(c), "{c}");
+            assert!(stdin_reader(c).is_none() && exits_within(c, Duration::from_secs(30)), "{c}");
         }
     }
 
