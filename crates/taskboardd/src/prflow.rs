@@ -12,9 +12,8 @@
 //! the PR waiting on them, for reviewers it didn't ask itself: `prbar.rs`).
 //!
 //! The `ask` stage (`[reviewers] ask_stage`): once the owner has looked at a green PR ("I reviewed
-//! it"), the PR waits for reviewers to be asked. The agent is brought back to run `tb pr reviewers`;
-//! when it can't be (outside work hours, or `pr.wake` off), the board asks them itself
-//! (`asks::stage`).
+//! it"), the PR waits for reviewers to be asked. The board asks them itself (`asks::stage`): no
+//! agent is brought back for it.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -27,12 +26,12 @@ use crate::util::*;
 use crate::worktrees::{git, last_line, GIT_SECS};
 use crate::{board, dispatch, fields, handoff, hooks, hours, limits, p, runner, transcript};
 
-pub const WAKE: &[&str] = &["fix", "rebase", "comments", "steps", "merge", "ask"];
+pub const WAKE: &[&str] = &["fix", "rebase", "comments", "steps", "merge"];
 /// The visits that don't change code: they start fresh on `[models] pr_visit` (`fresh_visit`).
-const MECHANICAL: &[&str] = &["merge", "ask"];
+const MECHANICAL: &[&str] = &["merge"];
 /// Steps whose visit works on the PR's host (asks, merges, replies), so it waits out a rate limit
 /// (a comments visit only when it has no threads to work from).
-const ON_HOST: &[&str] = &["ask", "merge", "comments"];
+const ON_HOST: &[&str] = &["merge", "comments"];
 pub const IN_REVIEW: &[&str] = &["ask", "review", "rereview", "comments", "steps", "merge", "waits", "stack"];
 /// The stages that move the ticket to In Code Review: reviewers have been asked (`ask` hasn't asked anyone yet).
 pub const IN_CODE_REVIEW: &[&str] = &["review", "rereview", "comments", "steps", "merge", "waits", "stack"];
@@ -822,12 +821,6 @@ fn prompt(app: &App, t: &Row, phase: &str, rec: &Value) -> String {
                 (false, true) => "Nothing holds it.",
             }
         ),
-        "ask" => format!(
-            "{} has reviewed it. Ask for reviews with {tb} pr reviewers {r}: the board picks the reviewers (a main \
-             contributor of the changed files, then whoever's turn it is) and asks them on the PR. To ask someone in \
-             particular, add --ask <name>. It finishes the visit.",
-            app.cfg.owner
-        ),
         _ => String::new(),
     };
     [
@@ -909,8 +902,8 @@ fn resume_or_fresh(app: &App, t: &Row, mut args: Value) -> Result<Value> {
     let last = board::get_session(app, flow(t).s("session"))?;
     let cid = task_conversation(t, last.as_ref())
         .filter(|c| transcript::conversation_saved(&app.cfg.claude_projects, args["cwd"].as_str().unwrap_or(""), c));
-    let model = app.cfg.models.resolve(t.s("model"));
-    let effort = app.cfg.models.resolve_effort(t.s("model"), t.s("effort"));
+    let model = app.cfg.models.resolve_pr_work(t.s("model"));
+    let effort = app.cfg.models.resolve_pr_work_effort(t.s("model"), t.s("effort"));
     if let Some(f) = runner::with_effort(runner::with_model(None, model.as_deref()), effort.as_deref()) {
         args["flags"] = json!(f);
     }
@@ -1206,7 +1199,7 @@ pub fn pr_tabs_to_close(app: &App) -> Result<Vec<(Row, Row, bool)>> {
         }
         let finished = FINISHED.contains(&t.s("pr_phase").unwrap_or(""));
         let f = flow(&t);
-        let still_needed = f.s("session") == s.s("id") && (f.contains_key("woke") || live_job(app, &t)?.is_some());
+        let still_needed = f.s("session") == s.s("id") && (woke_for_a_visit(&f) || live_job(app, &t)?.is_some());
         let awaiting_prompt = unprompted_tab(app, &t)?.is_some_and(|u| u.s("id") == s.s("id"));
         if !finished && (still_needed || awaiting_prompt) {
             continue;
@@ -1214,6 +1207,13 @@ pub fn pr_tabs_to_close(app: &App) -> Result<Vec<(Row, Row, bool)>> {
         out.push((s, t, finished));
     }
     Ok(out)
+}
+
+/// The PR's last wake still has a visit on: it was for a step that brings an agent back. A wake left
+/// from a step that no longer does (an `ask` visit from before the board asked for reviews itself)
+/// holds no terminal open.
+fn woke_for_a_visit(f: &Row) -> bool {
+    f.s("woke").is_some_and(|k| WAKE.contains(&k.split(':').next().unwrap_or("")))
 }
 
 /// Idle terminals of In review tasks that wait on nobody, for the owner's sweep (`tb close --review`):
@@ -1236,7 +1236,7 @@ pub fn idle_review_tabs(app: &App) -> Result<Vec<(Row, Row)>> {
             continue;
         }
         let f = flow(&t);
-        let still_needed = f.s("session") == s.s("id") && (f.contains_key("woke") || live_job(app, &t)?.is_some());
+        let still_needed = f.s("session") == s.s("id") && (woke_for_a_visit(&f) || live_job(app, &t)?.is_some());
         if still_needed || unprompted_tab(app, &t)?.is_some_and(|u| u.s("id") == s.s("id")) {
             continue;
         }
@@ -1410,14 +1410,14 @@ fn all_staged(path: &str) -> bool {
 
 /// One read of a task's PR from its host, as the flow keeps it (`prhost::Record::to_value`). The read
 /// time is kept as `read_at`: a PR a stream relay covers is polled again only once it's old
-/// (`feed::pr_poll_skips`).
+/// (`feed::pr_poll_skips`). It catches up on any event that didn't land (`event_unread_at`).
 pub fn read(app: &App, t: &Row) -> std::result::Result<Value, String> {
     let pr = crate::prhost::PrRef::of(t).ok_or_else(|| "the task has no PR".to_string())?;
     let host = crate::prhost::host_for(app, &pr.host)?;
     // An open PR's stage can change: its reads still go while the account restarts slowly after a limit.
     let mut rec = crate::prhost::limit::priority(|| host.read(&pr))?;
     roster_ids(app, &t.st("project"), &mut rec).map_err(|e| e.message)?;
-    merge_flow(app, t.id(), fields!["read_at" => now_iso()]).map_err(|e| e.message)?;
+    merge_flow(app, t.id(), fields!["read_at" => now_iso(), "event_unread_at" => Value::Null]).map_err(|e| e.message)?;
     Ok(rec.to_value())
 }
 
@@ -2604,9 +2604,7 @@ pub fn step(app: &App, t: &Row, rec: &Value) -> Result<bool> {
         && !retry_later(&f)
         && !visit_live(app, t)?
         && hours::goal_open(app, board::find_goal(app, t.i("goal_id"))?.as_ref())
-        && !goal_paused(app, t)?
-        // The agent isn't brought back to ask for reviews while the PR feed holds asks.
-        && (phase != "ask" || crate::asks::held(app, t)?.is_none());
+        && !goal_paused(app, t)?;
     // A visit whose step works on the host waits while the account the PR's host signs in as is
     // rate-limited: its first tb pr call would fail. Other hosts and accounts go on. A comments visit
     // with the threads in hand goes anyway: tb pr reads them from the board's copy, and the board
@@ -2702,6 +2700,9 @@ pub fn step(app: &App, t: &Row, rec: &Value) -> Result<bool> {
     changes.extend(reread_by(&after, merge_look_at(&phase, &after)));
     board::update_task(app, t.id(), task_fields)?;
     merge_flow(app, t.id(), changes)?;
+    if phase_changed && phase == "declined" {
+        crate::pr_closed::closed_outside(app, t, &f, rec)?;
+    }
     if phase_changed {
         crate::samepr::follow(app, t, &old, &phase)?;
     }

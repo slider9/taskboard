@@ -15,6 +15,8 @@ use serde_json::Value;
 pub enum St {
     Needs,
     Working,
+    /// A working task parked until a set time: nothing runs until then.
+    Waiting,
     Queued,
     /// Its terminal was closed by hand: nothing failed and nothing will run it until it's restarted.
     Stopped,
@@ -31,6 +33,7 @@ impl St {
         match self {
             St::Needs => "Needs you",
             St::Working => "Working",
+            St::Waiting => "Waiting",
             St::Queued => "Queued",
             St::Stopped => "Stopped",
             St::Review => "In review",
@@ -47,12 +50,13 @@ impl St {
             St::Needs => 0,
             St::Failed => 1,
             St::Working => 2,
-            St::Review => 3,
-            St::Pending => 4,
-            St::Stopped => 5,
-            St::Queued => 6,
-            St::Planned => 7,
-            St::Done => 8,
+            St::Waiting => 3,
+            St::Review => 4,
+            St::Pending => 5,
+            St::Stopped => 6,
+            St::Queued => 7,
+            St::Planned => 8,
+            St::Done => 9,
         }
     }
 
@@ -61,6 +65,8 @@ impl St {
         match self {
             St::Needs => (t.warn_fg, t.warn_soft, t.warn),
             St::Working => (t.accent_fg, t.accent_soft, t.accent),
+            // Working's blue, hollow.
+            St::Waiting => (t.accent_fg, gpui_kit::transparent_black(), t.accent),
             St::Queued | St::Stopped => (t.text_2, t.seg, t.border_2),
             St::Review => (t.results, t.results_soft, t.results),
             St::Pending => (t.up_fg, gpui_kit::transparent_black(), t.up),
@@ -83,6 +89,8 @@ pub struct Row {
     pub line: String,
     /// The line in the status's color (a question, a failed check) rather than muted.
     pub loud: bool,
+    /// How many bytes at the start of `line` are bold: a waiting task's "Resumes 6:30 PM".
+    pub lead: usize,
     /// "38m" running, "12m" since it asked, "2:05 PM" when it finished.
     pub age: String,
 }
@@ -95,7 +103,13 @@ fn short(a: String) -> String {
 pub fn row(c: &Value) -> Row {
     let when = opt_s(c, "when").or(opt_s(c, "updated_at")).unwrap_or("");
     if s(c, "status") == "planned" {
-        return Row { st: St::Planned, line: String::new(), loud: false, age: String::new() };
+        return Row { st: St::Planned, line: String::new(), loud: false, lead: 0, age: String::new() };
+    }
+    if let Some((st, lead, plan)) = wait_line(c) {
+        let line = if plan.is_empty() { lead.clone() } else { format!("{lead} · {plan}") };
+        // Nothing runs while it waits; once it missed its time, how long it has needed you.
+        let age = if st == St::Needs { short(fmt::ago(when)) } else { String::new() };
+        return Row { st, line, loud: st == St::Needs, lead: lead.len(), age };
     }
     let tile = tile_vm(c);
     let run = fmt::running_for(c).trim_start_matches("running ").to_string();
@@ -114,7 +128,7 @@ pub fn row(c: &Value) -> Row {
         "Queued" => (St::Queued, opt_s(c, "waiting").map(str::to_string).unwrap_or_default(), false, String::new()),
         "Checks failed" | "Conflicts" => (St::Review, format!("{} · {}", tile.status, tile.line), true, String::new()),
         "Checks running" | "Comments" | "Ready to merge" => (St::Review, format!("{} · {}", tile.status, tile.line), false, String::new()),
-        "In review" => (St::Review, tile.line, false, String::new()),
+        "In review" | "Merged, checks running" => (St::Review, tile.line, false, String::new()),
         "Pending merge" => (St::Pending, tile.line, false, String::new()),
         "Failed" => (St::Failed, opt_s(c, "summary").unwrap_or("").to_string(), false, fmt::hhmm(when)),
         "Done" if !crate::ui::goal::awaiting_merge(c) => (St::Done, opt_s(c, "summary").map(str::to_string).unwrap_or_default(), false, fmt::hhmm(when)),
@@ -129,11 +143,24 @@ pub fn row(c: &Value) -> Row {
     let declined = c["pr"]["state"].as_str().is_some_and(|st| !st.eq_ignore_ascii_case("MERGED") && !st.eq_ignore_ascii_case("OPEN"));
     let line = match (st == St::Done, pr_num, landed) {
         (true, Some(_), Some(sha)) if declined => format!("Landed in {}", &sha[..sha.len().min(7)]),
-        (true, Some(n), None) if declined => format!("PR #{n} declined"),
+        (true, Some(n), None) if declined => match c["pr"]["closed"]["line"].as_str() {
+            Some(went) => format!("PR #{n} declined · {went}"),
+            None => format!("PR #{n} declined"),
+        },
         (true, Some(n), _) if line.is_empty() => format!("PR #{n} merged"),
         _ => line,
     };
-    Row { st, line, loud, age }
+    Row { st, line, loud, lead: 0, age }
+}
+
+/// A task parked until a set time: Waiting with "Resumes 6:30 PM" and its plan, or once it missed
+/// that time, Needs you with "Didn't resume at 6:30 PM" (`wait_until.rs`).
+pub fn wait_line(c: &Value) -> Option<(St, String, String)> {
+    if let Some(at) = opt_s(c, "waiting_until").filter(|_| s(c, "status") == "working" && !b(c, "lost")) {
+        return Some((St::Waiting, format!("Resumes {}", fmt::resume_time(at)), opt_s(c, "resume_plan").unwrap_or("").to_string()));
+    }
+    let missed = fmt::obj(c, "wait_missed").filter(|_| s(c, "status") == "needs" && !b(c, "lost"))?;
+    Some((St::Needs, format!("Didn’t resume at {}", fmt::resume_time(s(missed, "at"))), s(missed, "plan").to_string()))
 }
 
 /// The status of a task whose tile label `row` doesn't know, from its own fields.
@@ -148,6 +175,14 @@ fn by_task(c: &Value) -> St {
     }
 }
 
+/// A row's line, its lead in bold: "**Resumes 6:30 PM** · read the build's result". A quiet line's lead
+/// takes the body color; a loud one keeps the line's.
+pub fn line_text(t: &Theme, id: impl Into<ElementId>, row: &Row, text: &str) -> InteractiveText {
+    let lead = if text == row.line { row.lead.min(text.len()) } else { 0 };
+    let bold = HighlightStyle { font_weight: Some(FontWeight::BOLD), color: (!row.loud).then_some(t.text), ..Default::default() };
+    kit::clipped_styled(id, text.to_string(), if lead > 0 { vec![(0..lead, bold)] } else { Vec::new() })
+}
+
 /// The chip's width: fits "Pending merge", the longest label.
 pub const CHIP_W: f32 = 104.;
 
@@ -157,7 +192,7 @@ pub fn chip(t: &Theme, st: St) -> Div {
     kit::pill(fg, bg, st.label())
         .w(px(CHIP_W))
         .justify_center()
-        .when(matches!(st, St::Planned | St::Pending), |d| d.border_1().border_color(line))
+        .when(matches!(st, St::Planned | St::Pending | St::Waiting), |d| d.border_1().border_color(line))
 }
 
 /// A bar split by status: (status, how many), in the order given.
@@ -172,6 +207,7 @@ pub fn bar(t: &Theme, parts: &[(St, i64)], h: f32) -> Div {
         let fill = match st {
             St::Queued | St::Planned => t.border_2,
             St::Pending => solid.opacity(0.5),
+            St::Waiting => solid.opacity(0.45),
             _ => solid,
         };
         let mut seg = div().h_full().bg(fill);
@@ -346,9 +382,23 @@ mod tests {
         // way the row says where.
         let declined = row(&card(json!({"status": "done", "summary": "Fixed it", "pr": {"num": 4, "state": "DECLINED"}})));
         assert_eq!((declined.st, declined.line.as_str()), (St::Done, "PR #4 declined"));
+        let superseded = row(&card(json!({"status": "done", "pr": {"num": 4, "state": "DECLINED", "closed": {"line": "Superseded by #12"}}})));
+        assert_eq!(superseded.line, "PR #4 declined · Superseded by #12", "says where its work went");
         let landed = row(&card(json!({"status": "done", "landed": "0123456789abcdef", "pr": {"num": 4, "state": "DECLINED"}})));
         assert_eq!((landed.st, landed.line.as_str()), (St::Done, "Landed in 0123456"));
         assert_eq!(row(&card(json!({"status": "done", "failed": true}))).st, St::Failed);
+    }
+
+    #[test]
+    fn a_parked_task_waits_with_its_resume_time_in_bold_and_needs_you_once_it_misses_it() {
+        crate::parity::freeze("2026-11-23T15:00:00Z");
+        let plan = "read the build";
+        let w = row(&card(json!({"waiting_until": "2026-11-23T18:30:00Z", "resume_plan": plan, "latest": "Waiting · resumes 6:30 PM"})));
+        assert_eq!((w.st, w.line.as_str(), w.loud, &w.line[..w.lead]), (St::Waiting, "Resumes 6:30 PM · read the build", false, "Resumes 6:30 PM"));
+        assert!(St::Working.rank() < St::Waiting.rank() && St::Waiting.rank() < St::Review.rank());
+        let missed = json!({"status": "needs", "needs_reason": "wait_overdue", "question": "T1 was due back", "wait_missed": {"at": "2026-11-23T18:30:00Z", "plan": plan}});
+        let m = row(&card(missed));
+        assert_eq!((m.st, m.line.as_str(), m.loud, &m.line[..m.lead]), (St::Needs, "Didn’t resume at 6:30 PM · read the build", true, "Didn’t resume at 6:30 PM"));
     }
 
     #[test]
@@ -373,6 +423,19 @@ mod tests {
             let c = card(json!({"status": "done", "pr": {"num": 7, "state": "OPEN", "stage": {"phase": phase}}}));
             assert_eq!(row(&c).st, St::Review, "phase {phase}");
         }
+    }
+
+    #[test]
+    fn a_pr_merged_while_its_checks_run_stays_in_review_until_they_finish() {
+        let pr = json!({"num": 933, "state": "MERGED", "stage": {"phase": "landing", "label": "Merged, checks still running"}});
+        let c = card(json!({"status": "done", "summary": "Merged early", "pr": pr}));
+        let r = row(&c);
+        assert_eq!((r.st, r.line.as_str(), r.loud), (St::Review, "PR #933 · Merged, checks still running", false));
+        assert_eq!(by_task(&c), St::Review);
+        assert!(crate::ui::goal::awaiting_merge(&c));
+        // Once the checks finish the daemon moves it to merged: plain Done.
+        let merged = card(json!({"status": "done", "pr": {"num": 933, "state": "MERGED", "stage": {"phase": "merged"}}}));
+        assert_eq!((row(&merged).st, row(&merged).line.as_str()), (St::Done, "PR #933 merged"));
     }
 
     #[test]

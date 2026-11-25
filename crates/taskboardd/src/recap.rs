@@ -60,6 +60,8 @@
 //! - `tries`: the PRs merged in the period, and how many merged on their first try, with no review
 //!   round that found something to fix (`pr_merges.fix_rounds`). A PR merged before the rounds were
 //!   recorded is `unknown` and counts in neither.
+//! - `estimates`: how the agents' own estimates of the period's finished tasks compared with their
+//!   working time (`accuracy.rs`), with the trend by month; null when none had an estimate.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -70,7 +72,7 @@ use serde_json::{json, Value};
 use crate::app::App;
 use crate::days::{self, NO_PROJECT};
 use crate::util::*;
-use crate::{dispatch, hours, human, midna, p, quality};
+use crate::{dispatch, estimate, hours, human, midna, p, quality};
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS recaps(
@@ -201,7 +203,7 @@ fn done_tasks(app: &App, from: f64, to: f64) -> Result<Vec<Done>> {
            CASE WHEN t.pr_num IS NOT NULL THEN t.pr_state ELSE a.pr_state END AS any_state,
            CASE WHEN t.pr_num IS NOT NULL THEN t.pr_phase ELSE a.pr_phase END AS any_phase
          FROM tasks t LEFT JOIN tasks a ON a.id = t.same_pr
-         WHERE t.status = 'done' AND t.failed = 0 AND COALESCE(t.owner_answer, '') NOT IN ('cant_do', 'not_needed')
+         WHERE t.status = 'done' AND t.failed = 0 AND COALESCE(t.owner_answer, '') NOT IN ('cant_do', 'not_needed', 'board_agent', 'board_answered')
            AND t.finished_at >= ? AND t.finished_at < ?
          ORDER BY t.finished_at, t.id",
         p![iso(from), iso(to)],
@@ -291,36 +293,15 @@ fn busy(stretches: impl Iterator<Item = (f64, f64)>) -> f64 {
     crate::clock::merge(stretches.collect()).iter().map(|(a, b)| b - a).sum()
 }
 
-/// Each task's working seconds, ever, by task (tasks that never worked are left out).
-fn work_by_task(app: &App, tasks: &[i64]) -> Result<HashMap<i64, f64>> {
-    let mut out: HashMap<i64, f64> = HashMap::new();
-    if tasks.is_empty() {
-        return Ok(out);
-    }
-    let now = now_ts();
-    let list = tasks.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(",");
-    let states = app.db.q(&format!("SELECT task_id, at, status FROM task_states WHERE task_id IN ({list}) ORDER BY task_id, at, id"), p![])?;
-    for (i, s) in states.iter().enumerate() {
-        if s.s("status") != Some("working") {
-            continue;
-        }
-        let task = s.i0("task_id");
-        let a = s.s("at").and_then(parse_iso).unwrap_or(now);
-        let b = states.get(i + 1).filter(|n| n.i0("task_id") == task).and_then(|n| n.s("at")).and_then(parse_iso).unwrap_or(now);
-        *out.entry(task).or_default() += (b - a).max(0.0);
-    }
-    Ok(out)
-}
-
 /// The tasks' working seconds, ever, added up (for agent time against the estimate).
 fn total_work(app: &App, tasks: &[i64]) -> Result<f64> {
-    Ok(work_by_task(app, tasks)?.values().sum())
+    Ok(estimate::work_by_task(app, tasks)?.values().sum())
 }
 
 /// `rows`' tasks by their agent time ever, most first, the first `cap` of them.
 fn slowest(app: &App, rows: &[&Row], cap: usize) -> Result<Vec<Value>> {
     let ids: Vec<i64> = rows.iter().map(|r| r.id()).collect();
-    let work = work_by_task(app, &ids)?;
+    let work = estimate::work_by_task(app, &ids)?;
     let mut slow: Vec<(&Row, f64)> = rows.iter().filter_map(|r| Some((*r, *work.get(&r.id()).filter(|s| **s > 0.0)?))).collect();
     slow.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.id().cmp(&b.0.id())));
     Ok(slow
@@ -672,6 +653,7 @@ fn labels() -> Value {
         "heat": "Finished tasks by weekday and hour",
         "ranks": "Projects ranked by finished tasks, this period and the one before",
         "first_try": "PRs merged with no review round that found something to fix",
+        "estimates": "Agents' own estimates of their working time against the working time tasks took (not the developer-time estimate)",
     })
 }
 
@@ -726,6 +708,7 @@ pub fn facts(app: &App, kind: &str, first: NaiveDate) -> Result<Value> {
         "slowest": slowest(app, &done_rows, SLOW_CAP)?,
         "heat": heat(&g),
         "tries": tries(app, from, to)?,
+        "estimates": crate::accuracy::window(app, from, to, &[])?,
     });
     f["ranks"] = if f["before"].is_null() { Value::Null } else { ranks(&project_list, &pg) };
     if kind == "monthly" {

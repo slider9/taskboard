@@ -120,15 +120,27 @@ pub fn rule_files(entry: &str) -> Vec<PathBuf> {
     vec![p]
 }
 
+/// Every file the owner's `questions.rules` name, each once, up to `RULES_FILES`.
+pub fn rule_paths(app: &App) -> Vec<PathBuf> {
+    let mut seen: Vec<PathBuf> = vec![];
+    for p in app.cfg.questions.rules.iter().flat_map(|r| rule_files(r)) {
+        if seen.len() >= RULES_FILES {
+            break;
+        }
+        if !seen.contains(&p) {
+            seen.push(p);
+        }
+    }
+    seen
+}
+
 fn rules(app: &App) -> String {
     let mut out = vec![format!("questions.md:\n{SKILL_QUESTIONS}")];
-    let mut seen: Vec<PathBuf> = vec![];
     let mut left = RULES_BUDGET;
-    for p in app.cfg.questions.rules.iter().flat_map(|r| rule_files(r)) {
-        if seen.contains(&p) || left == 0 || seen.len() >= RULES_FILES {
-            continue;
+    for p in rule_paths(app) {
+        if left == 0 {
+            break;
         }
-        seen.push(p.clone());
         if let Ok(text) = std::fs::read_to_string(&p) {
             let text = clip(&text, 12000.min(left));
             left = left.saturating_sub(text.len());
@@ -187,20 +199,25 @@ fn prompt(app: &App, t: Option<&Row>, question: &str, reply: bool) -> Result<Str
 
 /// Returns `{verdict, answer?, source?, question?}`, or None when screening is off or fails.
 pub fn question(app: &App, t: Option<&Row>, text: &str) -> Option<Value> {
-    screen(app, t, text, false)
+    screen(app, t, text, false, &app.cfg.questions.model)
+}
+
+/// Like [`question`], read by `model`: the Needs you re-check asks a second model when the first can't decide.
+pub fn question_by(app: &App, t: Option<&Row>, text: &str, model: &str) -> Option<Value> {
+    screen(app, t, text, false, model)
 }
 
 /// Like [`question`] for the end of a turn's reply, which may ask nothing: then `{verdict: "none"}`.
 pub fn reply_question(app: &App, t: Option<&Row>, text: &str) -> Option<Value> {
-    screen(app, t, text, true)
+    screen(app, t, text, true, &app.cfg.questions.model)
 }
 
-fn screen(app: &App, t: Option<&Row>, text: &str, reply: bool) -> Option<Value> {
+fn screen(app: &App, t: Option<&Row>, text: &str, reply: bool, model: &str) -> Option<Value> {
     if !app.cfg.questions.screen {
         return None;
     }
     let p = prompt(app, t, text, reply).ok()?;
-    let v = ask_claude(app, p, &app.cfg.questions.model, &verdict_schema(reply), "the question")?;
+    let v = ask_claude(app, p, model, &verdict_schema(reply), "the question")?;
     match v["verdict"].as_str() {
         Some("answered") if v["answer"].as_str().map(|a| !a.trim().is_empty()).unwrap_or(false) => Some(json!({
             "verdict": "answered", "answer": v["answer"], "source": v["source"].as_str().filter(|s| !s.is_empty()).unwrap_or("the rules")})),
@@ -306,12 +323,15 @@ fn human_prompt(app: &App, t: Option<&Row>, sid: Option<&str>, title: &str, deta
 /// `{verdict: "answered", answer, source}` mean it needn't reach the owner. None when screening is off or
 /// fails, and the task goes through as before.
 pub fn human_task(app: &App, t: Option<&Row>, sid: Option<&str>, title: &str, detail: &str) -> Option<Value> {
+    human_task_by(app, t, sid, title, detail, app.cfg.questions.human_model())
+}
+
+/// Like [`human_task`], read by `model`.
+pub fn human_task_by(app: &App, t: Option<&Row>, sid: Option<&str>, title: &str, detail: &str, model: &str) -> Option<Value> {
     if !app.cfg.questions.screen {
         return None;
     }
     let p = human_prompt(app, t, sid, title, detail).ok()?;
-    let q = &app.cfg.questions;
-    let model = if q.human_model.trim().is_empty() { &q.model } else { &q.human_model };
     human_verdict(&ask_claude(app, p, model, &human_schema(), "the human task")?)
 }
 

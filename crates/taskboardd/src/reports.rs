@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use crate::app::App;
 use crate::util::*;
-use crate::{blocks, board, deliver, fields, handoff, hooks, lines, midna, ops, p, prflow, projects, screen, steps, transcript, waitsfor};
+use crate::{blocks, board, deliver, estimate, fields, handoff, hooks, lines, midna, ops, p, prflow, projects, screen, steps, transcript, waitsfor};
 
 static MARKER_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\[task-board:[Tt](\d+)\]").unwrap());
 static COMMIT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^\[[^\]]+\]\s+(.+)$").unwrap());
@@ -378,6 +378,11 @@ pub fn git_place(cmd: &str, cwd: &str) -> Option<String> {
     }
 }
 
+/// The folder `cmd` ends up in: `cwd`, through each `cd <dir>` in it.
+pub fn cd_place(cmd: &str, cwd: &str) -> String {
+    CD_RE.captures_iter(cmd).fold(cwd.to_string(), |at, c| resolve(&at, &c[1]))
+}
+
 /// `p` (quoted, `~/…` or relative) as a plain absolute path from `cwd`.
 fn resolve(cwd: &str, p: &str) -> String {
     use std::path::{Component, Path, PathBuf};
@@ -519,7 +524,8 @@ fn on_session_start(r: &mut Report) -> Result<Value> {
 
 /// Why a running task needs the owner only until its terminal carries on: a permission prompt or an
 /// idle prompt, or an API error. Any prompt, the turn's end, or Midna seeing it work again clears it.
-pub const UNTIL_IT_CARRIES_ON: [&str; 3] = ["attention", "offline", "api_error"];
+/// A task that missed the time it parked itself until (`wait_until.rs`) is one too.
+pub const UNTIL_IT_CARRIES_ON: [&str; 4] = ["attention", "offline", "api_error", crate::wait_until::OVERDUE];
 
 fn back_to_work(r: &Report, t: &Row, prompt: Option<&str>) -> Result<()> {
     if t.s("status") != Some("needs") || t.b("lost") {
@@ -540,6 +546,10 @@ fn on_prompt(r: &mut Report) -> Result<Value> {
     r.note_background(transcript::Background::default())?;
     let prompt = r.body.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let m = MARKER_RE.captures(&prompt).and_then(|c| c[1].parse::<i64>().ok());
+    // A turn on a task that parked itself until a set time is the one it waited for.
+    if let Some(t) = board::task_for_session(app, r.sid())? {
+        crate::wait_until::resume(app, &t, &r.name(), "Back from waiting: a turn started")?;
+    }
     if let Some(sid) = r.sid() {
         app.db.x("UPDATE sessions SET board_prompt = ? WHERE id = ?", p![m.is_some() as i64, sid])?;
         if !r.spooled {
@@ -567,6 +577,7 @@ fn on_prompt(r: &mut Report) -> Result<Value> {
                     if let Err(why) = board::claim(app, t, &sid, r.claude.as_deref(), None, "Picked up", false)? {
                         return Ok(ok(None, Some(format!("Task board: {why} Ask {} before working on it.", app.cfg.owner))));
                     }
+                    crate::wait_until::resume(app, &board::get_task(app, t.id())?, &r.name(), "Back from waiting: a turn started")?;
                     let t = board::get_task(app, t.id())?;
                     r.set_session_status("working")?;
                     if handoff::is_full_handoff(&prompt, t.id()) {
@@ -686,9 +697,20 @@ fn on_stop(r: &mut Report) -> Result<Value> {
         prflow::link_pr(app, &t, &pr, &r.name())?;
     }
     r.stalled = stalled(r, &t)?;
+    // Parked until a set time (`tb wait-until`): its turn ends on purpose, with nothing for the owner.
+    let parked = crate::wait_until::waiting(&t);
+    if parked {
+        r.stalled = false;
+        r.unshipped = None;
+    }
     let reply_end = { let end = r.b("last_message_end"); if end.trim().is_empty() { r.b("last_message") } else { end } };
-    let waited = waits_in_reply(r, &t, &reply_end)?;
-    let caught = waited.is_some();
+    let waited = if parked { None } else { waits_in_reply(r, &t, &reply_end)? };
+    // Its reply says it waits until a set time it never parked on: not a question for the owner either.
+    let waited = match waited {
+        None if !parked => parks_in_reply(r, &t, &reply_end)?,
+        w => w,
+    };
+    let caught = waited.is_some() || parked;
     let asked = ends_on_question(&reply_end).filter(|_| !caught && !r.spooled && t.s("status") == Some("working"));
     if asked.is_some() || idle_on(r, &t)? != Some(false) {
         r.unshipped = None;
@@ -725,7 +747,7 @@ fn on_stop(r: &mut Report) -> Result<Value> {
     }
     app.wake_runner();
     if let Some(w) = waited {
-        return Ok(with(ok(Some(&t), None), w));
+        return Ok(with(ok(Some(&board::get_task(app, t.id())?), None), w));
     }
     match buried {
         Some(q) => Ok(with(ok(Some(&t), None), json!({"block": crate::buried::reason(app, &q, &board::tb_cmd(app))}))),
@@ -768,6 +790,36 @@ fn waits_in_reply(r: &mut Report, t: &Row, reply_end: &str) -> Result<Option<Val
     Ok(Some(said))
 }
 
+/// A working task's turn that ends saying it waits until a set time (a trigger wakes it at 06:30 UTC)
+/// that it never ran `tb wait-until` on (`turn_wait::until`): the first time, the Stop is sent back with
+/// the exact line to run; when it ends again still saying so, the board parks it itself. Either way it
+/// isn't left on the owner. What the Stop answers with (`block`, `parked`), or None when it names no time.
+fn parks_in_reply(r: &mut Report, t: &Row, reply_end: &str) -> Result<Option<Value>> {
+    let app = r.app;
+    if r.spooled || t.s("status") != Some("working") || t.b("lost") || t.s("session_id") != r.sid() || crate::code_review::in_review(t) {
+        return Ok(None);
+    }
+    let Some(u) = crate::turn_wait::until(reply_end, now_ts()) else { return Ok(None) };
+    r.stalled = false;
+    r.unshipped = None;
+    let when = crate::wait_until::say(&iso(u.at));
+    if !as_bool(r.body.get("stop_hook_active"), false) {
+        r.set_session_status("working")?;
+        r.log(t.id(), "note", &format!("Its reply says it waits until {when} without parking; sent back to park it"), None)?;
+        return Ok(Some(json!({"block": crate::turn_wait::until_reason(app, &u, &crate::human::task_ref(t))})));
+    }
+    park_from_reply(r, t, &u)?;
+    Ok(Some(json!({"parked": t.id()})))
+}
+
+/// Parks working task `t` until the time its reply named, as `tb wait-until` would.
+fn park_from_reply(r: &Report, t: &Row, u: &crate::turn_wait::Until) -> Result<()> {
+    let when = crate::wait_until::say(&iso(u.at));
+    r.log(t.id(), "note", &format!("Its reply says it waits until {when}, so the board parked it"), None)?;
+    crate::wait_until::park(r.app, t, u.at, &u.plan, board::BOARD)?;
+    Ok(())
+}
+
 /// The end of a turn on a terminal with no task (and not visiting a PR) that the board opened for
 /// the owner's work or its own (`reply_screen::asks`): when its reply ends on a question, it's
 /// screened like a task's turn.
@@ -798,8 +850,14 @@ static ASKS_OWNER: Lazy<Regex> = Lazy::new(|| {
 /// The question a turn's reply ends on, when its last paragraph asks the owner something: a
 /// sentence ending in "?", or asking for an answer in so many words ("tell me which…").
 pub(crate) fn ends_on_question(reply: &str) -> Option<String> {
-    let last = reply.trim().rsplit("\n\n").map(str::trim).find(|p| !p.is_empty())?;
+    let last = last_words(reply)?;
     asks_owner(last).then(|| one_line(last, 1000))
+}
+
+/// A reply's last paragraph with words in it: a closing horizontal rule (`---`, `***`) or other
+/// paragraph with no letter or digit after it says nothing, so the paragraph above it ends the reply.
+fn last_words(reply: &str) -> Option<&str> {
+    reply.rsplit("\n\n").map(str::trim).find(|p| p.chars().any(char::is_alphanumeric))
 }
 
 /// `text` asks the owner something, by [`ends_on_question`]'s signals.
@@ -1098,6 +1156,10 @@ fn changed_with_no_task(r: &Report) -> Result<Option<String>> {
         _ => shown_files(&files),
     };
     let last = board::find_task(r.app, s.i("last_task"))?;
+    // tb wait-for this turn took the task off this terminal: the turn's edits came before it and are its work.
+    if last.as_ref().is_some_and(|t| parked_this_turn(t, &sid, r.turn_at.as_deref())) {
+        return Ok(None);
+    }
     if let Some(last) = last {
         if last.s("status") == Some("done") && last.st("finished_at") >= r.turn_at.clone().unwrap_or_default() {
             return Ok(None);
@@ -1124,13 +1186,19 @@ fn changed_with_no_task(r: &Report) -> Result<Option<String>> {
     Ok(Some(format!(
         "[task-board] This turn changed code ({shown}), but this terminal has no task, so the board isn't tracking the work. \
          Put it on the board now as a standalone task on this terminal: {tb} task new \"<short imperative title>\" \
-         --detail \"<what {owner} asked for and what you changed>\" --here (add --no-pr if it won't end in a PR). \
+         --detail \"<what {owner} asked for and what you changed>\" --est <len> --here (add --no-pr if it won't end in a PR). \
          If the work is a design (concepts, a canvas, mockups, a design artifact), make a goal for the feature first: \
-         {tb} goal new \"<feature>\" --tldr \"…\" --outcome \"<done when>\", then the task with --kind design --goal G<n> --here; \
+         {tb} goal new \"<feature>\" --tldr \"…\" --outcome \"<done when>\" --est <len>, then the task with --kind design --goal G<n> --here; \
          the build tasks that follow go in that goal and wait for it.{backlog} \
          To check the board for this work first: {tb} search \"<words>\".{switch} Then end your turn without repeating your answer. \
          If {owner} said not to track it, just end your turn. The task-board skill's no-task.md has the rest."
     )))
+}
+
+/// Task `t` was parked by `tb wait-for` from terminal `sid` since the turn started (`turn_at`; any time when
+/// the turn's start isn't known).
+fn parked_this_turn(t: &Row, sid: &str, turn_at: Option<&str>) -> bool {
+    waitsfor::parked(t).is_some_and(|p| p.s("session") == Some(sid) && turn_at.is_none_or(|at| p.st("at").as_str() >= at))
 }
 
 /// The terminal's project got a release since the turn started.
@@ -1629,6 +1697,12 @@ fn on_attention(r: &mut Report) -> Result<Value> {
             return Ok(ok(r.task()?.as_ref(), None));
         }
     }
+    if kind == "idle_prompt" {
+        // Parked until a set time (`tb wait-until`): idle at its prompt is what it's meant to be.
+        if let Some(t) = r.task()?.filter(|t| crate::wait_until::waiting(t) && t.s("session_id") == r.sid()) {
+            return Ok(ok(Some(&t), None));
+        }
+    }
     r.set_session_status("needs")?;
     let Some(t) = r.task()? else {
         let m = one_line(&{ let m = r.b("message"); if m.is_empty() { r.b("title") } else { m } }, 500);
@@ -1662,6 +1736,12 @@ fn on_attention(r: &mut Report) -> Result<Value> {
             }
             return Ok(with(ok(Some(&t), None), json!({"waited": t.id(), "parked": out["parked"]})));
         }
+        // Its reply says it waits until a set time (its Stop never got to say so): park it, idle on purpose.
+        if let Some(u) = crate::turn_wait::until(reply, now_ts()) {
+            park_from_reply(r, &t, &u)?;
+            r.set_session_status("idle")?;
+            return Ok(with(ok(Some(&board::get_task(app, t.id())?), None), json!({"parked": t.id()})));
+        }
     }
     let message = match said.as_deref().and_then(last_paragraph) {
         Some(p) => one_line(&p, 500),
@@ -1677,7 +1757,7 @@ fn on_attention(r: &mut Report) -> Result<Value> {
 
 /// The last paragraph of a reply, where it says what it waits for.
 fn last_paragraph(reply: &str) -> Option<String> {
-    reply.trim().rsplit("\n\n").map(str::trim).find(|p| !p.is_empty()).map(|p| p.to_string())
+    last_words(reply).map(str::to_string)
 }
 
 /// Claude showed its question picker (`AskUserQuestion`): the task waits on the owner, who answers it
@@ -1740,6 +1820,17 @@ fn on_note(r: &mut Report) -> Result<Value> {
     r.log(t.id(), "note", &text, None)?;
     board::update_task(app, t.id(), fields!["latest" => one_line(&text, 200)])?;
     Ok(ok(Some(&t), None))
+}
+
+/// `tb estimate <len>`: the task's estimate of its working time, for one made without one.
+fn on_estimate(r: &mut Report) -> Result<Value> {
+    r.touch_session(true)?;
+    let Some(t) = r.task()? else { return err(400, "This terminal has no task: name it with --task T<n>.") };
+    let Some(min) = estimate::parse(r.body.get("est"))? else {
+        return err(400, format!("Give the estimate as a length: tb estimate 45m (or 3h, 1h30m), {}", estimate::what_it_is(r.app)));
+    };
+    estimate::set_task(r.app, &t, min, &r.name())?;
+    Ok(with(ok(Some(&t), None), json!({"est_min": min, "est": estimate::len(min as f64)})))
 }
 
 fn on_checkpoint(r: &mut Report) -> Result<Value> {
@@ -1844,6 +1935,11 @@ fn on_found(r: &mut Report) -> Result<Value> {
     let filer = blocks::Filer { task: t.as_ref(), goal_id, always: false };
     let marked = blocks::read(&r.body, &filer, None, &title)?;
     let misses = marked.level == blocks::GOAL;
+    // A miss that needs the owner's call stays on Needs you; any other goes to an agent (`misses.rs`).
+    let owner_call = as_bool(r.body.get("needs_owner"), false);
+    if owner_call && !misses {
+        return err(400, "--needs-owner is for a miss on the goal's done-when: give it with --misses-goal.");
+    }
     let key = norm_title(&title);
     let cands = match goal_id {
         Some(g) => app.db.q("SELECT * FROM issues WHERE state = 'open' AND goal_id = ?", p![g])?,
@@ -1857,6 +1953,9 @@ fn on_found(r: &mut Report) -> Result<Value> {
             text += &format!(" They said: “{}”", one_line(&detail, 400));
         }
         board::add_issue_event(app, dup.id(), &name, "seen", &text, Some(&snap))?;
+        if owner_call {
+            crate::misses::mark_owner(app, dup.id())?;
+        }
         let took = blocks::mark(app, dup.id(), &marked, goal_id, &dup.st("title"), &name, false, t.as_ref())?;
         if let Some(t) = &t {
             let took = took.as_deref().map(|w| format!(" {w}")).unwrap_or_default();
@@ -1880,7 +1979,8 @@ fn on_found(r: &mut Report) -> Result<Value> {
         fields!["goal_id" => goal_id, "project" => project, "kind" => kind, "title" => title,
                 "detail" => if detail.is_empty() { None } else { Some(detail.clone()) }, "said" => said, "how" => how,
                 "source" => "terminal", "found_by_task" => t.as_ref().map(|t| t.id()), "found_by_session" => r.sid(),
-                "found_by_name" => name, "state" => "open", "snapshot" => jdumps(&snap), "created_at" => now, "updated_at" => now]
+                "found_by_name" => name, "state" => "open", "snapshot" => jdumps(&snap), "created_at" => now, "updated_at" => now,
+                "needs_owner" => owner_call as i64]
             .into_iter()
             .chain(blocks::fields(&marked))
             .collect(),
@@ -1894,7 +1994,9 @@ fn on_found(r: &mut Report) -> Result<Value> {
         )?;
     }
     if let Some(t) = &t {
-        let text = if misses {
+        let text = if misses && took.is_some() {
+            format!("Found a miss on the goal’s done-when: {title}. Filed as {} with a snapshot. {}", rf("issue", iid), took.as_deref().unwrap_or(""))
+        } else if misses {
             format!("Found a miss on the goal’s done-when: {title}. Sent to you as {} with a snapshot; the goal stays open until it’s settled.", rf("issue", iid))
         } else if marked.level == blocks::PR {
             let took = took.as_deref().map(|w| format!(" {w}")).unwrap_or_default();
@@ -2225,6 +2327,37 @@ fn on_wait_for(r: &mut Report) -> Result<Value> {
     }
     app.wake_runner();
     Ok(with(ok(Some(&t), b), json!({"parked": true})))
+}
+
+/// `tb wait-until <time> --then "<plan>"`: the working task parks itself until a set time (`wait_until.rs`);
+/// `none` drops the wait.
+fn on_wait_until(r: &mut Report) -> Result<Value> {
+    let app = r.app;
+    r.touch_session(true)?;
+    let Some(t) = r.task()? else { return Ok(ok(None, None)) };
+    let me = rf("task", t.id());
+    let at = r.b("at");
+    if crate::scheduled::is_off(&at) {
+        let was = crate::wait_until::resume(app, &t, &r.name(), "No longer waits for a set time")?;
+        let text = if was { format!("{me} no longer waits for a set time.") } else { format!("{me} wasn't waiting for a set time.") };
+        let t = board::get_task(app, t.id())?;
+        return Ok(with(ok(Some(&t), Some(text)), crate::wait_until::answer(&t, None)));
+    }
+    if t.s("status") != Some("working") || t.b("lost") {
+        return err(409, format!("{me} isn't working, so it has nothing to wait on. Only a working task waits until a set time."));
+    }
+    if t.s("session_id") != r.sid() {
+        return err(409, format!("Only {me}'s own terminal can park it until a set time."));
+    }
+    let plan = one_line(&r.b("then"), 500);
+    if plan.is_empty() {
+        return err(400, "Say what it does when it resumes, for example: --then \"read the nightly build's result and fix what failed\".");
+    }
+    let when = crate::wait_until::parse(&at, now_ts())?;
+    let iso = crate::wait_until::park(app, &t, when, &plan, &r.name())?;
+    let t = board::get_task(app, t.id())?;
+    let text = crate::wait_until::parked_text(app, &t, &iso);
+    Ok(with(ok(Some(&t), Some(text)), crate::wait_until::answer(&t, Some(&iso))))
 }
 
 pub fn finish_task(app: &App, t: &Row, who: &str, summary: &str, failed: bool, at: Option<&str>) -> Result<Row> {
@@ -2770,7 +2903,39 @@ fn on_step_ask(r: &mut Report) -> Result<Value> {
     Ok(with(ok(Some(&t), None), json!({"step": step.name, "open": s.open})))
 }
 
-/// `tb step fail`: a step can't pass; the task waits for the owner's answer (or their skip).
+/// What the owner is asked when a step can't pass.
+fn step_fail_ask(step: &steps::Step, why: &str) -> String {
+    format!("Step “{}” can't pass: {why}. Answer, or skip the step.", step.name)
+}
+
+/// What the question screener reads for a `tb step fail`: the ask, what the step is and who can skip it,
+/// so a rule about that kind of step (or failure) can settle it.
+fn step_fail_screened(app: &App, step: &steps::Step, why: &str) -> String {
+    let mut q = step_fail_ask(step, why);
+    if !step.prompt.trim().is_empty() {
+        q += &format!("\n\nThe step asks: {}", one_line(&step.prompt, 1000));
+    }
+    q += &if step.skippable {
+        "\nThe agent may skip it itself with tb step skip when it doesn't apply.".to_string()
+    } else {
+        format!("\nOnly {} can skip it.", app.cfg.owner)
+    };
+    q
+}
+
+/// The rule or lesson that says what to do about a failing step, unless the agent overrode it
+/// (`tb step fail --override`) or the report was saved while the board was down and its agent has moved on.
+fn step_fail_rule(r: &Report, t: &Row, step: &steps::Step) -> Option<steps::StepRule> {
+    if r.spooled || r.body["override"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    steps::rule_for(r.app, t, step)
+}
+
+/// `tb step fail`: a step can't pass. A step a rule or lesson covers is refused with that rule, unless
+/// overridden (#1146). When the owner's rules settle what to do (screened before the transaction, as
+/// `tb question` is), the board answers and the task carries on; otherwise the task waits for the
+/// owner's answer (or their skip).
 fn on_step_fail(r: &mut Report) -> Result<Value> {
     let app = r.app;
     r.touch_session(true)?;
@@ -2780,7 +2945,15 @@ fn on_step_fail(r: &mut Report) -> Result<Value> {
     if why.is_empty() {
         return err(400, "Say why the step can't pass (--why).");
     }
-    wait_on_owner(r, &t, &step, &format!("Step “{}” can't pass: {why}. Answer, or skip the step.", step.name), true)?;
+    if let Some(rule) = step_fail_rule(r, &t, &step) {
+        return err(409, steps::rule_refusal(&board::tb_cmd(app), &step.name, &rule));
+    }
+    let ask = step_fail_ask(&step, &why);
+    if let Some(s) = r.screened.clone().filter(|s| s["verdict"] == "answered") {
+        let v = answered(r, &t, &ask, &s)?;
+        return Ok(with(v, json!({"step": step.name})));
+    }
+    wait_on_owner(r, &t, &step, &ask, true)?;
     Ok(with(ok(Some(&t), None), json!({"step": step.name})))
 }
 
@@ -2979,7 +3152,7 @@ static PLANNED_WITH_FILES: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)^(.*)::\s
 static PLANNED_WITH_REFS: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)^(.*)::\s*(\d*)\s*::\s*([#Tt0-9,\s]*)$").unwrap());
 static PLANNED_WITH_WAVE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)^(.*)::\s*(\d+)\s*$").unwrap());
 static EARLIER_REF: Lazy<Regex> = Lazy::new(|| Regex::new(r"^#(\d+)$").unwrap());
-static PLANNED_PART: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)^(.*)::\s*(model|effort|project|lane|pr)\s*=\s*([^:\s]*)\s*$").unwrap());
+static PLANNED_PART: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)^(.*)::\s*(model|effort|project|lane|pr|est)\s*=\s*([^:\s]*)\s*$").unwrap());
 
 /// The project a planned task goes in: the one it names, in the board's spelling, or its goal's.
 fn planned_in(r: &Report, g: &Row, named: &Value) -> Result<Value> {
@@ -2991,17 +3164,17 @@ fn planned_in(r: &Report, g: &Row, named: &Value) -> Result<Value> {
 
 /// A `--task` item's named parts at the very end ("::model=small", "::effort=high", "::project=api",
 /// "::lane=slot", "::pr=no", in any order), taken off before the rest is read: the rest, then the model, effort, project and lane.
-fn planned_parts(item: &str) -> (String, Value, Value, Value, Value, Value) {
-    let (mut rest, mut parts) = (item.to_string(), [Value::Null, Value::Null, Value::Null, Value::Null, Value::Null]);
+fn planned_parts(item: &str) -> (String, Value, Value, Value, Value, Value, Value) {
+    let (mut rest, mut parts) = (item.to_string(), [Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null]);
     while let Some(c) = PLANNED_PART.captures(&rest).filter(|c| !c[1].trim().is_empty()) {
-        let k = ["model", "effort", "project", "lane", "pr"].iter().position(|k| *k == &c[2]).unwrap_or(0);
+        let k = ["model", "effort", "project", "lane", "pr", "est"].iter().position(|k| *k == &c[2]).unwrap_or(0);
         if parts[k].is_null() {
             parts[k] = json!(&c[3]);
         }
         rest = c[1].to_string();
     }
-    let [model, effort, project, lane, pr] = parts;
-    (rest, model, effort, project, lane, pr)
+    let [model, effort, project, lane, pr, est] = parts;
+    (rest, model, effort, project, lane, pr, est)
 }
 
 /// "title::detail", "title::detail::2" (its wave) or "title::detail::<wave or nothing>::T14 #1" (what it
@@ -3078,16 +3251,20 @@ fn planned(r: &Report, g: &Row, items: &Value, status: &str, warnings: &mut Vec<
     let log = if status == "planned" { format!("Planned by {}", r.name()) } else { format!("Added by {} and queued: {} is running", r.name(), rf("goal", g.id())) };
     let mut created: Vec<String> = vec![];
     let waves_before = crate::pace::waves_left(r.app, g)?;
-    for item in items.as_array().cloned().unwrap_or_default() {
-        let (item, files, model, effort, project, lane, pr) = match &item {
+    let items = items.as_array().cloned().unwrap_or_default();
+    estimate::need_items(r.app, &unestimated(&items)?)?;
+    crate::trials::refuse_plan(r.app, &trial_items(&items)?)?;
+    for item in items {
+        let (item, files, model, effort, project, lane, pr, est) = match &item {
             Value::String(s) => {
-                let (s, model, effort, project, lane, pr) = planned_parts(s);
+                let (s, model, effort, project, lane, pr, est) = planned_parts(s);
                 let (rest, files) = planned_files(&s);
-                (Value::String(rest), files, model, effort, project, lane, pr)
+                (Value::String(rest), files, model, effort, project, lane, pr, est)
             }
             v => (v.clone(), v.get("files").cloned().unwrap_or(Value::Null), v.get("model").cloned().unwrap_or(Value::Null),
                   v.get("effort").cloned().unwrap_or(Value::Null), v.get("project").cloned().unwrap_or(Value::Null),
-                  v.get("lane").cloned().unwrap_or(Value::Null), v.get("ships_pr").cloned().unwrap_or(Value::Null)),
+                  v.get("lane").cloned().unwrap_or(Value::Null), v.get("ships_pr").cloned().unwrap_or(Value::Null),
+                  v.get("est").cloned().unwrap_or(Value::Null)),
         };
         let project = planned_in(r, g, &project)?;
         let (title, detail, wave, waits) = match &item {
@@ -3112,7 +3289,7 @@ fn planned(r: &Report, g: &Row, items: &Value, status: &str, warnings: &mut Vec<
                     "jira": item.get("jira"), "ticket_summary": item.get("ticket_summary"), "ticket_text": item.get("ticket_text"),
                     "stack_on": item.get("stack_on"), "same_pr": item.get("same_pr"), "stack_merge": item.get("stack_merge"), "ships_pr": if pr.is_null() { item.get("ships_pr").cloned().unwrap_or(Value::Null) } else { pr },
                     "devices": item.get("devices"), "bits": item.get("bits"), "area": item.get("area"), "model": model, "effort": effort,
-                    "from_issue_id": item.get("from_issue_id"), "latest": item.get("latest"), "kind": item.get("kind"),
+                    "from_issue_id": item.get("from_issue_id"), "latest": item.get("latest"), "kind": item.get("kind"), "est": est,
                     "not_backlog": item.get("not_backlog").filter(|v| !v.is_null()).or(r.body.get("not_backlog")),
                     "origin": item.get("origin").filter(|o| !o.is_null()).cloned()
                         .unwrap_or_else(|| json!({"from": format!("Planned in {}", rf("goal", g.id())), "by": r.name()}))}),
@@ -3147,6 +3324,50 @@ fn planned(r: &Report, g: &Row, items: &Value, status: &str, warnings: &mut Vec<
     Ok(created)
 }
 
+/// Each `--task` item's title, detail and whether it's a human task, for the plan check's trial-run refusal.
+fn trial_items(items: &[Value]) -> Result<Vec<(String, String, bool)>> {
+    let mut out = vec![];
+    for item in items {
+        let (title, detail, kind) = match item {
+            Value::String(s) => {
+                let (rest, ..) = planned_parts(s);
+                let (title, detail, ..) = split_planned(&planned_files(&rest).0);
+                (title, detail, Value::Null)
+            }
+            Value::Object(o) => (o.s("title").unwrap_or("").to_string(), o.s("detail").unwrap_or("").to_string(), item.get("kind").cloned().unwrap_or(Value::Null)),
+            _ => continue,
+        };
+        let title = one_line(&title, 300);
+        if !title.is_empty() {
+            out.push((title, detail, crate::design::clean_kind(Some(&kind))? == Some(crate::human::KIND)));
+        }
+    }
+    Ok(out)
+}
+
+/// The titles of `--task` items for agent work that give no estimate, or one that isn't a length.
+fn unestimated(items: &[Value]) -> Result<Vec<String>> {
+    let mut out = vec![];
+    for item in items {
+        let (title, est, kind) = match item {
+            Value::String(s) => {
+                let (rest, _, _, _, _, _, est) = planned_parts(s);
+                (split_planned(&rest).0, est, Value::Null)
+            }
+            Value::Object(o) => (o.s("title").unwrap_or("").to_string(), item.get("est").cloned().unwrap_or(Value::Null), item.get("kind").cloned().unwrap_or(Value::Null)),
+            _ => continue,
+        };
+        let title = one_line(&title, 300);
+        if title.is_empty() || crate::design::clean_kind(Some(&kind))? == Some(crate::human::KIND) {
+            continue;
+        }
+        if estimate::parse(Some(&est))?.is_none() {
+            out.push(title);
+        }
+    }
+    Ok(out)
+}
+
 fn on_propose(r: &mut Report) -> Result<Value> {
     r.touch_session(true)?;
     let g = board::get_goal(r.app, need_ref(&r.body["goal"], "goal")?)?;
@@ -3162,16 +3383,17 @@ fn on_propose(r: &mut Report) -> Result<Value> {
     if !board::goal_running(r.app, g.id())? {
         crate::plan_review::queue(r.app, g.id(), "the plan changed", &r.name());
     }
-    Ok(with(ok(None, None), json!({"created": created, "goal": rf("goal", g.id()), "status": status, "why": why, "warnings": warnings})))
+    Ok(with(ok(None, None), json!({"created": created, "goal": rf("goal", g.id()), "project": g.v("project"), "status": status, "why": why, "warnings": warnings})))
 }
 
 fn on_goal(r: &mut Report) -> Result<Value> {
     r.touch_session(true)?;
     let project = project_for(r, &r.b("project"))?;
+    let est = estimate::need_goal(r.app, &r.body)?;
     let g = ops::new_goal(
         r.app,
         &json!({"name": r.body.get("name"), "outcome": r.b("outcome"), "tldr": r.b("tldr"), "project": project, "product": r.body.get("product"),
-                "after": r.body.get("after"), "area": r.body.get("area"), "pr_base": r.body.get("pr_base")}),
+                "after": r.body.get("after"), "area": r.body.get("area"), "pr_base": r.body.get("pr_base"), "est": est}),
     )?;
     let gid = g["id"].as_i64().unwrap_or(0);
     let tasks = r.body.get("tasks").cloned().unwrap_or(json!([]));
@@ -3203,6 +3425,10 @@ fn on_new_task(r: &mut Report) -> Result<Value> {
     if let Some(why) = r.screened.as_ref().and_then(|s| screen::human_refusal(r.app, s)) {
         return err(409, why);
     }
+    if crate::design::clean_kind(r.body.get("kind"))? != Some(crate::human::KIND) {
+        estimate::need_task(r.app, &r.body)?;
+        crate::trials::refuse(r.app, false, &title, &r.b("detail"))?;
+    }
     if as_bool(r.body.get("here"), false) {
         if crate::design::clean_kind(r.body.get("kind"))? == Some(crate::human::KIND) {
             return err(400, "A human task isn't done in a terminal; leave out --here.");
@@ -3222,7 +3448,7 @@ fn on_new_task(r: &mut Report) -> Result<Value> {
                            "ticket_summary": r.body.get("ticket_summary"), "ticket_text": r.body.get("ticket_text"),
                            "stack_on": r.body.get("stack_on"), "same_pr": r.body.get("same_pr"), "stack_merge": r.body.get("stack_merge"), "ships_pr": r.body.get("ships_pr"),
                            "devices": r.body.get("devices"), "bits": r.body.get("bits"), "area": r.body.get("area"),
-                           "not_backlog": r.body.get("not_backlog"), "kind": r.body.get("kind")}]);
+                           "not_backlog": r.body.get("not_backlog"), "kind": r.body.get("kind"), "est": r.body.get("est")}]);
         if let Some(b) = &issue {
             item[0] = with_issue(r, b, item[0].take());
         }
@@ -3236,7 +3462,7 @@ fn on_new_task(r: &mut Report) -> Result<Value> {
         }
         note_made(r, &created)?;
         let wait_line = made_wait_line(r, &created)?;
-        return Ok(with(ok(None, None), json!({"created": created, "title": title, "goal": rf("goal", g.id()), "status": status, "why": why, "warnings": warnings,
+        return Ok(with(ok(None, None), json!({"created": created, "title": title, "goal": rf("goal", g.id()), "project": in_project, "status": status, "why": why, "warnings": warnings,
                                               "wait_line": wait_line})));
     }
     if r.body.get("also").map(|a| !a.is_null() && a != &json!([])).unwrap_or(false) {
@@ -3252,7 +3478,7 @@ fn on_new_task(r: &mut Report) -> Result<Value> {
                 "waits_for": r.body.get("waits_for"), "locks": r.body.get("locks"), "alone": r.body.get("alone"), "lane": r.body.get("lane"), "pr_base": r.body.get("pr_base"),
                 "jira": r.body.get("jira"), "ticket_summary": r.body.get("ticket_summary"), "ticket_text": r.body.get("ticket_text"),
                 "stack_on": r.body.get("stack_on"), "same_pr": r.body.get("same_pr"), "stack_merge": r.body.get("stack_merge"), "ships_pr": r.body.get("ships_pr"),
-                "devices": r.body.get("devices"), "bits": r.body.get("bits"), "area": r.body.get("area"),
+                "devices": r.body.get("devices"), "bits": r.body.get("bits"), "area": r.body.get("area"), "est": r.body.get("est"),
                 "not_backlog": r.body.get("not_backlog"), "origin": {"from": "Added by an agent", "by": r.name()}});
     if let Some(b) = &issue {
         fields = with_issue(r, b, fields);
@@ -3372,7 +3598,7 @@ fn new_task_here(r: &mut Report, title: &str, issue: Option<&Row>, more: &[i64])
             409,
             format!(
                 "This terminal works in {h}, so --here can't take {p}'s work: the task would be tracked here while its work \
-                 happens in another repository. Make it a task in {p} instead: tb task new \"{title}\" --project {p} (without --here)."
+                 happens in another repository. Make it a task in {p} instead: tb task new \"{title}\" --est <len> --project {p} (without --here)."
             ),
         );
     }
@@ -3380,7 +3606,7 @@ fn new_task_here(r: &mut Report, title: &str, issue: Option<&Row>, more: &[i64])
             "jira": r.body.get("jira"), "ticket_summary": r.body.get("ticket_summary"), "ticket_text": r.body.get("ticket_text"),
             "stack_on": r.body.get("stack_on"), "same_pr": r.body.get("same_pr"), "stack_merge": r.body.get("stack_merge"), "ships_pr": r.body.get("ships_pr"),
             "area": r.body.get("area"), "not_backlog": r.body.get("not_backlog"), "goal_id": goal.as_ref().map(|g| g.id()),
-            "kind": r.body.get("kind"), "waits_for": "none",
+            "kind": r.body.get("kind"), "waits_for": "none", "est": r.body.get("est"),
             "origin": {"from": format!("Code changed in {name} while {owner} worked there"), "by": board::OWNER}});
     let how = match issue {
         Some(b) => {
@@ -3620,7 +3846,10 @@ fn session_history(r: &Report, out: &Value) -> Option<(&'static str, String)> {
         }
         "tb.step" => out["step"].as_str().map(|s| ("step", format!("Did the step {s}"))),
         "tb.step_ask" => out["step"].as_str().map(|s| ("ask", format!("Asked you to do the step {s}"))),
-        "tb.step_fail" => out["step"].as_str().map(|s| ("ask", format!("The step {s} can't pass: {}", r.b("why")))),
+        "tb.step_fail" => out["step"].as_str().map(|s| match out.get("source").and_then(|a| a.as_str()) {
+            Some(a) => ("ask", format!("The step {s} can't pass, and the board answered it from {a}: {}", r.b("why"))),
+            None => ("ask", format!("The step {s} can't pass: {}", r.b("why"))),
+        }),
         "tb.fail" => Some(("fail", format!("Gave up on {}: {}", out["task"].as_str().unwrap_or("its task"), r.b("reason")))),
         "tb.take" => out["task"].as_str().map(|t| ("take", format!("Picked up {t}"))),
         "tb.switch" => out["task"].as_str().map(|t| ("take", format!("Switched to {t}"))),
@@ -3648,10 +3877,12 @@ fn handler(event: &str) -> Option<Handler> {
         "hook.delivered" => on_delivered,
         "tb.note" => on_note,
         "tb.checkpoint" => on_checkpoint,
+        "tb.estimate" => on_estimate,
         "tb.found" => on_found,
         "tb.question" => on_question,
         "tb.withdraw" => on_withdraw,
         "tb.wait_for" => on_wait_for,
+        "tb.wait_until" => on_wait_until,
         "tb.done" => on_done,
         "tb.fail" => on_fail,
         "tb.step" => on_step,
@@ -3788,6 +4019,15 @@ pub fn handle(app: &App, body: Value, spooled: bool) -> Result<Value> {
             r.screened = screen::question(app, t.as_ref(), &asked);
         }
     }
+    if r.event == "tb.step_fail" && !spooled {
+        // Screened like a tb question: the owner's rules may already say what to do about this step (#1144).
+        let why = one_line(&r.b("why"), 2000);
+        if let (Some(t), false) = (r.task().ok().flatten(), why.is_empty()) {
+            if let Some(step) = steps::find(app, &t, &r.b("name")).ok().filter(|s| step_fail_rule(&r, &t, s).is_none()) {
+                r.screened = screen::question(app, Some(&t), &step_fail_screened(app, &step, &why));
+            }
+        }
+    }
     if r.event == "tb.new_task" && !spooled && crate::design::clean_kind(r.body.get("kind")).ok().flatten() == Some(crate::human::KIND) {
         // Most human tasks an agent files are work an agent can do: screen it before it reaches the owner.
         let t = r.task().ok().flatten();
@@ -3880,11 +4120,21 @@ pub fn handle(app: &App, body: Value, spooled: bool) -> Result<Value> {
                 out["deliver"] = h;
                 if r.event == "hook.stop" {
                     r.set_session_status("working")?;
+                    if let Some(t) = r.task()? {
+                        crate::wait_until::resume(app, &t, board::BOARD, "Back from waiting: the board sent it something")?;
+                    }
                 }
             }
         }
         Ok(out)
     })?;
+    let mut out = out;
+    if !spooled && out["created"].is_array() && matches!(r.event.as_str(), "tb.new_task" | "tb.goal" | "tb.propose")
+        && crate::design::clean_kind(r.body.get("kind")).ok().flatten() != Some(crate::human::KIND)
+    {
+        // How past estimates turned out, for the agent that just made new ones.
+        out["estimates"] = json!(crate::accuracy::summary_for(app, out["project"].as_str()));
+    }
     if let Some(t) = gives_back {
         give_back_slot(app, t.id());
     }

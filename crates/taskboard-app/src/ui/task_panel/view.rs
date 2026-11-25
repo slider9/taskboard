@@ -23,6 +23,8 @@ pub enum Tone {
     Failed,
     Planned,
     Working,
+    /// A working task parked until a set time: Working's blue, hollow.
+    Waiting,
     Blocked,
     Neutral,
     Idle,
@@ -114,6 +116,13 @@ pub struct Act {
     pub grp: String,
 }
 
+/// The controls that ask the board for a change: `task_panel::act` sends each through `run` (or a
+/// dialog that does).
+const POSTS: &[&str] = &[
+    "start", "schedule", "queue-planned", "answer", "answer-opt", "pick", "requeue", "pr-reviewed", "pr-merge-now", "detach", "close-term", "focus", "step", "did",
+    "owner-reopen", "talk", "term-focus", "resume", "write-note", "grant-confirm",
+];
+
 impl Act {
     pub fn new(act: &'static str, arg: impl Into<String>, id: impl Into<String>, grp: impl Into<String>) -> Act {
         Act { act, arg: arg.into(), id: id.into(), grp: grp.into() }
@@ -122,6 +131,12 @@ impl Act {
     /// The web's `busyKey`: act, arg and id.
     pub fn busy_key(&self) -> String {
         format!("{}:{}:{}", self.act, self.arg, self.id)
+    }
+
+    /// It asks the board for a change (or opens the dialog that does), so it waits while the
+    /// board is down.
+    pub fn posts(&self) -> bool {
+        POSTS.contains(&self.act)
     }
 }
 
@@ -166,6 +181,10 @@ pub enum St {
     TlHWarn,
     /// What the needs-you banner says (`.nb-q`): the question, or what went wrong.
     BannerText,
+    /// A box's label behind a clock, or an alert once its time went by.
+    WaitLabel { late: bool },
+    /// What a parked task does when it resumes, in bold.
+    BannerPlan,
     /// How long an ask has waited on its reviewer, in work time; orange once it's about to swap.
     Wait { late: bool },
 }
@@ -262,6 +281,8 @@ pub enum TlStep {
 pub enum TlSt {
     Done,
     Now,
+    /// Now, parked until a set time: a dashed ring.
+    Wait,
     Warn,
     Fail,
     Todo,
@@ -496,7 +517,7 @@ fn pr_of(t: &Value) -> Option<&Value> {
 
 /// `awaitingMerge`.
 fn awaiting_merge(t: &Value) -> bool {
-    s(t, "status") == "done" && !b(t, "failed") && pr_of(t).is_some_and(pr_open)
+    s(t, "status") == "done" && !b(t, "failed") && pr_of(t).is_some_and(crate::ui::goal::pr_waiting)
 }
 
 /// `prStopped`: the stage's `stopped` object.
@@ -650,11 +671,18 @@ pub fn status_pill(t: &Value) -> Node {
             let tip = if b(st, "asked") { format!("Its terminal asked you about PR #{num}") } else { format!("Its terminal stopped on PR #{num} before it was finished") };
             return Node::Pill { s: "Needs you".into(), tone: Tone::Needs, tip: Some(tip) };
         }
-        let tip = format!("The work is done; PR #{num} isn’t merged yet");
+        let tip = if crate::ui::goal::pr_landing(p) {
+            format!("PR #{num} merged; the board waits on its checks")
+        } else {
+            format!("The work is done; PR #{num} isn’t merged yet")
+        };
         if let Some(stage) = obj(p, "stage") {
             return Node::Pill { s: or_empty(&stage["label"]), tone: stage_tone(s(stage, "phase")), tip: Some(tip) };
         }
         return Node::Pill { s: "Awaiting merge".into(), tone: Tone::Working, tip: Some(tip) };
+    }
+    if let Some(at) = waiting_until(t) {
+        return Node::Pill { s: "Waiting".into(), tone: Tone::Waiting, tip: Some(format!("Resumes {}", fmt::resume_time(at))) };
     }
     let k = st_key(t);
     if k == "queued" && b(t, "starting") {
@@ -732,6 +760,13 @@ fn head_chips(c: &Ctx, t: &Value) -> Option<Node> {
         }
     }
     (!chips.is_empty()).then(|| el(K::Head, chips))
+}
+
+/// The agent's estimate against the time it has spent working: "Est 45m · Actual 1h 10m · 1.6×";
+/// nothing when the task has no estimate.
+pub fn estimate_row(t: &Value) -> Option<Node> {
+    let line = fmt::estimate_line(&t["estimate"])?;
+    Some(txt_tip(line, St::Small, "The agent’s estimate of its working time, against the time it has spent working. Time waiting on you or a review doesn’t count."))
 }
 
 /// `goalChip(t)`: "Wave 5 · 18 of 20", opening the goal at the task's wave.
@@ -887,6 +922,7 @@ pub fn panel(c: &Ctx) -> Node {
     }
     kids.push(txt(or_empty(&t["title"]), St::Title));
     kids.extend(head_chips(c, t));
+    kids.extend(estimate_row(t));
     kids.push(panel_tabs(c, t, tab));
     let body = match tab {
         "what" => vec![what_view(t)],
@@ -1597,7 +1633,18 @@ fn now_node(c: &Ctx, t: &Value) -> Node {
     out.extend(blocked_row(c, t));
     out.extend(term_actions(c, t));
     out.extend(then_line(c, t));
-    tl_node(TlSt::Now, tl_head(status_pill(t), &sub, ""), out, true)
+    let dot = if waiting_until(t).is_some() { TlSt::Wait } else { TlSt::Now };
+    tl_node(dot, tl_head(status_pill(t), &sub, ""), out, true)
+}
+
+/// When a working task parked itself to resume (`waiting_until`), while it waits.
+fn waiting_until(t: &Value) -> Option<&str> {
+    opt_s(t, "waiting_until").filter(|_| s(t, "status") == "working" && !b(t, "lost"))
+}
+
+/// The resume time a parked task missed and its plan, while that's why it needs you.
+fn wait_missed(t: &Value) -> Option<&Value> {
+    obj(t, "wait_missed").filter(|_| s(t, "status") == "needs" && !b(t, "lost"))
 }
 
 /// "Terminal lost · 9:02 AM": what happened, then when (12-hour, with the day once it isn't today).
@@ -1710,6 +1757,22 @@ fn banner(c: &Ctx, t: &Value, alert: Option<&Value>) -> Option<Node> {
             el(K::Row, row),
         ];
         (BoxTone::Lost, bx)
+    } else if let Some(missed) = wait_missed(t) {
+        // It parked itself and didn't come back: its terminal is where to look.
+        let grp = format!("ask:{r}");
+        let mut bx = vec![txt(format!("Didn’t resume at {}", fmt::resume_time(s(missed, "at"))), St::WaitLabel { late: true })];
+        bx.extend(opt_s(missed, "plan").filter(|p| !p.is_empty()).map(|p| txt(p, St::BannerPlan)));
+        if session_live(t) {
+            let mut row = vec![c.btn("Focus in Midna", Act::new("focus", "", &r, &grp), Look::Primary, false, None)];
+            row.extend(c.note(&grp));
+            bx.push(el(K::Row, row));
+        }
+        (BoxTone::Ask, bx)
+    } else if let Some(at) = waiting_until(t) {
+        // Parked until a set time: nothing for the owner to do.
+        let mut bx = vec![txt(format!("Waiting · resumes {}", fmt::resume_time(at)), St::WaitLabel { late: false })];
+        bx.extend(opt_s(t, "resume_plan").filter(|p| !p.is_empty()).map(|p| txt(p, St::BannerPlan)));
+        (BoxTone::Quiet, bx)
     } else if status == "needs" {
         let grp = format!("ask:{r}");
         let question = opt_s(t, "question").filter(|q| !q.is_empty());
@@ -1813,8 +1876,8 @@ fn term_actions(c: &Ctx, t: &Value) -> Vec<Node> {
     let grp = format!("manage:{r}");
     let live = session_live(t);
     let mut row = Vec::new();
-    // A stuck-looking one has Focus in Midna in its box up top.
-    if live && s(t, "status") == "working" && obj(t, "stuck").is_none() {
+    // A stuck-looking one has Focus in Midna in its box up top; a parked one needs nothing.
+    if live && s(t, "status") == "working" && obj(t, "stuck").is_none() && waiting_until(t).is_none() {
         row.push(c.btn("Focus in Midna", Act::new("focus", "", &r, &grp), Look::SoftSmall, false, None));
     }
     if opt_s(t, "session_id").is_some() || live {
@@ -2632,8 +2695,15 @@ fn pr_nodes(c: &Ctx, t: &Value) -> Vec<Node> {
     vec![
         tl_node(TlSt::Done, tl_head(tl_name("Pull request"), "", ""), [el(K::PrHead, vec![head, txt(repo, St::Small)])].into_iter().chain(group_line(c, t)).collect(), false),
         tl_node(st, tl_head(tl_name("Checks and review"), "", &updated), body, false),
-        tl_node(merge_st, tl_head(tl_name(merge_name), &merge_sub, ""), merged_note_row(c, t).into_iter().collect(), false),
+        tl_node(merge_st, tl_head(tl_name(merge_name), &merge_sub, ""), merged_note_row(c, t).into_iter().chain(closed_line(p)).collect(), false),
     ]
+}
+
+/// Under "Closed without merging": where its work went ("Superseded by #12", "Its work is on main in
+/// abc1234"), when the board knows.
+fn closed_line(p: &Value) -> Option<Node> {
+    let line = obj(p, "closed").and_then(|x| opt_s(x, "line")).filter(|_| !pr_open(p))?;
+    Some(el(K::Line, vec![txt(line, St::Small)]))
 }
 
 /// What's left before it merges, on a task with no PR yet, as one quiet line under now: "Then: Pull
@@ -2784,6 +2854,42 @@ fn pool_rows(t: &Value) -> Vec<Node> {
     out
 }
 
+/// The task's Midna permission grants: kind and pattern, then a pending one's Confirm (the owner's
+/// one-click OK) or how often a confirmed one's rule let an action through. None when it has none.
+fn grants_section(c: &Ctx, t: &Value) -> Option<Node> {
+    let grants = arr(t, "grants");
+    if grants.is_empty() {
+        return None;
+    }
+    let r = rf(t, "T");
+    let rows = grants
+        .iter()
+        .map(|g| {
+            let gr = s(g, "ref");
+            let mut kids = vec![txt(s(g, "kind"), St::Kind), txt(s(g, "pattern"), St::Mono)];
+            let mut tip = opt_s(g, "asked_by").map(|w| format!("Asked in {w}")).unwrap_or_default();
+            if s(g, "state") == "granted" {
+                let n = g["fired"].as_i64().unwrap_or(0);
+                let fired = match n {
+                    0 => "Not fired yet".to_string(),
+                    1 => "Fired once".to_string(),
+                    n => format!("Fired {n} times"),
+                };
+                kids.push(txt(stamp(&fired, opt_s(g, "last_fired_at")), St::Muted));
+                if let Some(by) = opt_s(g, "granted_by") {
+                    tip = if tip.is_empty() { format!("Granted by {by}") } else { format!("{tip} · granted by {by}") };
+                }
+            } else {
+                let grp = format!("grant:{gr}");
+                kids.push(c.btn("Confirm", Act::new("grant-confirm", gr, &r, &grp), Look::SoftSmall, false, Some("Its terminals run this without a Midna prompt")));
+                kids.extend(c.note(&grp));
+            }
+            Node::El { k: K::Row, tip: Some(tip).filter(|x| !x.is_empty()), kids }
+        })
+        .collect();
+    Some(el(K::Stack, vec![txt("Grants", St::H3), el(K::Stack, rows)]))
+}
+
 /// `contextTab(t)`.
 fn context_tab(c: &Ctx, t: &Value) -> Vec<Node> {
     let r = rf(t, "T");
@@ -2815,6 +2921,7 @@ fn context_tab(c: &Ctx, t: &Value) -> Vec<Node> {
     kv.extend(origin_row(t));
     kv.extend(pool_rows(t));
     out.push(el(K::Kv, kv));
+    out.extend(grants_section(c, t));
     for (title, key, glyph, dot) in [("Done so far", "done", "✓", Dot::Up), ("Next", "next", "→", Dot::Accent), ("Decisions", "decisions", "•", Dot::Faint), ("Your answers", "answers", "•", Dot::Warn)] {
         let items = arr(cx, key);
         if items.is_empty() {

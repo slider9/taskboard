@@ -1404,8 +1404,12 @@ fn deny(reason: &str) {
 /// Not in auto mode either. There Claude Code gives no verdict on a call a hook changed, so Claude
 /// has to send the changed command again, every time, and a worktree session's guard then turns the
 /// group down as too complex to check. A stray read there waits for the Bash tool's time limit.
-fn close_stdin(payload: &Value) {
-    let Some(input) = stdin_closed_input(payload) else { return };
+///
+/// In a board terminal (`session`), a command that builds in a pool slot also builds into the slot's
+/// own `target/` (`builds::slot_target`), whatever folder the terminal opened in: a task that claimed
+/// its slot after it started would otherwise build into the shared checkout's.
+fn close_stdin(payload: &Value, session: &str) {
+    let Some(input) = stdin_closed_input(payload, session) else { return };
     let o = json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": input}});
     let mut so = std::io::stdout();
     let _ = so.write_all(o.to_string().as_bytes());
@@ -1414,11 +1418,14 @@ fn close_stdin(payload: &Value) {
 
 /// A Bash call's input with its command reading from /dev/null, or None to leave the call as it is
 /// (see [`close_stdin`]).
-fn stdin_closed_input(payload: &Value) -> Option<Value> {
+fn stdin_closed_input(payload: &Value, session: &str) -> Option<Value> {
     if payload["tool_name"] != "Bash" || payload["permission_mode"] == "auto" {
         return None;
     }
-    let command = payload["tool_input"]["command"].as_str().and_then(stdin_closed)?;
+    let command = payload["tool_input"]["command"].as_str()?;
+    let cwd = payload["cwd"].as_str().unwrap_or("");
+    let target = if session.is_empty() { None } else { taskboardd::builds::slot_target(&client::config().builds, command, cwd) };
+    let command = stdin_closed(command, target.as_deref())?;
     let mut input = payload["tool_input"].clone();
     input["command"] = json!(command);
     Some(input)
@@ -1427,13 +1434,20 @@ fn stdin_closed_input(payload: &Value) -> Option<Value> {
 const STDIN_CLOSED_END: &str = "\n} < /dev/null";
 
 /// `command` in a group reading from /dev/null, or None when it's empty or grouped already. The
-/// closing brace goes on its own line, after a heredoc's end word or a trailing comment.
-fn stdin_closed(command: &str) -> Option<String> {
+/// closing brace goes on its own line, after a heredoc's end word or a trailing comment. With a
+/// `target`, the group builds there: an export of its own, so the command's own setting still wins.
+fn stdin_closed(command: &str, target: Option<&str>) -> Option<String> {
     let command = command.trim_end();
     if command.trim().is_empty() || (command.starts_with("{ ") && command.ends_with(STDIN_CLOSED_END)) {
         return None;
     }
-    Some(format!("{{ {command}{STDIN_CLOSED_END}"))
+    let export = target.map(|t| format!("export CARGO_TARGET_DIR={}; ", shell_quoted(t))).unwrap_or_default();
+    Some(format!("{{ {export}{command}{STDIN_CLOSED_END}"))
+}
+
+/// `s` as one single-quoted shell word.
+fn shell_quoted(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 static GIT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\bgit\b(?:\s+(?:-[Cc]\s+\S+|--?[\w-]+(?:=\S+)?))*\s+(commit|push)\b").unwrap());
@@ -1634,11 +1648,11 @@ pub fn run(event_arg: Option<&str>) -> i32 {
             return 0;
         }
         if session.is_empty() {
-            close_stdin(&payload);
+            close_stdin(&payload, &session);
             return 0;
         }
         if !pre_tool_use(&payload, &session) {
-            close_stdin(&payload);
+            close_stdin(&payload, &session);
             tool_window(&payload, &session, "hook.tool_start");
         }
         return 0;
@@ -2081,7 +2095,7 @@ mod tests {
         // stdin is a pipe held open, as Claude Code's is: without the group, the bare `cat` would wait on it forever.
         let sh = |c: &str| {
             use std::process::{Command, Stdio};
-            let mut child = Command::new("sh").arg("-c").arg(stdin_closed(c).unwrap()).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            let mut child = Command::new("sh").arg("-c").arg(stdin_closed(c, None).unwrap()).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
             let _held = child.stdin.take();
             let mut out = String::new();
             child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
@@ -2091,20 +2105,33 @@ mod tests {
         assert_eq!(sh("cat > /dev/null; echo after # a comment"), "after\n");
         assert_eq!(sh("cat <<'EOF'\nheredoc\nEOF"), "heredoc\n");
         assert_eq!(sh("printf 'piped' | cat"), "piped");
-        let once = stdin_closed("echo hi\n").unwrap();
+        let once = stdin_closed("echo hi\n", None).unwrap();
         assert_eq!(once, "{ echo hi\n} < /dev/null");
-        assert_eq!(stdin_closed(&once), None, "grouped already");
-        assert_eq!(stdin_closed("  "), None);
+        assert_eq!(stdin_closed(&once, None), None, "grouped already");
+        assert_eq!(stdin_closed("  ", None), None);
+    }
+
+    #[test]
+    fn a_command_building_in_a_slot_exports_the_slot_s_target_first() {
+        let grouped = stdin_closed("cargo test -p app", Some("/r/.claude/worktrees/slot-2/target")).unwrap();
+        assert_eq!(grouped, "{ export CARGO_TARGET_DIR='/r/.claude/worktrees/slot-2/target'; cargo test -p app\n} < /dev/null");
+        // The command's own setting comes after, so it wins; a quote in the path stays one word.
+        let sh = |c: &str| {
+            let out = std::process::Command::new("sh").arg("-c").arg(c).env("CARGO_TARGET_DIR", "/r/target").output().unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(sh(&stdin_closed("echo \"$CARGO_TARGET_DIR\"", Some("/r/it's/target")).unwrap()), "/r/it's/target\n");
+        assert_eq!(sh(&stdin_closed("export CARGO_TARGET_DIR=/own; echo $CARGO_TARGET_DIR", Some("/r/s/target")).unwrap()), "/own\n");
     }
 
     #[test]
     fn auto_mode_leaves_a_bash_command_as_it_is() {
         let call = |mode: &str, tool: &str| json!({"tool_name": tool, "permission_mode": mode, "tool_input": {"command": "echo hi", "description": "d"}});
-        assert_eq!(stdin_closed_input(&call("default", "Bash")), Some(json!({"command": "{ echo hi\n} < /dev/null", "description": "d"})), "the rest of the input as it was");
-        assert!(stdin_closed_input(&call("acceptEdits", "Bash")).is_some());
-        assert_eq!(stdin_closed_input(&call("auto", "Bash")), None, "auto mode gives no verdict on a changed call");
-        assert_eq!(stdin_closed_input(&call("default", "PowerShell")), None);
-        assert!(stdin_closed_input(&json!({"tool_name": "Bash", "tool_input": {"command": "echo hi"}})).is_some(), "a hook input without a mode, as before");
+        assert_eq!(stdin_closed_input(&call("default", "Bash"), ""), Some(json!({"command": "{ echo hi\n} < /dev/null", "description": "d"})), "the rest of the input as it was");
+        assert!(stdin_closed_input(&call("acceptEdits", "Bash"), "").is_some());
+        assert_eq!(stdin_closed_input(&call("auto", "Bash"), ""), None, "auto mode gives no verdict on a changed call");
+        assert_eq!(stdin_closed_input(&call("default", "PowerShell"), ""), None);
+        assert!(stdin_closed_input(&json!({"tool_name": "Bash", "tool_input": {"command": "echo hi"}}), "").is_some(), "a hook input without a mode, as before");
     }
 
     #[test]

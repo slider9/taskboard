@@ -281,6 +281,40 @@ fn a_question_shows_once_in_the_banner() {
     assert!(text.contains("Waiting on you") && !text.contains("Asked"), "{text}");
 }
 
+#[::core::prelude::v1::test]
+fn a_parked_task_says_when_it_resumes_and_asks_nothing() {
+    parity::freeze("2026-11-23T15:00:00Z");
+    let plan = "Read the 5:00 PM benchmark run, then compare it";
+    let task = json!({"ref": "T10", "id": 10, "status": "working", "waiting_until": "2026-11-23T18:30:00Z", "resume_plan": plan,
+                      "started_at": "2026-11-23T13:00:00Z", "updated_at": "2026-11-23T14:00:00Z", "session": {"id": "s1", "status": "idle"}});
+    let panel = tree(&json!({"state": {}, "task": task, "tab": "overview"}));
+    let text = json!(view::text(&panel)).to_string();
+    assert!(text.contains(&format!("Waiting · resumes 6:30 PM {plan}")), "the quiet box: {text}");
+    assert!(text.contains("Waiting") && !text.contains("Asks you") && !text.contains("Needs you"), "{text}");
+    let a = json!(view::acts(&panel)).to_string();
+    assert!(!a.contains("\"focus\"") && !a.contains("answer"), "no Focus or answer while it waits: {a}");
+    // Tomorrow's time says so.
+    let task = json!({"ref": "T10", "id": 10, "status": "working", "waiting_until": "2026-11-24T06:30:00Z", "resume_plan": plan});
+    let text = json!(view::text(&tree(&json!({"state": {}, "task": task, "tab": "overview"})))).to_string();
+    assert!(text.contains("Waiting · resumes tomorrow 6:30 AM"), "{text}");
+}
+
+#[::core::prelude::v1::test]
+fn a_parked_task_that_missed_its_time_offers_only_its_terminal() {
+    parity::freeze("2026-11-23T19:00:00Z");
+    let plan = "Read the 5:00 PM benchmark run, then compare it";
+    let task = json!({"ref": "T10", "id": 10, "status": "needs", "needs_reason": "wait_overdue",
+                      "question": format!("T10 was due back at 6:30 PM and hasn't resumed (it was going to: {plan})"),
+                      "wait_missed": {"at": "2026-11-23T18:30:00Z", "plan": plan},
+                      "started_at": "2026-11-23T13:00:00Z", "updated_at": "2026-11-23T18:45:00Z", "session": {"id": "s1", "status": "idle"}});
+    let panel = tree(&json!({"state": {}, "task": task, "tab": "overview"}));
+    let text = json!(view::text(&panel)).to_string();
+    assert!(text.contains(&format!("Didn’t resume at 6:30 PM {plan} Focus in Midna")), "{text}");
+    assert!(!text.contains("Asks you") && !text.contains("hasn't resumed"), "its own box, not the question's: {text}");
+    let a = json!(view::acts(&panel)).to_string();
+    assert!(a.contains("\"focus\"") && !a.contains("answer") && !a.contains("\"resume"), "only Focus in Midna: {a}");
+}
+
 // ------------------------------------------------------------------ actions
 
 /// Open task `r` in the panel and let its detail load.
@@ -469,6 +503,32 @@ fn start_buttons(cx: &mut gpui_kit::TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn with_the_board_down_its_controls_wait(cx: &mut gpui_kit::TestAppContext) {
+    let (w, rec) = parity::window(cx);
+    open(cx, &w, "T5");
+    let start = control(cx, &w, "start", Some("queue"));
+    rec.clear();
+    w.update(cx, |m, _, cx| {
+        m.down = Some("The board isn't answering.".into());
+        act(m, &start, cx);
+        act(m, &Act::new("answer-opt", "Yes", "T5", ""), cx);
+    })
+    .unwrap();
+    settle(cx);
+    assert_eq!(rec.posts(), vec![], "nothing is sent while the board is down");
+    assert!(ui(|u| u.busy.is_empty()), "nothing reads Sending…");
+    // What only changes the panel still works.
+    press(cx, &w, "tab", Some("log"));
+    assert!(matches!(w.update(cx, |m, _, _| m.panel.clone()).unwrap(), Some(Panel::Task { tab: TaskTab::Log, .. })));
+}
+
+#[test]
+fn only_controls_that_change_the_board_wait_for_it() {
+    assert!(Act::new("start", "new", "T1", "").posts() && Act::new("did", "", "T1", "").posts() && Act::new("pr-merge-now", "", "T1", "").posts());
+    assert!(!Act::new("tab", "log", "T1", "").posts() && !Act::new("open-task", "", "T2", "").posts() && !Act::new("term-menu", "", "T1", "").posts());
+}
+
+#[gpui_kit::test]
 fn planned_task_queues(cx: &mut gpui_kit::TestAppContext) {
     let (w, rec) = parity::window(cx);
     open(cx, &w, "T4");
@@ -544,6 +604,44 @@ fn details_and_bits_are_shown_only() {
     let acts = json!(view::acts(&n)).to_string();
     assert!(!acts.contains("meta-del") && !acts.contains("bit-made"), "{acts}");
     assert!(!json!(view::values(&n)).to_string().contains("meta:"));
+}
+
+/// Context lists the task's grants: a confirmed one with how often it fired, a pending one with Confirm.
+#[::core::prelude::v1::test]
+fn grants_show_in_context_with_confirm_on_pending() {
+    let bare = json!({"ref": "T7", "id": 7, "title": "T", "status": "working"});
+    let text = view::text(&tree(&json!({"state": {}, "task": bare, "tab": "context"})));
+    assert!(!text.contains("Grants"), "no grants, no section: {text}");
+    let task = json!({"ref": "T7", "id": 7, "title": "T", "status": "working", "grants": [
+        {"id": 1, "ref": "A1", "kind": "tool", "pattern": "mcp__slack__chat_post*", "state": "granted", "fired": 3, "granted_by": "Alex in the app"},
+        {"id": 2, "ref": "A2", "kind": "command", "pattern": "git push origin *", "state": "pending", "fired": 0, "asked_by": "T7 Ship it"},
+        {"id": 3, "ref": "A3", "kind": "path", "pattern": "/tmp/*", "state": "granted", "fired": 0},
+    ]});
+    let n = tree(&json!({"state": {}, "task": task, "tab": "context"}));
+    let text = view::text(&n);
+    assert!(text.contains("Grants tool mcp__slack__chat_post* Fired 3 times command git push origin * Confirm path /tmp/* Not fired yet"), "{text}");
+    let acts = view::acts(&n);
+    assert_eq!(acts.iter().filter(|a| a.starts_with("grant-confirm")).count(), 1, "{acts:?}");
+    assert!(view::find_act(&n, "grant-confirm", Some("A2")).is_some_and(|a| a.posts()), "{acts:?}");
+}
+
+/// Confirm posts the owner's OK for that grant, and the row turns to its fired count.
+#[gpui_kit::test]
+fn confirming_a_grant_posts_it(cx: &mut gpui_kit::TestAppContext) {
+    let (w, rec) = parity::window(cx);
+    let added = taskboardd::task_grants::add(rec.board().app(), 5, &["tool:mcp__slack__chat_post*".into()], false, "").unwrap();
+    let g = added["asked"][0].as_str().expect("a pending grant").to_string();
+    open(cx, &w, "T5");
+    press(cx, &w, "tab", Some("context"));
+    let _ = cx.update_window(w.into(), |_, window, cx| window.draw(cx).clear(cx));
+    press(cx, &w, "grant-confirm", Some(&g));
+    assert_eq!(rec.posts().iter().filter(|(p, _)| *p == format!("grants/{g}/confirm")).count(), 1, "{:?}", rec.posts());
+    w.update(cx, |m, _, _| {
+        let tree = build(m).unwrap();
+        assert!(view::find_act(&tree, "grant-confirm", None).is_none(), "{:?}", view::acts(&tree));
+        assert!(view::text(&tree).contains("mcp__slack__chat_post* Not fired yet"), "{}", view::text(&tree));
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
@@ -1137,6 +1235,8 @@ fn a_closed_pr_ends_closed_without_merging() {
         let text = view::text(&tree);
         assert!(!text.contains("Declined") && !text.contains("Merged") && !text.contains("Pending merge"), "named for what happened, nothing under it: {text}");
         assert!(!view::acts(&tree).iter().any(|a| a == "pr-menu"), "nothing left to merge");
+        task["pr"]["closed"] = json!({"line": "Superseded by #12", "superseded_by": "#12"});
+        assert!(panel_text(task, json!({})).contains("Superseded by #12"), "says where its work went");
     }
 }
 
@@ -1711,7 +1811,7 @@ impl gpui_kit::Render for NoteLines {
         use gpui_kit::{ParentElement as _, Styled as _, div, px};
         let t = cx.global::<crate::theme::Theme>().clone();
         let view::Node::El { kids, .. } = view::note_body("Start `quill touch ios` then **swipe** it.\n- Run `idb` now.") else { unreachable!() };
-        let mut d = super::Draw { t: &t, window, path: Vec::new(), within: vec![view::K::MdP] };
+        let mut d = super::Draw { t: &t, window, path: Vec::new(), within: vec![view::K::MdP], down: false };
         let mut col = div().flex().flex_col().w(px(400.));
         for (i, block) in kids.iter().enumerate() {
             d.path = vec![i];

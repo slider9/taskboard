@@ -170,7 +170,16 @@ fn with_flag(flags: Option<String>, flag: &str, value: Option<&str>) -> Option<S
     })
 }
 
-fn start_parked(app: &App, t: &Row) -> Result<()> {
+/// How a task started again in a new terminal: its conversation carried on, or it started fresh from
+/// the handoff (with why when its conversation was too big or too old to resume).
+pub(crate) enum Again {
+    Resumed,
+    Fresh(Option<String>),
+}
+
+/// Starts task `t` again in a new terminal, in its slot: its saved conversation carries on with
+/// `resume` when it's small and recent enough, else it starts fresh from `fresh` (the handoff when None).
+pub(crate) fn start_again(app: &App, t: &Row, resume: String, fresh: Option<String>) -> Result<Again> {
     let ctx = board::task_context(t);
     // A slot's root, not the subfolder it last reported from: the conversation is saved under the root.
     let wt = match worktrees::made(app, t)? {
@@ -191,15 +200,20 @@ fn start_parked(app: &App, t: &Row) -> Result<()> {
         None => None,
     };
     if let (Some(cid), None) = (cid, &too_big) {
-        start_task(app, t, "new", None, Some(waitsfor::resume_prompt(app, t)?), Some(format!("--resume {cid}")), wt)?;
-        board::log_event(app, t.id(), board::BOARD, "handoff", "What it waited for is done, so its conversation carries on in a new terminal")?;
-    } else if let Some(why) = too_big {
-        start_task(app, t, "new", None, None, None, wt)?;
-        board::log_event(app, t.id(), board::BOARD, "handoff", &format!("What it waited for is done. It starts again with the handoff: {why}"))?;
-    } else {
-        start_task(app, t, "new", None, None, None, wt)?;
-        board::log_event(app, t.id(), board::BOARD, "handoff", "What it waited for is done, so it starts again with the handoff")?;
+        start_task(app, t, "new", None, Some(resume), Some(format!("--resume {cid}")), wt)?;
+        return Ok(Again::Resumed);
     }
+    start_task(app, t, "new", None, fresh, None, wt)?;
+    Ok(Again::Fresh(too_big))
+}
+
+fn start_parked(app: &App, t: &Row) -> Result<()> {
+    let line = match start_again(app, t, waitsfor::resume_prompt(app, t)?, None)? {
+        Again::Resumed => "What it waited for is done, so its conversation carries on in a new terminal".to_string(),
+        Again::Fresh(Some(why)) => format!("What it waited for is done. It starts again with the handoff: {why}"),
+        Again::Fresh(None) => "What it waited for is done, so it starts again with the handoff".to_string(),
+    };
+    board::log_event(app, t.id(), board::BOARD, "handoff", &line)?;
     waitsfor::started(app, &board::get_task(app, t.id())?)
 }
 
@@ -400,6 +414,7 @@ fn free_waiting_slots(app: &App) -> Result<()> {
 
 pub fn start_queued(app: &App) -> Result<Vec<i64>> {
     let mut started = vec![];
+    crate::pressure::refresh(app);
     free_waiting_slots(app)?;
     let in_hours = hours::may_start(app);
     let queued = app.db.q(
@@ -527,7 +542,7 @@ fn worth_retrying(tried: &[Row]) -> bool {
         && age_secs(last.s("updated_at")).unwrap_or(0.0) >= AUTO_CLOSE_RETRY_SECS
 }
 
-fn settled(s: &Row) -> bool {
+pub(crate) fn settled(s: &Row) -> bool {
     s.s("status") == Some("idle") && !board::offline(s) && !board::waiting_on_background(s) && age_secs(s.s("status_at")).unwrap_or(0.0) >= AUTO_CLOSE_SETTLE_SECS
 }
 
@@ -559,7 +574,7 @@ pub fn auto_close_done(app: &App) -> Result<()> {
     Ok(())
 }
 
-fn task_terminals(app: &App) -> Result<Vec<(Row, Row)>> {
+pub(crate) fn task_terminals(app: &App) -> Result<Vec<(Row, Row)>> {
     let mut out = vec![];
     for s in app.db.q("SELECT * FROM sessions WHERE status IS NOT 'gone'", p![])? {
         let t = match board::task_for_session(app, s.s("id"))? {
@@ -575,7 +590,7 @@ fn task_terminals(app: &App) -> Result<Vec<(Row, Row)>> {
     Ok(out)
 }
 
-fn close_for(app: &App, s: &Row, t: &Row, purpose: &str, why: &str) -> Result<i64> {
+pub(crate) fn close_for(app: &App, s: &Row, t: &Row, purpose: &str, why: &str) -> Result<i64> {
     board::log_event(
         app,
         t.id(),
@@ -609,7 +624,7 @@ pub fn close_compacted(app: &App) -> Result<()> {
     }
     for (s, t) in task_terminals(app)? {
         let n = s.i0("compactions");
-        if n < max || t.s("status") != Some("working") || t.b("lost") || t.s("session_id") != s.s("id") {
+        if n < max || t.s("status") != Some("working") || t.b("lost") || t.s("session_id") != s.s("id") || crate::wait_until::waiting(&t) {
             continue;
         }
         if board::compacting_since(&s).is_string() || !settled(&s) || board::limited(&s) {
@@ -676,7 +691,8 @@ pub fn close_idle_after_hours(app: &App) -> Result<()> {
         if s.s("status") != Some("idle") || board::offline(&s) || board::limited(&s) || board::waiting_on_background(&s) || age_secs(s.s("status_at")).unwrap_or(0.0) < IDLE_CLOSE_SECS {
             continue;
         }
-        if hours::goal_open(app, board::find_goal(app, t.i("goal_id"))?.as_ref()) {
+        // Parked until a set time: closing its terminal would lose what wakes it.
+        if crate::wait_until::waiting(&t) || hours::goal_open(app, board::find_goal(app, t.i("goal_id"))?.as_ref()) {
             continue;
         }
         app.db.tx(|| close_for(app, &s, &t, board::HOURS_CLOSE, "It's idle after work hours"))?;
@@ -749,7 +765,10 @@ pub fn tick(app: &App) -> Result<Vec<i64>> {
     close_for_usage(app)?;
     close_idle_after_hours(app)?;
     close_compacted(app)?;
+    crate::idle_close::sweep(app)?;
     close_pr_tabs(app)?;
+    // Before queued starts: an open PR visit waiting on a slot is mid-work. Outside a transaction (git).
+    crate::slots::resume_pr_waits(app)?;
     // Outside a transaction: a restart command may take a while.
     crate::feed::check(app)?;
     crate::prhost::limit::check(app)?;
@@ -757,9 +776,15 @@ pub fn tick(app: &App) -> Result<Vec<i64>> {
     crate::prhost::limit::reader("master", || crate::breaks::tick(app))?;
     crate::relevance::tick(app)?;
     crate::tidy::tick(app)?;
+    crate::recheck::tick(app)?;
     dispatch::start_answers(app)?;
     crate::start_grants::answers(app)?;
+    crate::task_grants::answers(app)?;
+    crate::task_grants::tend(app, false)?;
     crate::scheduled::tick(app)?;
+    app.db.tx(|| crate::wait_until::sweep(app))?;
+    app.db.tx(|| crate::misses::sweep(app).map(|_| ()))?;
+    app.db.tx(|| crate::needs_retry::sweep(app))?;
     let made = start_queued(app)?;
     app.db.tx(|| {
         deliver::tick(app)?;

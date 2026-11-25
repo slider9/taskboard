@@ -45,6 +45,7 @@ pub struct FileConfig {
     pub comments: CommentsConfig,
     pub default_branch: DefaultBranchConfig,
     pub devices: crate::devices::DevicesConfig,
+    pub cleanup: crate::leftovers::CleanupConfig,
     pub app_origin: crate::apporigin::AppOriginConfig,
     pub bits: crate::bits::BitsConfig,
     pub releases: crate::releases::ReleasesConfig,
@@ -162,6 +163,22 @@ pub struct Questions {
     pub human_model: String,
     /// Screen a `tb question` from a terminal with no task too. Off: it goes straight to the owner.
     pub no_task: bool,
+    /// Re-check the questions and human tasks waiting in Needs you during work hours (`recheck.rs`):
+    /// ones raised before screening existed or before the rule files last changed.
+    pub recheck: bool,
+    /// Minutes between re-checks.
+    pub recheck_every_mins: u64,
+}
+
+impl Questions {
+    /// The model for a human task, and the second opinion on what the first model can't decide.
+    pub fn human_model(&self) -> &str {
+        if self.human_model.trim().is_empty() {
+            &self.model
+        } else {
+            &self.human_model
+        }
+    }
 }
 
 impl Default for Questions {
@@ -170,6 +187,8 @@ impl Default for Questions {
             screen: true,
             human_model: "sonnet".into(),
             no_task: true,
+            recheck: true,
+            recheck_every_mins: 45,
             model: "claude-haiku-5-5".into(),
             budget_usd: "0.30".into(),
             timeout_secs: 75,
@@ -205,6 +224,9 @@ pub struct BacklogAi {
     /// can run (the PR holds meanwhile), and rejecting one sends it back to the plain backlog. `auto`:
     /// the fix task runs at once.
     pub critical: String,
+    /// A miss on a goal's done-when that an agent can fix becomes a task in its goal and runs, instead of
+    /// waiting on the owner's Needs you list (`misses.rs`). Off: every miss goes to the owner.
+    pub misses_to_agent: bool,
 }
 
 impl BacklogAi {
@@ -216,7 +238,7 @@ impl BacklogAi {
 
 impl Default for BacklogAi {
     fn default() -> Self {
-        BacklogAi { ai: true, model: "sonnet".into(), group_model: "haiku".into(), budget_usd: "1.00".into(), timeout_secs: 240, max_terminals: 2, tidy: true, tidy_every_hours: 24.0, critical_max: 3, critical: "ask".into() }
+        BacklogAi { ai: true, model: "sonnet".into(), group_model: "haiku".into(), budget_usd: "1.00".into(), timeout_secs: 240, max_terminals: 2, tidy: true, tidy_every_hours: 24.0, critical_max: 3, critical: "ask".into(), misses_to_agent: true }
     }
 }
 
@@ -568,6 +590,9 @@ pub struct LimitsConfig {
     pub warm_idle_mins: i64,
     /// A task terminal that has compacted this many times carries on in a fresh terminal from its handoff.
     pub max_compactions: i64,
+    /// A board-opened task terminal idle this many minutes is asked for a checkpoint and closed; the task
+    /// carries on in a new terminal when the board next has something for it. 0 keeps them open.
+    pub idle_close_mins: i64,
     /// Generated-file globs marked `-diff` in every active project's `.git/info/attributes`.
     pub generated: Vec<String>,
     /// More globs for one project, by its name.
@@ -582,6 +607,7 @@ impl Default for LimitsConfig {
             warm_tokens: 60_000,
             warm_idle_mins: 60,
             max_compactions: 3,
+            idle_close_mins: 30,
             generated: vec![],
             project_generated: BTreeMap::new(),
         }
@@ -619,6 +645,15 @@ pub struct TerminalsConfig {
     /// A task opens its terminal only while fewer than this many task terminals run across every project
     /// (`tb terminals --max` changes it on the board).
     pub global_max: i64,
+    /// A task's terminal waits to open while the Mac's 1-minute load average is at or above this many
+    /// per core, even with terminals free under the caps (0: the load never holds starts).
+    pub hold_load_per_core: f64,
+    /// A task's terminal waits to open while macOS's memory pressure is at least this: `warning`,
+    /// `critical`, or `off`.
+    pub hold_memory: String,
+    /// A task's terminal waits to open while less than this much memory is free, in GB (Midna's
+    /// `memory_available_bytes`; 0: free memory never holds starts). Unknown without Midna.
+    pub hold_free_memory_gb: f64,
     /// Tools the board's terminals start without (`--disallowedTools`), so each turn carries less:
     /// `mcp__<server>` drops a server's deferred tool names, `Agent(<type>)` one subagent's listing.
     pub deny: Vec<String>,
@@ -630,6 +665,8 @@ pub const DENY: [&str; 1] = ["mcp__midna"];
 
 pub const PROJECT_MAX_TERMINALS: i64 = 5;
 pub const GLOBAL_MAX_TERMINALS: i64 = 8;
+pub const HOLD_LOAD_PER_CORE: f64 = 1.5;
+pub const HOLD_FREE_MEMORY_GB: f64 = 2.0;
 /// The most a terminal cap (board-wide or a project's) or a project's worktree slots may be set to.
 pub const MAX_PARALLEL: i64 = 100;
 /// What opens in the background unless config.toml says: the Jira desk, and the terminals that need
@@ -642,6 +679,9 @@ impl Default for TerminalsConfig {
             background: BACKGROUND.map(String::from).to_vec(),
             project_max: PROJECT_MAX_TERMINALS,
             global_max: GLOBAL_MAX_TERMINALS,
+            hold_load_per_core: HOLD_LOAD_PER_CORE,
+            hold_memory: "warning".into(),
+            hold_free_memory_gb: HOLD_FREE_MEMORY_GB,
             deny: DENY.map(String::from).to_vec(),
         }
     }
@@ -663,11 +703,16 @@ pub struct ModelsConfig {
     pub large_effort: String,
     /// The effort of tasks that name a model outright; empty passes none, Claude's own.
     pub default_effort: String,
-    /// The model of PR visits that don't change code (merging, asking for reviews): `small`, `large` or a
+    /// The model of PR visits that don't change code (merging): `small`, `large` or a
     /// model name. Empty runs them on the task's own model.
     pub pr_visit: String,
     /// Those visits start a fresh conversation with a short prompt instead of resuming the task's.
     pub fresh_pr_visits: bool,
+    /// The model of PR visits that resume the task's conversation (fixing checks, rebasing, review
+    /// comments, tester notes): `small`, `large` or a model name. Empty keeps the task's own.
+    pub pr_work: String,
+    /// The most effort those visits run at; a task or tier that runs lower keeps its own. Empty: no cap.
+    pub pr_work_effort: String,
 }
 
 impl Default for ModelsConfig {
@@ -682,6 +727,8 @@ impl Default for ModelsConfig {
             default_effort: "".into(),
             pr_visit: "sonnet".into(),
             fresh_pr_visits: true,
+            pr_work: "".into(),
+            pr_work_effort: "medium".into(),
         }
     }
 }
@@ -730,6 +777,32 @@ impl ModelsConfig {
         match self.pr_visit.trim() {
             "" => self.resolve(task),
             m => self.resolve(Some(m)),
+        }
+    }
+
+    /// The model of a PR visit that resumes the task's conversation; the task's own when `pr_work` is empty.
+    pub fn resolve_pr_work(&self, task: Option<&str>) -> Option<String> {
+        match self.pr_work.trim() {
+            "" => self.resolve(task),
+            m => self.resolve(Some(m)),
+        }
+    }
+
+    /// The effort of a PR visit that resumes the task's conversation: what it would run at, held to
+    /// `pr_work_effort`. One Claude picks itself (none passed) or names no known level takes the cap.
+    pub fn resolve_pr_work_effort(&self, model: Option<&str>, effort: Option<&str>) -> Option<String> {
+        let own = match self.pr_work.trim() {
+            "" => self.resolve_effort(model, effort),
+            m => self.resolve_effort(Some(m), None),
+        };
+        let cap = self.pr_work_effort.trim();
+        if !self.enabled || cap.is_empty() {
+            return own;
+        }
+        let rank = |e: &str| crate::runner::EFFORTS.iter().position(|k| k.eq_ignore_ascii_case(e));
+        match (own.as_deref().and_then(rank), rank(cap)) {
+            (Some(o), Some(c)) if o <= c => own,
+            _ => Some(cap.to_string()),
         }
     }
 }
@@ -820,6 +893,7 @@ pub struct Config {
     pub comments: CommentsConfig,
     pub default_branch: DefaultBranchConfig,
     pub devices: crate::devices::DevicesConfig,
+    pub cleanup: crate::leftovers::CleanupConfig,
     pub app_origin: crate::apporigin::AppOriginConfig,
     pub bits: crate::bits::BitsConfig,
     pub releases: crate::releases::ReleasesConfig,
@@ -1021,6 +1095,7 @@ impl Config {
             comments: f.comments,
             default_branch: f.default_branch,
             devices: f.devices,
+            cleanup: f.cleanup,
             app_origin: f.app_origin,
             bits: f.bits,
             releases: f.releases,
@@ -1066,7 +1141,11 @@ impl Config {
         // A test's fake Midna is a shell script, slow to start on a loaded machine.
         c.midna_exit_timeout = 10.0;
         c.questions.screen = false;
+        // Idle task terminals stay open unless a test sets idle_close_mins.
+        c.limits.idle_close_mins = 0;
         c.backlog.ai = false;
+        // Misses on a goal's done-when go to the owner unless a test hands them to agents.
+        c.backlog.misses_to_agent = false;
         c.pr.watch = false;
         // No host is read for the owner's open PRs unless a test asks.
         c.pr_builds.owner_prs_secs = 0.0;
@@ -1076,6 +1155,12 @@ impl Config {
         c.pr.approvals = 0;
         c.accounts_sandbox = true;
         c.page_url = "taskboard://".into();
+        // The test machine's own load and memory never hold a test's starts back.
+        c.terminals.hold_load_per_core = 0.0;
+        c.terminals.hold_memory = "off".into();
+        c.terminals.hold_free_memory_gb = 0.0;
+        // The test machine's cores don't show in started terminals' settings.
+        c.builds.jobs = Some(0);
         c
     }
 
@@ -1219,6 +1304,25 @@ mod tests {
         assert_eq!(own.resolve_pr_visit_effort(Some("small"), None).as_deref(), Some("medium"));
         let off = ModelsConfig { enabled: false, ..ModelsConfig::default() };
         assert_eq!(off.resolve_effort(Some("small"), Some("max")), None);
+    }
+
+    #[test]
+    fn pr_work_visits_run_at_most_at_pr_work_effort() {
+        let m = ModelsConfig::default();
+        assert_eq!(m.resolve_pr_work(Some("large")).as_deref(), Some("opus"), "the task's own model by default");
+        assert_eq!(m.resolve_pr_work_effort(Some("large"), None).as_deref(), Some("medium"), "high held to medium");
+        assert_eq!(m.resolve_pr_work_effort(None, Some("max")).as_deref(), Some("medium"), "a task's own effort too");
+        assert_eq!(m.resolve_pr_work_effort(Some("small"), Some("low")).as_deref(), Some("low"), "lower keeps its own");
+        assert_eq!(m.resolve_pr_work_effort(Some("claude-haiku-5-5"), None).as_deref(), Some("medium"), "Claude's own: the cap");
+        let uncapped = ModelsConfig { pr_work_effort: "".into(), ..ModelsConfig::default() };
+        assert_eq!(uncapped.resolve_pr_work_effort(Some("large"), None).as_deref(), Some("high"));
+        let small = ModelsConfig { pr_work: "small".into(), pr_work_effort: "low".into(), ..ModelsConfig::default() };
+        assert_eq!(small.resolve_pr_work(Some("large")).as_deref(), Some("sonnet"));
+        assert_eq!(small.resolve_pr_work_effort(Some("large"), Some("max")).as_deref(), Some("low"));
+        let off = ModelsConfig { enabled: false, ..ModelsConfig::default() };
+        assert_eq!((off.resolve_pr_work(None), off.resolve_pr_work_effort(None, None)), (None, None));
+        let c = Config::from_file(toml::from_str("[models]\npr_work_effort = \"low\"").unwrap(), PathBuf::from("/tmp/x.toml"));
+        assert_eq!((c.models.pr_work.as_str(), c.models.pr_work_effort.as_str()), ("", "low"));
     }
 
     #[test]

@@ -33,6 +33,41 @@ impl Composer {
     }
 }
 
+/// The note forms by the name a restart saves them under.
+const NOTE_KINDS: [(Note, &str); 4] = [(Note::Done, "done"), (Note::CantDo, "cant_do"), (Note::NotNeeded, "not_needed"), (Note::WaitingOn, "waiting_on")];
+
+/// What's typed in the page's note boxes, for a restart to update to keep: by row key, the form
+/// open, its text, Done's note kept aside and the waiting date. Boxes with no text are left out.
+pub fn drafts(m: &MainWindow, cx: &App) -> HashMap<String, Value> {
+    m.home
+        .notes
+        .iter()
+        .filter_map(|(key, c)| {
+            let text = c.input.text(cx);
+            if text.trim().is_empty() && c.done_text.trim().is_empty() {
+                return None;
+            }
+            let kind = NOTE_KINDS.iter().find(|(k, _)| *k == c.kind).map_or("done", |(_, n)| n);
+            Some((key.clone(), json!({"kind": kind, "text": text, "done": c.done_text, "until": c.until})))
+        })
+        .collect()
+}
+
+/// Back after a restart: each saved note box with its text, its row open.
+pub fn restore_drafts(m: &mut MainWindow, kept: &serde_json::Map<String, Value>, cx: &mut Context<MainWindow>) {
+    for (key, v) in kept {
+        let kind = NOTE_KINDS.iter().find(|(_, n)| v["kind"] == *n).map_or(Note::Done, |(k, _)| *k);
+        let mut c = Composer::new(cx);
+        c.kind = kind;
+        c.until = v["until"].as_str().map(str::to_string);
+        c.done_text = v["done"].as_str().unwrap_or("").to_string();
+        c.input.set_text(v["text"].as_str().unwrap_or(""), cx);
+        m.home.notes.insert(key.clone(), c);
+        FLIPPED.with(|f| f.borrow_mut().insert(key.clone()));
+    }
+    m.home.remeasure = true;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Line {
     Head,
@@ -49,6 +84,9 @@ enum Line {
     /// Open.
     Later(bool),
     LaterItem(usize),
+    /// What the board took off the list itself: open, then each held.
+    Handled(bool),
+    HandledItem(usize),
     End,
 }
 
@@ -85,6 +123,9 @@ pub struct State {
     /// A line's height changed with the lines the same: a note field took another shape.
     remeasure: bool,
     later_open: bool,
+    pub handled: super::handled::Handled,
+    /// `handled.held.version` the list was last measured for.
+    handled_seen: u64,
     notes: HashMap<String, Composer>,
     /// The row ↑ and ↓ are on, by its key.
     cursor: Option<String>,
@@ -101,7 +142,7 @@ fn goal_open(g: &GoalRow) -> bool {
 }
 
 /// The page's lines; with the board down, no counts from before it went.
-fn lines_of(v: &View, later_open: bool, down: bool) -> Vec<Line> {
+fn lines_of(v: &View, later_open: bool, handled: (usize, bool), down: bool) -> Vec<Line> {
     let mut out = vec![Line::Head];
     if !v.stats.is_empty() && !down {
         out.push(Line::Stats);
@@ -134,6 +175,12 @@ fn lines_of(v: &View, later_open: bool, down: bool) -> Vec<Line> {
             out.extend((0..l.items.len()).map(Line::LaterItem));
         }
     }
+    if handled.0 > 0 {
+        out.push(Line::Handled(handled.1));
+        if handled.1 {
+            out.extend((0..handled.0).map(Line::HandledItem));
+        }
+    }
     out.push(Line::End);
     out
 }
@@ -149,7 +196,11 @@ fn prepare(m: &mut MainWindow) {
     let same_project = st.view.as_ref().is_some_and(|v| v.project == project);
     let fresh = held.is_none();
     let v = held.unwrap_or_else(|| Rc::new(View::of(&built, &project, &home)));
-    let lines = lines_of(&v, st.later_open, down);
+    let lines = lines_of(&v, st.later_open, (st.handled.held.rows.len(), st.handled.open), down);
+    if st.handled.held.version != st.handled_seen {
+        st.handled_seen = st.handled.held.version;
+        st.remeasure = true;
+    }
     let count = lines.len();
     match &st.list {
         None => st.list = Some(ListState::new(count, ListAlignment::Top, px(600.))),
@@ -189,6 +240,7 @@ pub fn render(m: &mut MainWindow, window: &mut Window, cx: &mut Context<MainWind
         .h_full()
         .bg(t.bg);
     let Some(list) = m.home.list.clone() else { return page.into_any_element() };
+    super::handled::load_older(m, m.home.lines.len(), list.logical_scroll_top().item_ix, cx);
     page.child(gpui_kit::list(list, cx.processor(line_item)).flex_1().min_w_0().h_full()).children(filter).children(menu).into_any_element()
 }
 
@@ -208,6 +260,8 @@ fn line_item(m: &mut MainWindow, ix: usize, window: &mut Window, cx: &mut Contex
         Line::Idea(i) => idea_line(&t, &v, i, cx),
         Line::Later(open) => later_line(&t, &v, open, cx),
         Line::LaterItem(i) => later_item(&t, &v, i, cx),
+        Line::Handled(open) => super::handled::head(&t, m.home.handled.held.total, open, chevron(open, t.muted), cx),
+        Line::HandledItem(i) => super::handled::item(m, &t, i, cx),
         Line::End => div().h(px(32.)),
     };
     div().px(px(PAGE_X)).line_height(relative(1.4)).child(inner).into_any_element()
@@ -750,7 +804,10 @@ fn question_body(t: &Theme, a: &Ask, body: Div, paused: bool, cx: &mut Context<M
             _ => kit::disabled(b),
         }
     });
+    // A task that missed the time it parked itself until: its plan under the missed time.
+    let under = (a.asks.is_empty() && !a.line.is_empty() && a.line != a.text).then(|| div().text_size(px(13.)).text_color(t.text_2).child(a.line.clone()));
     body.child(div().text_size(px(14.)).text_color(t.warn_text).child(a.text.clone()))
+        .children(under)
         .when(!rows.is_empty(), |d| d.child(div().flex().flex_col().gap(px(8.)).children(rows)))
         .when(send.is_some() || focus.is_some(), |d| d.child(div().flex().items_center().gap(px(8.)).children(send).children(focus)))
 }
@@ -1201,6 +1258,34 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn typed_notes_are_kept_for_a_restart_and_come_back_open(cx: &mut gpui_kit::TestAppContext) {
+        let (w, _) = window(cx);
+        let (key, empty) = ("task:T44".to_string(), "task:T45".to_string());
+        let saved = w
+            .update(cx, |m, window, cx| {
+                m.home.notes.entry(key.clone()).or_insert_with(|| Composer::new(cx)).input.set_text("Sent the invoice", cx);
+                open_note(m, &key, Note::WaitingOn, window, cx);
+                let c = m.home.notes.get_mut(&key).unwrap();
+                c.input.set_text("Dana", cx);
+                c.until = Some("2026-12-01".into());
+                m.home.notes.entry(empty.clone()).or_insert_with(|| Composer::new(cx));
+                drafts(m, cx)
+            })
+            .unwrap();
+        assert_eq!(saved.keys().collect::<Vec<_>>(), [&key], "an empty box isn't kept");
+        let saved = serde_json::Map::from_iter(saved);
+        w.update(cx, |m, _, cx| {
+            m.home.notes.clear();
+            FLIPPED.with(|f| f.borrow_mut().clear());
+            restore_drafts(m, &saved, cx);
+            let c = &m.home.notes[&key];
+            assert_eq!((c.kind, c.input.text(cx), c.done_text.as_str(), c.until.as_deref()), (Note::WaitingOn, "Dana".to_string(), "Sent the invoice", Some("2026-12-01")));
+            assert!(flipped(&key), "its row opens");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn with_the_board_down_row_buttons_wait(cx: &mut gpui_kit::TestAppContext) {
         let (w, rec) = window(cx);
         rec.clear();
@@ -1243,8 +1328,8 @@ mod tests {
     #[test]
     fn with_the_board_down_the_page_drops_its_counts() {
         let v = View { asks: Rc::new(vec![]), project: "all".into(), stats: Rc::new(stats_vm(&json!({}))), names: Rc::new(vec![]), counts: vec![], groups: vec![], ideas: vec![], later: None, sub: String::new() };
-        assert!(lines_of(&v, false, false).contains(&Line::Stats));
-        assert!(!lines_of(&v, false, true).contains(&Line::Stats));
+        assert!(lines_of(&v, false, (0, false), false).contains(&Line::Stats));
+        assert!(!lines_of(&v, false, (0, false), true).contains(&Line::Stats));
     }
 
     #[test]
@@ -1254,9 +1339,14 @@ mod tests {
             "later": [{"id": "stage:G2:1", "stage": true, "goal": "G2", "goal_name": "Faster sign-in", "wave": 1, "later": {"back": true}}]});
         let v = View { asks: Rc::new(vec![]), project: "all".into(), stats: Rc::new(vec![]), names: Rc::new(vec![]), counts: vec![], groups: vec![],
                        ideas: groups::ideas_vm(&home, "all"), later: groups::later_vm(&home, "all"), sub: String::new() };
-        assert_eq!(lines_of(&v, false, false), [Line::Head, Line::Ideas, Line::Idea(0), Line::Later(false), Line::End], "an idea waiting isn't Nothing needs you");
+        assert_eq!(lines_of(&v, false, (0, false), false), [Line::Head, Line::Ideas, Line::Idea(0), Line::Later(false), Line::End], "an idea waiting isn't Nothing needs you");
         let none = View { ideas: vec![], ..v };
-        assert_eq!(lines_of(&none, false, false), [Line::Head, Line::Empty, Line::Later(false), Line::End]);
+        assert_eq!(lines_of(&none, false, (0, false), false), [Line::Head, Line::Empty, Line::Later(false), Line::End]);
+        assert_eq!(lines_of(&none, false, (2, false), false), [Line::Head, Line::Empty, Line::Later(false), Line::Handled(false), Line::End], "shut: its line alone");
+        assert_eq!(
+            lines_of(&none, false, (2, true), false),
+            [Line::Head, Line::Empty, Line::Later(false), Line::Handled(true), Line::HandledItem(0), Line::HandledItem(1), Line::End]
+        );
     }
 
     #[test]

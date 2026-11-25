@@ -13,13 +13,16 @@
 //! `fail`, or `skip` for a round that couldn't review and mustn't block), a headline and findings. The
 //! task shows the latest round's headline and findings, and `tb step triage` answers a finding. A step
 //! with `per_head = true` passes once per head commit, so every push is checked again (an author-side
-//! review gate); `min_gap_mins` keeps its rounds apart; `bar` names it in the app's PR bar.
+//! review gate); `min_gap_mins` keeps its rounds apart; `bar` names it in the app's PR bar. A clean
+//! rebase keeps such a pass: a head whose change is the passed head's as it was (`rounds_on`, #1145).
 //!
 //! The handoff tells the agent the steps, and the board holds the PR (the Claude Code `PreToolUse` hook on
 //! `gh pr create` and the like) and `tb submit` until they're recorded. The owner's Done in the app isn't
 //! held. The file is read fresh each time, like hooks.json, so edits apply without restarting the board.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -542,14 +545,16 @@ pub fn vars_for(app: &App, t: &Row) -> BTreeMap<String, String> {
 pub fn vars_at(app: &App, t: &Row, head: Option<&str>) -> BTreeMap<String, String> {
     let mut v = vars(t);
     let base = real_base(app, t).unwrap_or_else(|_| v.get("base").cloned().unwrap_or_default());
-    v.insert("base_ref".into(), format!("{}/{base}", app.cfg.pr_body.remote));
-    if let Some(h) = crate::samepr::review_base(app, t) {
-        v.insert("base_ref".into(), h);
-    }
+    v.insert("base_ref".into(), base_ref_of(app, t, &base));
     v.insert("base".into(), base);
     v.insert("head".into(), judged_head(t, head).or_else(|| asked_at(t, "head")).unwrap_or_default());
     v.insert("worktree".into(), worktree_of(t));
     v
+}
+
+/// `{base_ref}`: the task's base branch `base` on the remote, else the head its same-PR anchor is reviewed on.
+fn base_ref_of(app: &App, t: &Row, base: &str) -> String {
+    crate::samepr::review_base(app, t).unwrap_or_else(|| format!("{}/{base}", app.cfg.pr_body.remote))
 }
 
 /// What `tb step ask` last resolved for the task (`head`, `branch`, `worktree`): what its placeholders
@@ -633,6 +638,61 @@ pub fn rounds(app: &App, task_id: i64) -> Result<Vec<Round>> {
             })
         })
         .collect())
+}
+
+/// `rounds`, as the gates judge them on `head`: a passed round of a per-head step on another commit
+/// whose change `head` carries as it was counts as on `head`, its own commit kept as `kept_from`. That's
+/// a clean rebase onto a base that moved on: the same `git patch-id` for each commit's change from where
+/// it leaves the task's base (`code_review::patch_of`, as a review is kept, #1071). A rebase that had to
+/// resolve a conflict in the change's own lines, or any new work, changes the patch, and the step runs
+/// again (#1145).
+pub fn rounds_on(app: &App, t: &Row, head: Option<&str>) -> Result<Vec<Round>> {
+    let mut all = rounds(app, t.id())?;
+    keep_across_rebase(app, t, &mut all, head);
+    Ok(all)
+}
+
+/// `rounds_on` for rounds already read.
+fn keep_across_rebase(app: &App, t: &Row, all: &mut [Round], head: Option<&str>) {
+    let Some(head) = head.map(str::trim).filter(|h| !h.is_empty()) else { return };
+    let per_head: HashSet<String> = for_task(app, t).iter().filter(|s| s.counts_per_head()).map(|s| key(&s.name)).collect();
+    let moved = |r: &Round| r.passed && per_head.contains(&r.key) && r.head.as_deref().is_some_and(|rh| !same_head(head, rh));
+    if !all.iter().any(moved) {
+        return;
+    }
+    let dir = worktree_of(t);
+    let base = real_base(app, t).unwrap_or_else(|_| base_branch(&t.st("repo_path")));
+    let Some(base) = rev_in(&dir, &base_ref_of(app, t, &base)) else { return };
+    let Some(now) = patch_at(&dir, &base, head) else { return };
+    for r in all.iter_mut().filter(|r| moved(r)) {
+        let was = r.head.clone().unwrap_or_default();
+        if patch_at(&dir, &base, &was).as_deref() == Some(now.as_str()) {
+            r.data["kept_from"] = json!(was);
+            r.head = Some(head.to_string());
+        }
+    }
+}
+
+/// The change the commit `at` makes from where it leaves the base commit `base`, as `git patch-id`
+/// (`code_review::patch_of`); none when git can't tell. Kept per checkout, base and commit, which name
+/// it for good, so the app's refreshes don't run git again.
+fn patch_at(dir: &str, base: &str, at: &str) -> Option<String> {
+    type Patches = HashMap<(String, String, String), Option<String>>;
+    static SEEN: Mutex<Option<Patches>> = Mutex::new(None);
+    let at = rev_in(dir, at)?;
+    let k = (dir.to_string(), base.to_string(), at.clone());
+    if let Some(p) = SEEN.lock().ok().and_then(|m| m.as_ref()?.get(&k).cloned()) {
+        return p;
+    }
+    let p = crate::code_review::patch_of(dir, base, &at, &at);
+    if let Ok(mut m) = SEEN.lock() {
+        let m = m.get_or_insert_with(HashMap::new);
+        if m.len() >= 512 {
+            m.clear();
+        }
+        m.insert(k, p.clone());
+    }
+    p
 }
 
 /// Two commits are the same when one names the other (a short sha and its full one).
@@ -783,8 +843,8 @@ pub fn missing(app: &App, t: &Row, before: &[Before]) -> Result<Vec<Step>> {
 
 /// `missing`, judging per-head steps on `head` (else the task's head as the board knows it).
 pub fn missing_at(app: &App, t: &Row, before: &[Before], head: Option<&str>) -> Result<Vec<Step>> {
-    let rounds = rounds(app, t.id())?;
     let known = judged_head(t, head);
+    let rounds = rounds_on(app, t, known.as_deref())?;
     Ok(for_task(app, t).into_iter().filter(|s| before.contains(&s.before) && !passed_on(s, &rounds, known.as_deref())).collect())
 }
 
@@ -795,10 +855,10 @@ pub fn merge_missing(app: &App, t: &Row, head: Option<&str>, base: Option<&str>)
     if all.is_empty() {
         return Ok(all);
     }
-    let rounds = rounds(app, t.id())?;
     let default = if all.iter().any(|s| s.default_branch_only) { default_base(&t.st("repo_path")) } else { None };
     let base = base.filter(|b| !b.is_empty());
     let head = head.filter(|h| !h.is_empty());
+    let rounds = rounds_on(app, t, head)?;
     Ok(all.into_iter().filter(|s| s.applies_to_base(base, default.as_deref()) && !passed_on(s, &rounds, head)).collect())
 }
 
@@ -809,10 +869,10 @@ pub fn merge_cards(app: &App, t: &Row, head: Option<&str>, base: Option<&str>) -
     if all.is_empty() {
         return Ok(vec![]);
     }
-    let rounds = rounds(app, t.id())?;
     let default = if all.iter().any(|s| s.default_branch_only) { default_base(&t.st("repo_path")) } else { None };
     let base = base.filter(|b| !b.is_empty());
     let head = head.filter(|h| !h.is_empty());
+    let rounds = rounds_on(app, t, head)?;
     Ok(all
         .into_iter()
         .filter(|s| s.applies_to_base(base, default.as_deref()))
@@ -873,8 +933,8 @@ pub fn waiting_card(app: &App, t: &Row) -> Value {
 /// `GET /steps`: a task's steps (placeholders as written), which have passed (on `head`, for a
 /// per-head step), when each may run its next round, and the placeholders' values.
 pub fn list(app: &App, t: &Row, head: Option<&str>) -> Result<Value> {
-    let rounds = rounds(app, t.id())?;
     let known = judged_head(t, head);
+    let rounds = rounds_on(app, t, known.as_deref())?;
     let steps: Vec<Value> = for_task(app, t)
         .iter()
         .map(|s| {
@@ -951,11 +1011,108 @@ pub fn refusal(tb: &str, what: &str, left: &[Step]) -> String {
     lines.join("\n")
 }
 
+/// A kept lesson or a rule of the owner's that names a step: where it's from and what it says (#1146).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepRule {
+    pub source: String,
+    pub text: String,
+}
+
+/// How much of a rule the handoff and the refusal quote.
+const RULE_CHARS: usize = 400;
+
+/// The first kept lesson, project instruction file (`AGENTS.md`, `CLAUDE.md` in the task's repo) or file
+/// in the owner's question rules (`questions.rules`, which the question screener reads) that names the
+/// step, else None. A step named in one word (`Lens`) counts only where the same passage also says
+/// "step", so a rule that merely uses the word doesn't take it over.
+pub fn rule_for(app: &App, t: &Row, step: &Step) -> Option<StepRule> {
+    let lessons = crate::lessons::kept(app, t.s("project"), &["code", "process", "tooling"]).unwrap_or_default();
+    if let Some(l) = lessons.iter().find(|l| names_step(&l.st("text"), &step.name)) {
+        return Some(StepRule { source: format!("lesson {}", rf("lesson", l.id())), text: one_line(&l.st("text"), RULE_CHARS) });
+    }
+    let repo = t.st("repo_path");
+    let mut files: Vec<PathBuf> = vec![];
+    if !repo.trim().is_empty() {
+        files.extend(["AGENTS.md", "CLAUDE.md"].map(|f| Path::new(&repo).join(f)));
+    }
+    files.extend(crate::screen::rule_paths(app));
+    files.iter().find_map(|p| {
+        let text = std::fs::read_to_string(p).ok()?;
+        let b = passages(&text).into_iter().find(|b| names_step(b, &step.name))?;
+        Some(StepRule { source: shown_path(p, &repo), text: one_line(&b, RULE_CHARS) })
+    })
+}
+
+/// Whether `text` names the step `name` as a whole phrase, any case or spacing; a one-word name also
+/// needs the word "step" nearby.
+fn names_step(text: &str, name: &str) -> bool {
+    let words: Vec<String> = name.split_whitespace().map(regex::escape).collect();
+    if words.is_empty() {
+        return false;
+    }
+    let Ok(re) = regex::Regex::new(&format!(r"(?i)(?:^|\W){}(?:\W|$)", words.join(r"\s+"))) else { return false };
+    if !re.is_match(text) {
+        return false;
+    }
+    words.len() > 1 || regex::Regex::new(r"(?i)\bsteps?\b").map(|s| s.is_match(text)).unwrap_or(false)
+}
+
+/// A Markdown file's passages: each paragraph or list item, a heading joined to the paragraph under it.
+fn passages(text: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let mut heading_only = false;
+    for line in text.lines() {
+        let l = line.trim();
+        let item = l.starts_with("- ") || l.starts_with("* ") || l.split_once(". ").is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+        let heading = l.starts_with('#');
+        let breaks = heading || item || l == "---" || (l.is_empty() && !heading_only);
+        if breaks && !cur.trim().is_empty() {
+            out.push(std::mem::take(&mut cur).trim().to_string());
+        }
+        if breaks {
+            cur.clear();
+            heading_only = heading;
+        } else if !l.is_empty() {
+            heading_only = false;
+        }
+        if l != "---" && !l.is_empty() {
+            cur += l.trim_start_matches('#').trim_start_matches("- ").trim_start_matches("* ").trim();
+            cur += if heading { ": " } else { " " };
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// A rule file as the agent should see it: relative to the task's repo, else with `~` for home.
+fn shown_path(p: &Path, repo: &str) -> String {
+    if let Some(r) = p.strip_prefix(repo).ok().filter(|_| !repo.trim().is_empty()) {
+        return r.display().to_string();
+    }
+    match std::env::var("HOME").ok().and_then(|h| p.strip_prefix(h).ok().map(|r| r.display().to_string())) {
+        Some(r) => format!("~/{r}"),
+        None => p.display().to_string(),
+    }
+}
+
+/// What `tb step fail` says when a rule covers the step and the agent didn't override it.
+pub fn rule_refusal(tb: &str, step: &str, rule: &StepRule) -> String {
+    format!(
+        "Not failed: a rule covers the step “{step}” ({}): “{}”\nDo what it says and run the step again. If it truly \
+         doesn't fit this failure, say why: {tb} step fail \"{step}\" --why \"<why the rule doesn't fit and the step can't pass>\" --override",
+        rule.source, rule.text
+    )
+}
+
 /// The handoff's lines about the task's steps, or nothing when it has none.
 pub fn handoff_block(app: &App, t: &Row, tb: &str, ships_prs: bool) -> String {
     let v = vars_for(app, t);
     let all: Vec<Step> = for_task(app, t).iter().map(|s| s.filled(&v)).collect();
     let mut s = String::new();
+    let (mut listed, mut ruled) = (0, 0);
     for (before, when) in [(Before::Pr, "Before you open the PR"), (Before::Done, "Before you run tb submit"), (Before::Merge, "Before the PR merges")] {
         let these: Vec<&Step> = all.iter().filter(|s| s.before == before && (ships_prs || before == Before::Done)).collect();
         if these.is_empty() {
@@ -964,6 +1121,11 @@ pub fn handoff_block(app: &App, t: &Row, tb: &str, ships_prs: bool) -> String {
         s += &format!("\n{when}, do {}:", if these.len() == 1 { "this step" } else { "these steps in order" });
         for (i, st) in these.iter().enumerate() {
             s += &format!("\n{}. {}: {}. Then: {}.", i + 1, st.name, st.what(), st.how(tb));
+            listed += 1;
+            if let Some(r) = rule_for(app, t, st) {
+                ruled += 1;
+                s += &format!(" A rule covers it ({}): “{}” Follow that rule when it doesn't pass.", r.source, r.text);
+            }
         }
     }
     let ignored = ignored_for(app, t);
@@ -983,9 +1145,14 @@ pub fn handoff_block(app: &App, t: &Row, tb: &str, ships_prs: bool) -> String {
     if s.is_empty() {
         return off.trim_start().to_string();
     }
+    let fail = match ruled {
+        0 => format!(" If one can't pass, {tb} step fail \"<name>\" --why \"…\" and end your turn."),
+        n if n == listed => String::new(),
+        _ => format!(" If a step with no rule above can't pass, {tb} step fail \"<name>\" --why \"…\" and end your turn."),
+    };
     format!(
         "{}{off}\nThe board won't let the PR open or the task finish until they pass. A script or check can take a while: \
-         give it time. If one can't pass, {tb} step fail \"<name>\" --why \"…\" and end your turn. {tb} steps lists them.",
+         give it time.{fail} {tb} steps lists them.",
         s.trim_start()
     )
 }
@@ -1119,12 +1286,13 @@ pub fn skipped_why(round: &Round) -> Option<String> {
 /// What the app shows for each of the task's steps that has run: its latest round's headline and
 /// findings, and whether the head has moved since.
 pub fn results(app: &App, t: &Row) -> Result<Vec<Value>> {
-    let all = rounds(app, t.id())?;
+    let mut all = rounds(app, t.id())?;
     if all.is_empty() {
         return Ok(vec![]);
     }
     let triage = triage_of(app, t)?;
     let head = judged_head(t, None);
+    keep_across_rebase(app, t, &mut all, head.as_deref());
     let mut out = vec![];
     for st in for_task(app, t) {
         let k = key(&st.name);
@@ -1157,7 +1325,7 @@ fn round_card(st: &Step, round: &Round, all: &[Round], triage: &[Value], head: O
     let stale = st.counts_per_head() && matches!((head, &round.head), (Some(h), Some(rh)) if !same_head(h, rh));
     json!({
         "name": st.name, "bar": if st.bar.is_empty() { Value::Null } else { json!(st.bar) },
-        "at": round.at, "head": round.head, "passed": round.passed, "stale": stale,
+        "at": round.at, "head": round.head, "passed": round.passed, "stale": stale, "kept_from": round.data["kept_from"],
         "verdict": round.data["result"]["verdict"], "headline": headline(round, &fs), "note": round.data["note"],
         "skipped": skipped_why(round).is_some(), "why": skipped_why(round),
         "open": fs.iter().filter(|f| finding_open(f)).count(), "findings": fs,
@@ -1189,6 +1357,22 @@ pub fn bar_card(app: &App, t: &Row) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rule_names_a_step_as_a_whole_phrase() {
+        assert!(names_step("When design  PARITY fails, fix the app.", "Design parity"));
+        assert!(names_step("“Design parity”: never ask.", "Design parity"));
+        assert!(!names_step("Design parityx is new.", "Design parity"));
+        assert!(!names_step("Run the tests before pushing.", "Tests"), "one word needs \"step\" too");
+        assert!(names_step("The Tests step needs the VPN.", "Tests"));
+        assert!(!names_step("anything", "  "));
+    }
+
+    #[test]
+    fn passages_are_paragraphs_items_and_headed_sections() {
+        let p = passages("# Agents\n\n## Design parity\n\nNever ask;\nrerun it.\n\n- one\n  more\n- two\n---\n1. three\n");
+        assert_eq!(p, vec!["Agents:", "Design parity: Never ask; rerun it.", "one more", "two", "1. three"]);
+    }
 
     #[test]
     fn scripts_get_each_value_as_one_shell_word() {

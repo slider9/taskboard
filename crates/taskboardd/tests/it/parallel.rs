@@ -199,10 +199,10 @@ fn propose_names_what_each_task_waits_for_by_ref_or_place() {
     let g = b.side_by_side();
     let setup = b.task("Set up", json!({}));
     let out = b.report("tb.propose", "s1", json!({"goal": format!("G{g}"), "tasks": [
-        {"title": "Measure", "detail": "before numbers", "waits_for": [format!("T{setup}")], "locks": ["quiet-mac"]},
-        "Fix the tabs::the fix::2::#1",
-        {"title": "Measure after", "detail": "after", "waits_for": ["#1", "#2"], "alone": "goal"},
-        "Docs::write them::::T1",
+        {"est": "1h", "title": "Measure", "detail": "before numbers", "waits_for": [format!("T{setup}")], "locks": ["quiet-mac"]},
+        "Fix the tabs::the fix::2::#1::est=1h",
+        {"est": "1h", "title": "Measure after", "detail": "after", "waits_for": ["#1", "#2"], "alone": "goal"},
+        "Docs::write them::::T1::est=1h",
     ]}));
     let made: Vec<String> = out["created"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
     let card = |r: &str| b.get(&format!("tasks/{r}"));
@@ -219,7 +219,7 @@ fn propose_names_what_each_task_waits_for_by_ref_or_place() {
     let two = shown["tasks"].as_array().unwrap().iter().find(|t| t["ref"] == made[1].as_str()).unwrap().clone();
     assert_eq!(two["waits_for_state"], json!([{"ref": made[0], "done": false}]));
 
-    let bad = b.try_report("tb.propose", "s1", json!({"goal": format!("G{g}"), "tasks": [{"title": "First", "detail": "x", "waits_for": ["#1"]}]}));
+    let bad = b.try_report("tb.propose", "s1", json!({"goal": format!("G{g}"), "tasks": [{"est": "1h", "title": "First", "detail": "x", "waits_for": ["#1"]}]}));
     let (code, msg) = bad.unwrap_err();
     assert_eq!(code, 400);
     assert!(msg.contains("#1 is the first"), "{msg}");
@@ -795,6 +795,39 @@ fn worktrees_agents_made_are_matched_to_their_task_and_removed_by_the_same_rules
 }
 
 #[test]
+fn a_worktree_on_main_isn_t_handed_to_a_shared_checkout_task_nor_a_release_cut_s_removed() {
+    let b = new_board();
+    git_repo(&b);
+    let repo = b.repo();
+    let dir = b.dir.path().to_string_lossy().to_string();
+    // The shared checkout moves on to a feature branch; main is free for a worktree of its own.
+    git(Path::new(&repo), &["switch", "-q", "-c", "feat/other"]);
+    let [shared, cutter] = ["Worked in the shared checkout on main", "Cuts the release"].map(|t| b.task(t, json!({})));
+    let ctx = json!({"where": {"worktree": repo, "branch": "main"}}).to_string();
+    b.app.db.x("UPDATE tasks SET context = ? WHERE id = ?", p![ctx, shared]).unwrap();
+    let on_main = format!("{dir}/release-main");
+    let cut_in = format!("{dir}/release-t{cutter}");
+    git(Path::new(&repo), &["worktree", "add", "-q", &on_main, "main"]);
+    git(Path::new(&repo), &["worktree", "add", "-q", "--detach", &cut_in]);
+    for t in [shared, cutter] {
+        b.app.db.x("UPDATE tasks SET status = 'done', session_id = NULL WHERE id = ?", p![t]).unwrap();
+    }
+    b.app.db.x("INSERT INTO pending_cuts(project, name, after, dir, running_at) VALUES ('webapp', 'v1', '[]', ?, '2026-11-24T18:48:25Z')", p![cut_in]).unwrap();
+
+    assert!(worktrees::clean_up(&b.app).unwrap().is_empty());
+    assert!(Path::new(&on_main).exists(), "a shared-checkout task's recorded main isn't the worktree's");
+    assert!(Path::new(&cut_in).exists(), "kept while the release script runs in it");
+    assert!(!b.card(shared)["log"].to_string().contains("release-main"), "{}", b.card(shared)["log"]);
+    let stray = &b.get("projects")["projects"][0]["stray_worktrees"];
+    assert_eq!(stray.as_array().unwrap().len(), 1, "{stray}");
+    assert!(stray[0].as_str().unwrap().ends_with("/release-main"), "{stray}");
+
+    b.app.db.x("DELETE FROM pending_cuts", p![]).unwrap();
+    assert_eq!(worktrees::clean_up(&b.app).unwrap(), vec![cutter], "once the cut is through, its task's rules apply");
+    assert!(!Path::new(&cut_in).exists());
+}
+
+#[test]
 fn a_stacked_task_starts_from_its_parent_s_branch_where_it_exists() {
     let b = new_board();
     git_repo(&b);
@@ -859,7 +892,7 @@ fn more_changes_after_done_reopen_the_task() {
     let b = new_board();
     b.add_session("s1");
     b.report("hook.prompt", "s1", json!({"prompt": "zip the project"}));
-    let tr = b.report("tb.new_task", "s1", json!({"title": "Zip the project", "here": true, "ships_pr": false}))["created"][0].as_str().unwrap().to_string();
+    let tr = b.report("tb.new_task", "s1", json!({"est": "1h", "title": "Zip the project", "here": true, "ships_pr": false}))["created"][0].as_str().unwrap().to_string();
     write_turn(&b, "s1", "zip the project", &["notes.md"], "2026-01-01T10:00:00Z");
     b.report("tb.done", "s1", json!({"summary": "Zipped it."}));
     assert!(b.report("hook.stop", "s1", json!({"last_message": "Zipped."})).get("block").is_none());
@@ -884,10 +917,30 @@ fn more_changes_after_done_reopen_the_task() {
 }
 
 #[test]
+fn edits_before_a_wait_for_stay_with_the_parked_task() {
+    let b = new_board();
+    b.add_session("s1");
+    let t = b.task("Fix the tab bar", json!({"pickup": "manual"}));
+    let other = b.task("Ship the icons", json!({}));
+    b.report("hook.prompt", "s1", json!({"prompt": format!("[task-board:T{t}] go")}));
+    write_turn(&b, "s1", "go", &["TabBar.swift"], "2000-01-01T00:00:00Z");
+    assert_eq!(b.report("tb.wait_for", "s1", json!({"tasks": [format!("T{other}")], "why": "needs the icons"}))["parked"], true);
+    assert!(b.report("tb.status", "s1", json!({}))["task"].is_null(), "the terminal has no task now");
+    let out = b.report("hook.stop", "s1", json!({"last_message": "Waiting on the icons."}));
+    assert!(out.get("block").is_none(), "the edits are the parked task's: {out}");
+
+    b.report("hook.prompt", "s1", json!({"prompt": "now rename the app"}));
+    write_turn(&b, "s1", "now rename the app", &["Info.plist"], "2099-01-01T00:00:00Z");
+    let out = b.report("hook.stop", "s1", json!({"last_message": "Renamed it."}));
+    let block = out["block"].as_str().expect("a later turn's edits are new work");
+    assert!(block.contains("this terminal has no task"), "{block}");
+}
+
+#[test]
 fn more_changes_leave_a_done_pr_task_to_the_pr_flow() {
     let b = new_board();
     b.add_session("s1");
-    let tr = b.report("tb.new_task", "s1", json!({"title": "Fix the tab bar", "here": true}))["created"][0].as_str().unwrap().to_string();
+    let tr = b.report("tb.new_task", "s1", json!({"est": "1h", "title": "Fix the tab bar", "here": true}))["created"][0].as_str().unwrap().to_string();
     b.report("tb.done", "s1", json!({"summary": "Fixed it.", "pr": "https://github.com/acme/webapp/pull/7"}));
     b.report("hook.prompt", "s1", json!({"prompt": "one more tweak"}));
     write_turn(&b, "s1", "one more tweak", &["TabBar.swift"], "2099-01-01T00:00:00Z");
@@ -1361,12 +1414,12 @@ fn auto_takes_a_slot_when_wave_mates_overlap_list_no_files_or_have_the_shared_ch
         "tb.propose",
         "s1",
         json!({"goal": format!("G{g}"), "tasks": [
-            "Apart A::x::1::::src/a.rs", "Apart B::x::1::::src/b.rs",
-            "Over C::x::2::::src/c.rs", "Over D::x::2::::src/c.rs, src/d.rs",
-            "Bare E::x::3", "Listed F::x::3::::src/f.rs",
-            "Pinned G::x::4::lane=shared", "Pinned H::x::4::::src/h.rs::lane=slot",
-            "Held I::x::5::::src/i.rs::lane=shared", "Apart J::x::5::::src/j.rs",
-            "Apart K::x::6::::src/k.rs", "Started L::x::6::::src/l.rs",
+            "Apart A::x::1::::src/a.rs::est=1h", "Apart B::x::1::::src/b.rs::est=1h",
+            "Over C::x::2::::src/c.rs::est=1h", "Over D::x::2::::src/c.rs, src/d.rs::est=1h",
+            "Bare E::x::3::est=1h", "Listed F::x::3::::src/f.rs::est=1h",
+            "Pinned G::x::4::lane=shared::est=1h", "Pinned H::x::4::::src/h.rs::lane=slot::est=1h",
+            "Held I::x::5::::src/i.rs::lane=shared::est=1h", "Apart J::x::5::::src/j.rs::est=1h",
+            "Apart K::x::6::::src/k.rs::est=1h", "Started L::x::6::::src/l.rs::est=1h",
         ]}),
     );
     let ids: Vec<i64> =
@@ -1393,7 +1446,7 @@ fn auto_takes_a_slot_when_wave_mates_overlap_list_no_files_or_have_the_shared_ch
 fn auto_stays_in_the_shared_checkout_outside_a_wave_or_a_git_checkout() {
     let b = new_board();
     let g = b.side_by_side();
-    let r = b.report("tb.propose", "s1", json!({"goal": format!("G{g}"), "tasks": ["One::x::1", "Two::x::1"]}));
+    let r = b.report("tb.propose", "s1", json!({"goal": format!("G{g}"), "tasks": ["One::x::1::est=1h", "Two::x::1::est=1h"]}));
     let t: i64 = r["created"][0].as_str().unwrap()[1..].parse().unwrap();
     assert_eq!(lane(&b, t), ("shared".into(), "auto".into()), "no git checkout: no pool to borrow from");
     let loose = b.task("Loose", json!({"goal_id": g}));

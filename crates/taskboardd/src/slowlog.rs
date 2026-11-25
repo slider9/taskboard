@@ -15,9 +15,14 @@ pub const SLOW: Duration = Duration::from_secs(1);
 
 static SINK: RwLock<Option<Weak<App>>> = RwLock::new(None);
 
-/// Sends slow commands and database waits to this board's server.log. Until then they go nowhere.
+/// Sends slow commands, database waits and `line`s to this board's server.log. Until then they go nowhere.
 pub fn install(app: &Arc<App>) {
     *SINK.write() = Some(Arc::downgrade(app));
+}
+
+/// A server.log line from code with no `App` at hand, such as a notification sent on its own thread.
+pub fn line(msg: impl Into<String>) {
+    write(msg.into());
 }
 
 fn write(line: String) {
@@ -83,7 +88,7 @@ fn command_line(program: &Path, args: &[String], cwd: Option<&Path>, took: Durat
 }
 
 /// `s` on one line, cut to `max` characters.
-fn short(s: &str, max: usize) -> String {
+pub(crate) fn short(s: &str, max: usize) -> String {
     let one: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if one.chars().count() <= max {
         return one;
@@ -159,12 +164,11 @@ mod tests {
             })
         };
         has_it.recv().unwrap();
-        // A write: a read has its own connection and doesn't wait.
-        app.db.changed("DELETE FROM events WHERE 0", vec![]).unwrap();
+        app.db.x("DELETE FROM tasks WHERE id = -1", vec![]).unwrap();
         holder.join().unwrap();
         let log = std::fs::read_to_string(app.cfg.log_path()).unwrap();
         // The program by its file name: `sleep.exe` on Windows.
         assert!(log.contains("command timed out after 0.2s: sleep 5 in ") || log.contains("command timed out after 0.2s: sleep.exe 5 in "), "{log}");
-        assert!(log.contains("slow db lock: waited 1.") && log.contains("for DELETE FROM events WHERE 0"), "{log}");
+        assert!(log.contains("slow db lock: waited 1.") && log.contains("for DELETE FROM tasks WHERE id = -1"), "{log}");
     }
 }

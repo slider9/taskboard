@@ -226,6 +226,22 @@ pub fn day_clock(iso: &str) -> String {
     if d > today && (d - today).num_days() < 7 { format!("{} {clock}", l.format("%a")) } else { format!("{} {clock}", day_word(t)) }
 }
 
+/// When a waiting task resumes: "6:30 PM" today, "tomorrow 6:30 AM", "Thursday 6:30 AM" within the
+/// week, else "Dec 2 6:30 AM".
+pub fn resume_time(iso: &str) -> String {
+    let Some(t) = parse(iso) else { return String::new() };
+    let l = local(t);
+    let clock = clock12(&l.format("%H:%M").to_string());
+    let (today, d) = (local(now()).date_naive(), l.date_naive());
+    match (d - today).num_days() {
+        0 => clock,
+        1 => format!("tomorrow {clock}"),
+        2..=6 => format!("{} {clock}", l.format("%A")),
+        _ if d.year() == today.year() => format!("{} {clock}", l.format("%b %-d")),
+        _ => format!("{} {clock}", l.format("%b %-d, %Y")),
+    }
+}
+
 /// A time as "8:26 AM" today, else "Yesterday 8:26 AM" or "Oct 27 8:26 AM".
 pub fn day_time(iso: &str) -> String {
     let Some(t) = parse(iso) else { return String::new() };
@@ -357,6 +373,44 @@ pub fn obj<'a>(v: &'a Value, k: &str) -> Option<&'a Value> {
 }
 
 
+/// A length of working time as estimates are written: "45m", "3h", "1h 10m" (hours past a day too).
+pub fn work_len(min: i64) -> String {
+    let m = min.max(0);
+    match (m / 60, m % 60) {
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h {m}m"),
+    }
+}
+
+/// Actual time over the estimate: "1.6×", "0.8×"; two places when it rounds to nothing at one.
+pub fn times(r: f64) -> String {
+    if r < 0.095 { format!("{r:.2}×") } else { format!("{r:.1}×") }
+}
+
+/// An estimate's actual working minutes now: `actual_min` as of `as_of`, plus the time since while
+/// it's working (`working_since` is set).
+pub fn est_actual(e: &Value) -> i64 {
+    let at = e["actual_min"].as_i64().unwrap_or(0);
+    let more = match (opt_s(e, "working_since"), opt_s(e, "as_of").and_then(parse)) {
+        (Some(_), Some(as_of)) => ((now() - as_of).num_seconds() as f64 / 60.).round().max(0.) as i64,
+        _ => 0,
+    };
+    at + more
+}
+
+/// "Est 45m · Actual 1h 10m · 1.6×" from a task's `estimate`, the actual going on while it works;
+/// "Est 45m" before any working time. None when it has no estimate.
+pub fn estimate_line(e: &Value) -> Option<String> {
+    let est = e["est_min"].as_i64().filter(|m| *m > 0)?;
+    let actual = est_actual(e);
+    let mut s = format!("Est {}", work_len(est));
+    if actual > 0 {
+        s += &format!(" · Actual {} · {}", work_len(actual), times(actual as f64 / est as f64));
+    }
+    Some(s)
+}
+
 /// The reader's own clock, without the board's skew correction (the web's bare `Date.now()`).
 pub fn device_now() -> DateTime<Utc> {
     #[cfg(test)]
@@ -370,6 +424,16 @@ pub fn device_now() -> DateTime<Utc> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_resume_time_names_its_day_once_it_isnt_today() {
+        crate::parity::freeze("2026-11-23T15:00:00Z");
+        assert_eq!(resume_time("2026-11-23T18:30:00Z"), "6:30 PM");
+        assert_eq!(resume_time("2026-11-24T06:30:00Z"), "tomorrow 6:30 AM");
+        assert_eq!(resume_time("2026-11-26T06:30:00Z"), "Thursday 6:30 AM");
+        assert_eq!(resume_time("2026-12-02T06:30:00Z"), "Dec 2 6:30 AM");
+        assert_eq!(resume_time("2027-01-02T06:30:00Z"), "Jan 2, 2027 6:30 AM");
+    }
 
     #[test]
     fn a_human_tasks_h_ref_is_its_t_ref() {
@@ -409,6 +473,23 @@ mod tests {
         assert_eq!(background_label(&json!({"agents": 0, "commands": 1})), "1 command running");
         assert_eq!(background_label(&json!({"agents": 1, "commands": 1})), "1 agent, 1 command");
         assert_eq!(background_label(&json!(null)), "Running in background");
+    }
+
+    #[test]
+    fn an_estimate_reads_against_the_actual_time() {
+        assert_eq!(estimate_line(&json!({"est_min": 45, "actual_min": 70})).as_deref(), Some("Est 45m · Actual 1h 10m · 1.6×"));
+        assert_eq!(estimate_line(&json!({"est_min": 180, "actual_min": 0})).as_deref(), Some("Est 3h"));
+        assert_eq!(estimate_line(&json!({"est_min": null, "actual_min": 30})), None);
+        assert_eq!(work_len(1500), "25h");
+        assert_eq!(times(0.04), "0.04×");
+    }
+
+    #[test]
+    fn a_working_tasks_actual_time_keeps_going() {
+        let as_of = (now() - chrono::Duration::minutes(10)).to_rfc3339();
+        let e = json!({"est_min": 60, "actual_min": 20, "as_of": as_of, "working_since": as_of});
+        assert_eq!(est_actual(&e), 30);
+        assert_eq!(est_actual(&json!({"est_min": 60, "actual_min": 20, "as_of": as_of, "working_since": null})), 20);
     }
 
     #[test]

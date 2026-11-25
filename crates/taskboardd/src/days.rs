@@ -28,6 +28,8 @@ const SUMMARY_KEY: &str = "history_summary_days";
 const LAST_CLEANUP_KEY: &str = "history_last_cleanup";
 pub const DETAIL_DAYS: i64 = 90;
 pub const SUMMARY_DAYS: i64 = 365;
+/// Days of finished tasks the Days page's Estimate accuracy card counts, up to the day shown.
+pub const ESTIMATE_DAYS: i64 = 30;
 pub const DETAIL_CHOICES: &[i64] = &[30, 90, 180, 365];
 /// `0` keeps day summaries forever.
 pub const SUMMARY_CHOICES: &[i64] = &[180, 365, 730, 0];
@@ -299,7 +301,7 @@ fn work_out(app: &App, date: NaiveDate, now: f64) -> Result<(BTreeMap<String, Va
         .db
         .q(
             "SELECT task_id, at FROM task_states WHERE status = 'done' AND failed = 0 AND at >= ? AND at < ? \
-             AND task_id NOT IN (SELECT id FROM tasks WHERE owner_answer IN ('cant_do', 'not_needed')) ORDER BY at, id",
+             AND task_id NOT IN (SELECT id FROM tasks WHERE owner_answer IN ('cant_do', 'not_needed', 'board_agent', 'board_answered')) ORDER BY at, id",
             p![iso(from), iso(to)],
         )?
         .iter()
@@ -750,6 +752,7 @@ pub fn page(app: &App, date: Option<&str>, hide: Option<&str>) -> Result<Value> 
         "first_weekday": weekday_key(app.cfg.first_weekday),
         "usual": usual,
         "oldest": oldest(app)?.map(date_str),
+        "estimates": crate::accuracy::window(app, start_of(date - Duration::days(ESTIMATE_DAYS - 1)), bounds(date).1.min(now), &hide.iter().cloned().collect::<Vec<_>>())?,
         "planning": crate::quality::recent(app, date)?.into_iter().filter(|v| !hide.contains(v["project"].as_str().unwrap_or(""))).collect::<Vec<_>>(),
     }))
 }
@@ -977,13 +980,15 @@ pub fn cleanup(app: &App) -> Result<Value> {
     Ok(json!({"removed": {"events": events, "status_changes": states, "terminal_lines": lines, "day_rows": days}, "history": history(app)?}))
 }
 
-/// Once a day, after 3 AM local time, clean up. First, on start, earlier moves carry their history.
+/// Once a day, after 3 AM local time, clean up and check a dev build against main (`dev_behind`). First,
+/// on start, earlier moves carry their history and a dev build is checked.
 pub fn cleanup_loop(app: std::sync::Arc<App>) {
     match crate::reproject::carry_earlier_moves(&app) {
         Ok(0) => {}
         Ok(n) => app.info(format!("history: {n} moved tasks' merges and days now count under their project")),
         Err(e) => app.info(format!("history: carrying moved tasks' history failed: {}", e.message)),
     }
+    crate::dev_behind::check(&app);
     while !app.stopping() {
         let now = local_now();
         let last = app.db.get_setting(LAST_CLEANUP_KEY).ok().flatten().and_then(|s| parse_iso(&s)).map(|t| local_dt(t).date_naive());
@@ -991,6 +996,7 @@ pub fn cleanup_loop(app: std::sync::Arc<App>) {
             if let Err(e) = cleanup(&app) {
                 app.info(format!("history cleanup failed: {}", e.message));
             }
+            crate::dev_behind::check(&app);
         }
         app.sleep(30.0 * 60.0);
     }

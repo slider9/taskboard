@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use parking_lot::{Mutex, ReentrantMutex, ReentrantMutexGuard};
+use parking_lot::{Condvar, Mutex, ReentrantMutex, ReentrantMutexGuard};
 use rusqlite::types::ValueRef;
 use rusqlite::{params_from_iter, Connection};
 use serde_json::{Number, Value};
@@ -49,6 +49,7 @@ CREATE INDEX IF NOT EXISTS tasks_goal ON tasks(goal_id);
 CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY, task_id INT, at TEXT, who TEXT, kind TEXT, text TEXT, data TEXT);
 CREATE INDEX IF NOT EXISTS events_task ON events(task_id);
+CREATE INDEX IF NOT EXISTS events_kind ON events(kind);
 
 CREATE TABLE IF NOT EXISTS goals(
   id INTEGER PRIMARY KEY, name TEXT, outcome TEXT, tldr TEXT, project TEXT, repo_path TEXT,
@@ -321,6 +322,9 @@ const ADDED: &[(&str, &str, &str)] = &[
     ("issues", "holds_pr", "INT"),
     // 1 while a `pr` item waits for the owner to approve or reject it (`[backlog] critical = "ask"`).
     ("issues", "asks_owner", "INT DEFAULT 0"),
+    // 1 for a miss on a goal's done-when that needs the owner's call (`tb found --misses-goal --needs-owner`):
+    // it stays on Needs you instead of going to an agent (`misses.rs`).
+    ("issues", "needs_owner", "INT DEFAULT 0"),
     // The model the task's terminal starts with (`tb task new --model`, `[models]`): `small`, `large`
     // or a model name; null for `[models] default`.
     ("tasks", "model", "TEXT"),
@@ -362,6 +366,12 @@ const ADDED: &[(&str, &str, &str)] = &[
     // A failed wave the owner let the goal go on past: who, when and the tasks that had failed
     // (JSON `{"by", "at", "tasks"}`, `waves::release`).
     ("goal_waves", "passed_failed", "TEXT"),
+    // The agent's estimate of its working time in minutes, and when it was made (`estimate.rs`): a
+    // goal's is of its running time. Null on work made before estimates; kept once work starts.
+    ("tasks", "est_min", "INT"),
+    ("tasks", "est_at", "TEXT"),
+    ("goals", "est_min", "INT"),
+    ("goals", "est_at", "TEXT"),
 ];
 
 fn add_columns(conn: &Connection, added: &[(&str, &str, &str)]) -> rusqlite::Result<()> {
@@ -394,20 +404,75 @@ const LOGGED_ROWS: usize = 256;
 /// one: in WAL mode it sees the last commit while the writer works.
 struct Readers {
     path: PathBuf,
-    idle: Mutex<Vec<Connection>>,
+    pool: Mutex<Pool>,
+    /// Signalled when a reader comes back to the pool.
+    back: Condvar,
     /// Kept apart from the pool: its `data_version` only compares with its own earlier answers.
     marker: Mutex<Option<Connection>>,
 }
 
-/// How many idle readers to keep; a burst past it opens more and closes them after.
-const IDLE_READERS: usize = 8;
+#[derive(Default)]
+struct Pool {
+    idle: Vec<Connection>,
+    /// Readers open, idle or lent.
+    open: usize,
+}
+
+/// How many readers may be open at once. Each keeps its own page cache and file mapping, and every
+/// request runs on a blocking thread of its own, so a burst of requests used to open a reader each;
+/// past this many a read waits for one to come back.
+const READERS: usize = 8;
+
+/// A pooled reader, back in the pool when dropped, even by a read that panicked.
+struct Lent<'a> {
+    readers: &'a Readers,
+    conn: Option<Connection>,
+}
+
+impl std::ops::Deref for Lent<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("lent until dropped")
+    }
+}
+
+impl Drop for Lent<'_> {
+    fn drop(&mut self) {
+        if let Some(c) = self.conn.take() {
+            self.readers.pool.lock().idle.push(c);
+            self.readers.back.notify_one();
+        }
+    }
+}
 
 impl Readers {
-    fn take(&self) -> Result<Connection> {
-        if let Some(c) = self.idle.lock().pop() {
-            return Ok(c);
+    fn new(path: PathBuf) -> Readers {
+        Readers { path, pool: Mutex::new(Pool::default()), back: Condvar::new(), marker: Mutex::new(None) }
+    }
+
+    fn take(&self, what: &str) -> Result<Lent<'_>> {
+        let asked = Instant::now();
+        let mut pool = self.pool.lock();
+        loop {
+            if let Some(c) = pool.idle.pop() {
+                drop(pool);
+                crate::slowlog::db_wait(asked.elapsed(), what);
+                return Ok(Lent { readers: self, conn: Some(c) });
+            }
+            if pool.open < READERS {
+                pool.open += 1;
+                drop(pool);
+                return match self.open() {
+                    Ok(c) => Ok(Lent { readers: self, conn: Some(c) }),
+                    Err(e) => {
+                        self.pool.lock().open -= 1;
+                        self.back.notify_one();
+                        Err(e)
+                    }
+                };
+            }
+            self.back.wait(&mut pool);
         }
-        self.open()
     }
 
     fn open(&self) -> Result<Connection> {
@@ -427,13 +492,6 @@ impl Readers {
         }
         let c = marker.as_ref().expect("opened above");
         Ok(c.query_row("PRAGMA data_version", [], |r| r.get(0))?)
-    }
-
-    fn give_back(&self, c: Connection) {
-        let mut idle = self.idle.lock();
-        if idle.len() < IDLE_READERS {
-            idle.push(c);
-        }
     }
 }
 
@@ -505,12 +563,15 @@ impl Db {
         conn.execute_batch(crate::devices::SCHEMA)?;
         add_columns(&conn, crate::devices::ADDED)?;
         conn.execute_batch(crate::bits::SCHEMA)?;
+        conn.execute_batch(crate::leftovers::SCHEMA)?;
+        add_columns(&conn, crate::leftovers::ADDED)?;
         conn.execute_batch(crate::lessons::SCHEMA)?;
         conn.execute_batch(crate::ideas::SCHEMA)?;
         conn.execute_batch(crate::plan_review::SCHEMA)?;
         add_columns(&conn, crate::plan_review_again::ADDED)?;
         add_columns(&conn, crate::ideas::ADDED)?;
         add_columns(&conn, crate::scheduled::ADDED)?;
+        add_columns(&conn, crate::wait_until::ADDED)?;
         conn.execute_batch(crate::releases::SCHEMA)?;
         add_columns(&conn, crate::releases::ADDED)?;
         add_columns(&conn, crate::release_run::ADDED)?;
@@ -524,6 +585,7 @@ impl Db {
         add_columns(&conn, crate::breaks::ADDED)?;
         add_columns(&conn, crate::lines::ADDED)?;
         add_columns(&conn, crate::lost_done::ADDED)?;
+        add_columns(&conn, crate::needs_retry::ADDED)?;
         add_columns(&conn, crate::qa::ADDED)?;
         add_columns(&conn, crate::tidy::ADDED)?;
         conn.execute_batch(crate::lines::SCHEMA)?;
@@ -541,12 +603,13 @@ impl Db {
         conn.execute_batch(crate::samepr::SCHEMA)?;
         conn.execute_batch(crate::start_grants::SCHEMA)?;
         add_columns(&conn, crate::start_grants::ADDED)?;
+        conn.execute_batch(crate::task_grants::SCHEMA)?;
         let changed: Arc<Mutex<Vec<(String, i64)>>> = Default::default();
         let hooked = changed.clone();
         conn.update_hook(Some(move |_, _: &str, table: &str, rowid: i64| hooked.lock().push((table.to_string(), rowid))));
         Ok(Db {
             inner: ReentrantMutex::new(Inner { counted: Cell::new(conn.total_changes()), conn: RefCell::new(conn), depth: Cell::new(0), changed }),
-            readers: path.map(|path| Readers { path, idle: Mutex::new(vec![]), marker: Mutex::new(None) }),
+            readers: path.map(Readers::new),
             writes: AtomicI64::new(0),
             log: Mutex::new(VecDeque::new()),
             reads: AtomicU64::new(0),
@@ -575,10 +638,8 @@ impl Db {
         self.reads.fetch_add(1, Ordering::Relaxed);
         match &self.readers {
             Some(readers) if !self.held_here() => {
-                let c = readers.take()?;
-                let out = f(&c);
-                readers.give_back(c);
-                out
+                let c = readers.take(what)?;
+                f(&c)
             }
             _ => {
                 let g = self.lock(what);
@@ -862,6 +923,44 @@ mod tests {
         assert_eq!(rows.iter().filter(|r| *r == &("tasks".to_string(), id)).count(), 2);
         assert_eq!(db.changed_since(db.mark().unwrap().0), Some(vec![]));
         assert_eq!(db.changed_since(since - 1), None);
+    }
+
+    #[test]
+    fn a_burst_of_reads_opens_no_more_than_the_pool_s_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(Db::open(&dir.path().join("board.db")).unwrap());
+        let readers = db.readers.as_ref().unwrap();
+        let held: Vec<_> = (0..READERS).map(|_| readers.take("held").unwrap()).collect();
+        let (done, got) = std::sync::mpsc::channel();
+        let d = db.clone();
+        let late = std::thread::spawn(move || done.send(d.count("SELECT 1", p![]).unwrap()).unwrap());
+        assert!(got.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "a read past the cap waits");
+        drop(held);
+        assert_eq!(got.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), 1);
+        late.join().unwrap();
+
+        let threads: Vec<_> = (0..READERS * 4)
+            .map(|_| {
+                let d = db.clone();
+                std::thread::spawn(move || (0..20).for_each(|_| assert_eq!(d.count("SELECT 1", p![]).unwrap(), 1)))
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+        let pool = readers.pool.lock();
+        assert_eq!((pool.open, pool.idle.len()), (READERS, READERS));
+    }
+
+    #[test]
+    fn a_read_that_panics_gives_its_reader_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("board.db")).unwrap();
+        for _ in 0..READERS + 1 {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.read("boom", |_| -> Result<()> { panic!("boom") })));
+            assert!(r.is_err());
+        }
+        assert_eq!(db.count("SELECT 1", p![]).unwrap(), 1);
+        let pool = db.readers.as_ref().unwrap().pool.lock();
+        assert_eq!((pool.open, pool.idle.len()), (1, 1));
     }
 
     #[test]

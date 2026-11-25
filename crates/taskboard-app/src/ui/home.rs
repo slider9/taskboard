@@ -21,9 +21,10 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 mod groups;
+pub mod handled;
 mod view;
 
-pub use view::{State, render};
+pub use view::{State, drafts, render, restore_drafts};
 
 const PAGE_X: f32 = 36.;
 const PROJECT_FILTER: &str = "home-project";
@@ -240,6 +241,10 @@ pub fn short_ago(iso: &str) -> String {
 
 /// The alert's text less the "T12: " its task's ref already says.
 fn ask_text(a: &Value, card: &Value) -> String {
+    // A task that parked itself and missed its time: the time here, its plan on the line under it.
+    if let Some((_, lead, _)) = crate::ui::status::wait_line(card).filter(|w| w.0 == crate::ui::status::St::Needs) {
+        return lead;
+    }
     if let Some(q) = opt_s(card, "question").filter(|_| s(card, "status") == "needs") {
         return q.to_string();
     }
@@ -343,7 +348,7 @@ pub fn ask_vm(a: &Value) -> Ask {
         Some(_) if !answer => detail.unwrap_or(s(a, "text")).to_string(),
         _ => ask_text(a, card),
     };
-    let pr_open = obj(card, "pr").is_some_and(|p| !p["num"].is_null() && crate::ui::goal::pr_open(p));
+    let pr_open = obj(card, "pr").is_some_and(|p| !p["num"].is_null() && crate::ui::goal::pr_waiting(p));
     let (asks, picker) = if answer { asks_of(card) } else { (Vec::new(), false) };
     let missed = miss.as_ref().and_then(|_| missed_of(s(a, "text")));
     let title = if let Some(t) = own_title.or(missed) {
@@ -372,6 +377,8 @@ pub fn ask_vm(a: &Value) -> Ask {
             tile_vm(card).line
         } else if let Some(d) = detail {
             d.to_string()
+        } else if let Some((_, _, plan)) = crate::ui::status::wait_line(card).filter(|w| w.0 == crate::ui::status::St::Needs) {
+            plan
         } else if title == text || missed.is_some() {
             String::new()
         } else {
@@ -603,8 +610,9 @@ pub fn tile_vm(c: &Value) -> Tile {
         "queued" if c["compacting"].is_string() => ("Compacting", "working", fmt::compacting(c).unwrap_or_default()),
         "queued" if b(c, "starting") =>("Starting", "working", opt_s(c, "waiting").unwrap_or("Opening a terminal").to_string()),
         "queued" => ("Queued", "queued", opt_s(c, "waiting").unwrap_or("When a terminal is free").to_string()),
-        // A merged or closed PR has nothing left to wait on: the task is plain Done.
-        "done" if pr.is_some_and(crate::ui::goal::pr_open) => {
+        // A merged or closed PR has nothing left to wait on: the task is plain Done. One merged
+        // while its checks still run waits on them first.
+        "done" if pr.is_some_and(crate::ui::goal::pr_waiting) => {
             let p = pr.unwrap_or(&Value::Null);
             let stage = obj(p, "stage");
             let label = stage.map(|st| s(st, "label")).filter(|l| !l.is_empty());
@@ -620,6 +628,7 @@ pub fn tile_vm(c: &Value) -> Tile {
                     "checks" => ("Checks running", "goal", with(label)),
                     "fix" => ("Checks failed", "down", with(label)),
                     "rebase" => ("Conflicts", "down", with(label)),
+                    "landing" => ("Merged, checks running", "goal", with(label)),
                     "comments" => ("Comments", "goal", num.clone()),
                     // The board ran out of tries to merge it: the owner's Merge anyway is what's left.
                     "merge" if stage.is_some_and(|st| b(st, "gave_up")) => ("Needs you", "needs", format!("{num} · couldn't merge")),
@@ -661,7 +670,7 @@ fn sent(m: &mut MainWindow, text: String, cx: &mut Context<MainWindow>) {
 
 /// With the board down, what would change it waits until it answers.
 fn paused(m: &MainWindow) -> bool {
-    m.down.is_some()
+    m.paused()
 }
 
 pub fn run_act(m: &mut MainWindow, act: &Act, cx: &mut Context<MainWindow>) {
@@ -1054,6 +1063,17 @@ mod tests {
         assert_eq!(gone.act, Some(Act::AskAgain("T5".into())));
         assert_eq!(gone.act.as_ref().map(Act::label), Some("Open new terminal"));
         assert_eq!(ask_vm(&q(true)).act, Some(Act::Focus("T5".into())));
+    }
+
+    #[test]
+    fn a_task_that_missed_its_resume_time_says_so_with_its_plan_under_it() {
+        let _clock = crate::parity::freeze("2026-11-23T19:00:00Z");
+        let a = json!({"id": "a1", "at": "2026-11-23T18:45:00Z", "text": "T5: T5 was due back at 6:30 PM and hasn't resumed.", "task": "T5",
+            "card": card(json!({"ref": "T5", "status": "needs", "needs_reason": "wait_overdue", "question": "T5 was due back at 6:30 PM and hasn't resumed.",
+                                "terminal_open": true, "wait_missed": {"at": "2026-11-23T18:30:00Z", "plan": "Read the nightly build"}}))});
+        let ask = ask_vm(&a);
+        assert_eq!((ask.text.as_str(), ask.line.as_str()), ("Didn’t resume at 6:30 PM", "Read the nightly build"));
+        assert_eq!(ask.act, Some(Act::Focus("T5".into())));
     }
 
     #[test]

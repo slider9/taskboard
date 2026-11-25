@@ -26,6 +26,10 @@ enum Cmd {
         /// Run the runner (start terminals, send messages) even on a non-default data folder
         #[arg(long)]
         runner: bool,
+        /// Stop once this process exits. Without it, a daemon launchd didn't start still stops when its
+        /// data folder is deleted, and, on a folder other than the default one, when its parent exits.
+        #[arg(long, value_name = "PID")]
+        exit_with: Option<u32>,
     },
     /// Write a starting config.toml (if there's none) and print where things live
     Init,
@@ -105,7 +109,9 @@ fn widen_path() {
     }
 }
 
-fn serve(cfg: Config) -> i32 {
+fn serve(cfg: Config, exit_with: Option<u32>) -> i32 {
+    // Read before anything else runs: how this process was started decides whether it's a throwaway.
+    let launch = taskboardd::throwaway::Launch::current();
     widen_path();
     let addr: SocketAddr = match format!("{}:{}", cfg.host, cfg.port).parse() {
         Ok(a) => a,
@@ -199,10 +205,23 @@ fn serve(cfg: Config) -> i32 {
             }
             Err(e) => app.info(format!("can't listen on {}: {e}; the app's Start and review stops won't work", socket.display())),
         }
+        let watch = taskboardd::throwaway::Watch::new(&app.cfg.data, app.cfg.data == config::default_data_dir(), &launch, exit_with);
+        if let Some(w) = &watch {
+            app.info(format!("not started by launchd: stopping on its own when {}", describe(w)));
+        }
         let stop = app.clone();
         let shutdown = async move {
-            let why = stop_signal().await;
-            taskboardd::runmark::stopping(&stop, why);
+            let gone = async move {
+                match watch {
+                    Some(w) => w.wait().await,
+                    None => std::future::pending().await,
+                }
+            };
+            let why = tokio::select! {
+                why = stop_signal() => why.to_string(),
+                why = gone => format!("a throwaway board: {why}"),
+            };
+            taskboardd::runmark::stopping(&stop, &why);
             stop.stop();
         };
         let served = axum::serve(listener, router).with_graceful_shutdown(shutdown).await;
@@ -245,6 +264,20 @@ async fn stop_signal() -> &'static str {
         _ = close.recv() => "its console closed",
         Ok(()) = asked => "asked to stop by its supervisor (the app restarting or updating the daemon, an install or an uninstall)",
     }
+}
+
+fn describe(w: &taskboardd::throwaway::Watch) -> String {
+    let mut when = vec![];
+    if let Some(d) = &w.data {
+        when.push(format!("{} is deleted", d.display()));
+    }
+    if let Some(p) = w.parent {
+        when.push(format!("its parent ({p}) exits"));
+    }
+    if let Some(p) = w.exit_with {
+        when.push(format!("process {p} exits"));
+    }
+    when.join(", or when ")
 }
 
 fn init() -> i32 {
@@ -312,8 +345,8 @@ fn launchd(label: &str) -> i32 {
 
 fn main() {
     let cli = Cli::parse();
-    let code = match cli.cmd.unwrap_or(Cmd::Serve { data: None, port: None, runner: false }) {
-        Cmd::Serve { data, port, runner } => serve(load(data, port, runner)),
+    let code = match cli.cmd.unwrap_or(Cmd::Serve { data: None, port: None, runner: false, exit_with: None }) {
+        Cmd::Serve { data, port, runner, exit_with } => serve(load(data, port, runner), exit_with),
         Cmd::Init => init(),
         Cmd::Seed { data, reviews } => {
             let mut cfg = load(Some(data), None, false);

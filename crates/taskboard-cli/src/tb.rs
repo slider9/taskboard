@@ -65,6 +65,14 @@ enum Cmd {
         #[command(flatten)]
         t: TaskArg,
     },
+    /// Record this task's estimate of its agent working time, for one made without one
+    Estimate {
+        /// How long the work will take you, like 45m, 3h or 1h30m: an honest guess of working time, not
+        /// counting time waiting on the owner. The board compares it with the time actually spent working
+        len: String,
+        #[command(flatten)]
+        t: TaskArg,
+    },
     /// Report a problem outside the task to the backlog
     Found {
         /// A short summary, 80 characters at most
@@ -78,9 +86,12 @@ enum Cmd {
         /// The error text or other output
         #[arg(long)]
         output: Option<String>,
-        /// It misses the goal's own done-when (same as --blocks goal): it goes to the owner as an alert, and the goal stays open until the miss is made into a task that's done, sent to Jira or closed
+        /// It misses the goal's own done-when (same as --blocks goal): the board makes it a task in the goal for an agent to fix (with --needs-owner, it goes to the owner as an alert instead), and the goal stays open until the miss is made into a task that's done, sent to Jira or closed
         #[arg(long)]
         misses_goal: bool,
+        /// With --misses-goal: settling it needs the owner's call (a decision, an account, a device only they have), so it goes to them rather than to an agent
+        #[arg(long)]
+        needs_owner: bool,
         /// Whether it blocks: pr (merging this task's PR leaves main worse: a crash, data lost, a usable hole, something that works today stops), goal (the goal's done-when isn't met without it) or none. Required while the task's PR is open
         #[arg(long, value_parser = ["none", "pr", "goal"])]
         blocks: Option<String>,
@@ -245,13 +256,24 @@ enum Cmd {
         #[command(flatten)]
         t: TaskArg,
     },
+    /// Park this working task until a set time (6:30am, 06:30 UTC, tomorrow 9am, in 40m), or `none`. Set something to wake this conversation then
+    WaitUntil {
+        /// When it resumes
+        #[arg(required = true, num_args = 1..)]
+        at: Vec<String>,
+        /// What it does when it resumes
+        #[arg(long)]
+        then: Option<String>,
+        #[command(flatten)]
+        t: TaskArg,
+    },
     /// Propose tasks for a goal: --task "title::what to do". Planned, or queued while the goal is running
     Propose {
         goal: String,
         /// A planned task: "title::detail", "title::detail::<wave>", "title::detail::<wave or nothing>::<T14 #1, the tasks it waits for>"
         /// or with "::<src/a.rs, src/b.rs>" after the waits, the files the wave plans for it (its wave mates are told);
-        /// end any of them with "::model=small" (small, large or a model name) for the model its terminal runs, "::effort=high" (low, medium, high, xhigh or max) for its effort and/or "::project=api" to put it in another project than the goal's
-        #[arg(long = "task", value_name = "TITLE::DETAIL[::WAVE][::WAITS][::FILES][::model=M][::effort=E][::project=P]")]
+        /// end each with "::est=45m", your estimate of its agent working time (required), and any of them with "::model=small" (small, large or a model name) for the model its terminal runs, "::effort=high" (low, medium, high, xhigh or max) for its effort and/or "::project=api" to put it in another project than the goal's
+        #[arg(long = "task", value_name = "TITLE::DETAIL[::WAVE][::WAITS][::FILES]::est=LEN[::model=M][::effort=E][::project=P]")]
         tasks: Vec<String>,
         /// Planned even while the goal is running, so they wait for its next run
         #[arg(long)]
@@ -460,6 +482,14 @@ enum Cmd {
         #[arg(long)]
         accept: bool,
     },
+    /// How past estimates compared with the actual working time: the bias overall, by project and by size,
+    /// the biggest recent misses, and the typical working time of finished tasks. Run it before giving
+    /// anyone a length of time
+    Estimates {
+        /// One project's (every project's when left out)
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// How well goals were planned: tasks added late, failed or retried, review rounds that found something to fix, questions and time against the estimate, by month
     Quality {
         /// The project (this terminal's when left out)
@@ -641,7 +671,8 @@ enum Cmd {
     },
     /// Show or change the context limits: the compact window, when a cold conversation is compacted,
     /// how big and how fresh a conversation must be to resume, how many compactions a task terminal
-    /// takes before it carries on in a fresh one, and the generated-file globs
+    /// takes before it carries on in a fresh one, how long an idle task terminal stays open, and the
+    /// generated-file globs
     Limits {
         /// Tokens at which Claude compacts a board terminal's conversation, e.g. 150000 or 150k (0 = off; at least 50k)
         #[arg(long = "compact-window")]
@@ -658,6 +689,9 @@ enum Cmd {
         /// A task terminal that has compacted this many times carries on in a fresh terminal from its handoff (0 = off)
         #[arg(long = "max-compactions")]
         max_compactions: Option<i64>,
+        /// A task terminal the board opened that sits idle this many minutes saves a checkpoint and closes; the task carries on in a new terminal when the board has something for it (0 = off)
+        #[arg(long = "idle-close-mins")]
+        idle_close_mins: Option<i64>,
         /// Generated-file globs kept as `-diff` in .git/info/attributes, comma-separated (none clears them)
         #[arg(long)]
         generated: Option<String>,
@@ -1040,6 +1074,14 @@ enum StartGrantCmd {
 }
 
 #[derive(Subcommand)]
+enum GrantCmd {
+    /// A task's grants: each one's state and how often its rule let an action through
+    List { task: String },
+    /// Drop a grant (A3): terminals opened later don't get it, and live ones are asked again
+    Drop { id: String },
+}
+
+#[derive(Subcommand)]
 enum LessonCmd {
     /// Suggest a lesson for later work: planning (how to slice goals), code, process or tooling. It reaches
     /// handoffs (or planners, for planning) once the owner keeps it
@@ -1368,11 +1410,15 @@ enum StepCmd {
         #[command(flatten)]
         t: TaskArg,
     },
-    /// A step can't pass: the task waits for the owner's answer, so end your turn after
+    /// A step can't pass: the task waits for the owner's answer, so end your turn after. Refused when a
+    /// rule or lesson covers the step, unless --override
     Fail {
         name: String,
         #[arg(long)]
         why: String,
+        /// Fail it even though a rule or lesson covers the step; say in --why why that rule doesn't fit
+        #[arg(long = "override")]
+        override_rule: bool,
         #[command(flatten)]
         t: TaskArg,
     },
@@ -1453,9 +1499,13 @@ enum GoalCmd {
         after: Vec<String>,
         /// A planned task: "title::detail", "title::detail::<wave>", "title::detail::<wave or nothing>::<T14 #1, the tasks it waits for>"
         /// or with "::<src/a.rs, src/b.rs>" after the waits, the files the wave plans for it (its wave mates are told);
-        /// end any of them with "::model=small" (small, large or a model name) for the model its terminal runs, "::effort=high" (low, medium, high, xhigh or max) for its effort and/or "::project=api" to put it in another project than the goal's
-        #[arg(long = "task", value_name = "TITLE::DETAIL[::WAVE][::WAITS][::FILES][::model=M][::effort=E][::project=P]")]
+        /// end each with "::est=45m", your estimate of its agent working time (required), and any of them with "::model=small" (small, large or a model name) for the model its terminal runs, "::effort=high" (low, medium, high, xhigh or max) for its effort and/or "::project=api" to put it in another project than the goal's
+        #[arg(long = "task", value_name = "TITLE::DETAIL[::WAVE][::WAITS][::FILES]::est=LEN[::model=M][::effort=E][::project=P]")]
         tasks: Vec<String>,
+        /// Your estimate of the goal's running time (3h, 1d): from its first task starting to its last one
+        /// finishing, counting only time a task is working. Required; the board compares it with the actual
+        #[arg(long, value_name = "LEN")]
+        est: Option<String>,
         /// One of its project's areas (`.taskboard.toml` at the repo's root), any case
         #[arg(long, value_name = "NAME")]
         area: Option<String>,
@@ -1478,6 +1528,10 @@ enum GoalCmd {
     /// Change a goal
     Set {
         goal: String,
+        /// Its estimate of the goal's running time (3h, 1d): only while none of its tasks has started, or
+        /// its first one; once work starts the first estimate is kept
+        #[arg(long, value_name = "LEN")]
+        est: Option<String>,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
@@ -1710,11 +1764,17 @@ enum TaskCmd {
         /// The effort its terminal runs at: low, medium, high, xhigh or max; its model's tier's (`[models]`) when left out
         #[arg(long, value_name = "low|medium|high|xhigh|max")]
         effort: Option<String>,
+        /// Your estimate of the agent working time it takes, like 45m, 3h or 1h30m: an honest guess, not
+        /// counting time waiting on the owner. Required for agent work; the board compares it with the
+        /// time the task actually spends working
+        #[arg(long, value_name = "LEN", conflicts_with = "human")]
+        est: Option<String>,
         /// It's work only the owner can do (make an account, sign something): shown as H<n>, no terminal
         /// starts on it, --detail holds the steps and links, and the owner presses Done in the app (or tells
         /// an agent to: tb needs done H<n>).
         /// Tasks that wait for it (--waits-for H<n>, or later in its goal) go on after that, with the
-        /// owner's note in their prompt
+        /// owner's note in their prompt. Never a trial run (use or try something for a week and report
+        /// back): the board refuses one
         #[arg(long, conflicts_with_all = ["here", "pr", "stack_on", "same_pr", "model", "effort", "lock", "alone", "kind"], requires = "detail")]
         human: bool,
         /// design: its work is a design (concepts, a canvas, mockups). It ends without a PR once its design
@@ -1725,10 +1785,24 @@ enum TaskCmd {
         /// Only when the open backlog items whose titles look like it name different work: the board refuses it otherwise and says which item to take
         #[arg(long = "not-backlog", conflicts_with = "issue")]
         not_backlog: bool,
+        /// A Midna permission its terminals get once the owner confirms it: <kind>:<pattern>, kind one of
+        /// command, tool, path, cli, window, e.g. 'tool:mcp__slack__chat_post*'. Repeat for more. The board
+        /// asks the owner in a notification; until they tap Grant it does nothing
+        #[arg(long, value_name = "KIND:PATTERN")]
+        allow: Vec<String>,
     },
     /// Change a task
     Set {
         task: String,
+        /// A Midna permission its terminals get once the owner confirms it: <kind>:<pattern>, kind one of
+        /// command, tool, path, cli, window, e.g. 'tool:mcp__slack__chat_post*'. Repeat for more. The board
+        /// asks the owner in a notification; until they tap Grant it does nothing
+        #[arg(long, value_name = "KIND:PATTERN")]
+        allow: Vec<String>,
+        /// Its estimate of the agent working time (45m, 3h, 1h30m): only while it hasn't started, or its
+        /// first one; once work starts the first estimate is kept
+        #[arg(long, value_name = "LEN")]
+        est: Option<String>,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
@@ -1828,6 +1902,11 @@ enum TaskCmd {
     },
     /// Delete a task with its log (only when the owner asks)
     Delete { task: String },
+    /// A task's Midna permission grants (add them with tb task set T5 --allow '<kind>:<pattern>')
+    Grant {
+        #[command(subcommand)]
+        action: GrantCmd,
+    },
     /// A task: its title, status, goal, PR, detail and latest log entries
     Show {
         task: String,
@@ -2223,12 +2302,16 @@ enum PrCmd {
         #[arg(long = "override")]
         force: bool,
     },
-    /// Close it without merging (Bitbucket: decline), keeping its branch: only on the owner's word
+    /// Close it without merging (Bitbucket: decline), keeping its branch: only on the owner's word. Says where its work went, on the PR as a comment
+    #[command(group(clap::ArgGroup::new("why").required(true).multiple(true).args(["reason", "superseded_by"])))]
     Close {
         task: Option<String>,
-        /// Why, posted on the PR as a comment
+        /// Why it's closed
         #[arg(long)]
         reason: Option<String>,
+        /// The PR (#12 or its link) or commit that replaced it
+        #[arg(long, value_name = "PR_OR_COMMIT")]
+        superseded_by: Option<String>,
     },
     /// Record the owner's review, so reviewers can be asked: only the owner, or an agent on their word (a no-op when owner review is off)
     Reviewed { task: Option<String> },
@@ -2432,6 +2515,9 @@ fn print_pr_status(t: &str, v: &Value) {
         out(&w);
     }
     out(&format!("State: {} · checks: {} · review: {}", pr["state"].as_str().unwrap_or("?"), pr["checks"].as_str().unwrap_or("unknown"), review_words(pr)));
+    if let Some(l) = pr["closed"]["line"].as_str() {
+        out(l);
+    }
     if let Some(e) = live["read_error"].as_str() {
         out(&format!("Couldn't read it just now ({e}); this is the last read."));
     }
@@ -3261,6 +3347,24 @@ fn short_task_titles(tasks: &[String]) -> Result<(), String> {
 }
 
 /// `midna` arguments that pin `r` (T42 or G3), or None outside a Midna terminal or for another ref.
+/// Checks each `--allow` as the board will, before anything changes.
+fn allow_args(allow: &[String]) -> Result<(), String> {
+    for a in allow {
+        taskboardd::task_grants::parse(a)?;
+    }
+    Ok(())
+}
+
+/// Adds task `r`'s `--allow` grants: from a terminal, the board asks the owner to confirm them.
+fn grant_new(c: &Ctx, r: &str, allow: &[String]) -> Result<(), String> {
+    if allow.is_empty() {
+        return Ok(());
+    }
+    let v = c.call("POST", &format!("/tasks/{r}/grants"), Some(json!({"allow": allow, "via_session": c.session})))?;
+    out(v["line"].as_str().unwrap_or(""));
+    Ok(())
+}
+
 fn midna_pin_args(session: Option<&str>, r: &str, title: &str) -> Option<Vec<String>> {
     session.filter(|s| !s.is_empty())?;
     let kind = match r.chars().next()? {
@@ -3422,6 +3526,14 @@ fn print_warnings(v: &Value) {
     }
 }
 
+/// How past estimates turned out (`accuracy::summary`), under a reply that made new ones.
+fn print_estimates(v: &Value) {
+    let lines: Vec<&str> = v["estimates"].as_array().into_iter().flatten().filter_map(|l| l.as_str()).filter(|l| !l.is_empty()).collect();
+    if !lines.is_empty() {
+        out(&format!("{} (tb estimates has more)", lines.join("\n")));
+    }
+}
+
 /// `--jira` on `tb task new`: a key links it, `new` asks for one, `none` means no ticket.
 fn jira_arg(v: &str) -> Value {
     match v.trim().to_lowercase().as_str() {
@@ -3477,6 +3589,10 @@ fn planning_cmd(c: &Ctx, project: Option<String>) -> Result<i32, String> {
     let lessons: Vec<&str> = v["lessons"].as_array().into_iter().flatten().filter_map(|l| l.as_str()).collect();
     if !lessons.is_empty() {
         out(&format!("\nWhat earlier goals taught about planning here:\n{}", lessons.join("\n")));
+    }
+    let est: Vec<&str> = v["estimates"].as_array().into_iter().flatten().filter_map(|l| l.as_str()).collect();
+    if !est.is_empty() {
+        out(&format!("\nHow past estimates turned out (estimate each task and goal with this in mind; tb estimates has more):\n{}", est.join("\n")));
     }
     Ok(0)
 }
@@ -4278,6 +4394,9 @@ fn task_show_lines(v: &Value, n: usize) -> Vec<String> {
     let mut lines = vec![show_head(v, status), v["title"].as_str().unwrap_or("").to_string()];
     if let Some(num) = v["pr"]["num"].as_i64() {
         lines.push(format!("PR: #{num} {} {}", v["pr"]["state"].as_str().unwrap_or(""), v["pr"]["url"].as_str().unwrap_or("")).trim_end().to_string());
+        if let Some(l) = v["pr"]["closed"]["line"].as_str() {
+            lines.push(l.to_string());
+        }
     }
     if let Some(w) = v["who"].as_str().filter(|w| !w.is_empty()) {
         lines.push(format!("Terminal: {w}"));
@@ -4293,6 +4412,9 @@ fn task_show_lines(v: &Value, n: usize) -> Vec<String> {
     }
     if let Some(b) = v["pr_base"].as_str().filter(|b| !b.is_empty()) {
         lines.push(format!("PR into: {b}"));
+    }
+    if let Some(e) = taskboardd::estimate::line(&v["estimate"]) {
+        lines.push(e);
     }
     for (label, key) in [("Detail", "detail"), ("Summary", "summary")] {
         let block = indented(label, v[key].as_str().unwrap_or(""));
@@ -5519,6 +5641,12 @@ fn goal_lines(g: &Value) -> Vec<String> {
     if let Some(o) = g["outcome"].as_str().filter(|o| !o.is_empty()) {
         lines.push(format!("Done when: {o}"));
     }
+    if let Some(mut e) = taskboardd::estimate::line(&g["estimate"]) {
+        if let Some(w) = g["estimate"]["work_min"].as_i64().filter(|w| *w > 0) {
+            e += &format!(" · Task work {}", taskboardd::estimate::len(w as f64));
+        }
+        lines.push(e);
+    }
     if g["paused"] == true {
         lines.push("Paused: nothing new starts.".into());
     }
@@ -6147,9 +6275,7 @@ fn step_cmd(c: &Ctx, action: StepCmd) -> Result<i32, String> {
             s
         }),
         StepCmd::Skip { name, why, t } => skip_step(c, &name, &why, t),
-        StepCmd::Fail { name, why, t } => c.run_report("tb.step_fail", json!({"name": name, "why": why}), t.task, true, |v| {
-            format!("Told {} that {} can't pass; the task waits for their answer. End your turn now.", c.cfg.owner, v["step"].as_str().unwrap_or("the step"))
-        }),
+        StepCmd::Fail { name, why, override_rule, t } => fail_step(c, &name, &why, override_rule, t),
     }
 }
 
@@ -6192,6 +6318,31 @@ fn done_step(c: &Ctx, name: &str, note: Option<String>, skip: bool, t: TaskArg, 
         f["result"] = json!(result);
     }
     step_report(c, f, t.task.or_else(|| v["task"].as_str().map(|s| s.to_string())))
+}
+
+/// `tb step fail`: the board screens it like a tb question (#1144), so it can take a while; when the
+/// owner's rules settle it, the agent gets the answer and carries on.
+/// A step a rule or lesson covers is refused with that rule unless `override_rule` (#1146).
+fn fail_step(c: &Ctx, name: &str, why: &str, override_rule: bool, t: TaskArg) -> Result<i32, String> {
+    let task = t.task.map(|x| task_ref(&x)).transpose()?;
+    let owner = &c.cfg.owner;
+    match c.report_progress("tb.step_fail", json!({"name": name, "why": why, "override": override_rule}), task.as_deref())? {
+        None => out(SAVED),
+        Some(v) if !v["task"].is_string() => out(NO_TASK),
+        Some(v) => out(&step_fail_text(&v, owner)),
+    }
+    Ok(0)
+}
+
+fn step_fail_text(v: &Value, owner: &str) -> String {
+    let step = v["step"].as_str().unwrap_or("the step");
+    match v["answer"].as_str() {
+        Some(a) => format!(
+            "Answered without asking {owner}, from {}:\n{a}\n\nCarry on with {step}. If this answer really doesn't fit, run tb step fail again and say why.",
+            v["source"].as_str().unwrap_or("the rules")
+        ),
+        None => format!("Told {owner} that {step} can't pass; the task waits for their answer. End your turn now."),
+    }
 }
 
 /// `tb step skip`: passes a skippable step on the aimed head (else this checkout's) without doing it.
@@ -6373,7 +6524,11 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
             // The latest round of each step that ran: its headline and findings, to triage.
             if let Ok(d) = c.call("GET", &format!("/tasks/{task}"), None) {
                 for r in d["step_results"].as_array().into_iter().flatten() {
-                    let moved = if r["stale"] == true { " (the branch has moved since)" } else { "" };
+                    let moved = match r["kept_from"].as_str() {
+                        _ if r["stale"] == true => " (the branch has moved since)".to_string(),
+                        Some(was) => format!(" (kept from {}: a clean rebase left the change as it was)", &was[..was.len().min(12)]),
+                        None => String::new(),
+                    };
                     out(&format!("{}: {}{moved}", r["name"].as_str().unwrap_or(""), r["headline"].as_str().unwrap_or("")));
                     for f in r["findings"].as_array().into_iter().flatten() {
                         let at = match (f["file"].as_str(), f["line"].as_i64()) {
@@ -6397,9 +6552,12 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
             let f = checkpoint_body(done, next, decisions, files)?;
             c.run_report("tb.checkpoint", f, t.task, true, |v| format!("Checkpoint saved on {}.", v["task"].as_str().unwrap_or("")))
         }
-        Cmd::Found { title, kind, detail, output, misses_goal, blocks, blocks_why, t } => c.run_report(
+        Cmd::Estimate { len, t } => c.run_report("tb.estimate", json!({"est": len}), t.task, true, |v| {
+            format!("Estimated {} for {}; the board compares it with the time actually spent working.", v["est"].as_str().unwrap_or(""), v["task"].as_str().unwrap_or(""))
+        }),
+        Cmd::Found { title, kind, detail, output, misses_goal, needs_owner, blocks, blocks_why, t } => c.run_report(
             "tb.found",
-            json!({"title": short_title(&title)?, "kind": kind, "detail": detail, "output": output.map(|o| o.chars().take(4000).collect::<String>()), "misses_goal": misses_goal, "blocks": blocks, "blocks_why": blocks_why}),
+            json!({"title": short_title(&title)?, "kind": kind, "detail": detail, "output": output.map(|o| o.chars().take(4000).collect::<String>()), "misses_goal": misses_goal, "needs_owner": needs_owner, "blocks": blocks, "blocks_why": blocks_why}),
             t.task,
             false,
             |v| {
@@ -6666,6 +6824,14 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                 }
             })
         }
+        Cmd::WaitUntil { at, then, t } => {
+            let at = at.join(" ");
+            let off = matches!(at.trim().to_lowercase().as_str(), "none" | "off" | "cancel" | "clear");
+            if !off && then.as_deref().is_none_or(|x| x.trim().is_empty()) {
+                return Err("say what it does when it resumes, for example: tb wait-until 06:30 UTC --then \"read the nightly build's result\"".into());
+            }
+            c.run_report("tb.wait_until", json!({"at": at, "then": then}), t.task, true, |v| v["context"].as_str().unwrap_or("Noted.").to_string())
+        }
         Cmd::Propose { goal, tasks, planned, not_backlog } => {
             let g = goal_ref(&goal)?;
             propose_tasks(&tasks)?;
@@ -6676,6 +6842,7 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                     out(&format!("Added {} to {g} ({}).", v["created"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default(),
                                  v["why"].as_str().unwrap_or("planned")));
                     print_warnings(&v);
+                    print_estimates(&v);
                     for (r, t) in v["created"].as_array().into_iter().flatten().filter_map(|x| x.as_str()).zip(&tasks) {
                         c.midna_pin(r, t.split_once("::").map_or(t.as_str(), |(t, _)| t));
                     }
@@ -6690,6 +6857,14 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
             _ => planning_lessons_cmd(c, project, accept),
         },
         Cmd::Quality { project, all, goals } => quality_cmd(c, project, all, goals),
+        Cmd::Estimates { project } => {
+            let q = project.map(|p| format!("?project={}", qv(&p))).unwrap_or_default();
+            let v = c.call("GET", &format!("/estimates{q}"), None)?;
+            for l in v["lines"].as_array().into_iter().flatten().filter_map(|l| l.as_str()) {
+                out(l);
+            }
+            Ok(0)
+        }
         Cmd::Review { target, since, week, save, list, file_again } => {
             if file_again {
                 return review_file_again(c, target.as_deref().unwrap_or(""));
@@ -6841,10 +7016,10 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
             Ok(0)
         }
         Cmd::Goal { action } => match action {
-            GoalCmd::New { name, outcome, tldr, project, product, after, tasks, area, base, not_backlog } => {
+            GoalCmd::New { name, outcome, tldr, project, product, after, tasks, area, base, not_backlog, est } => {
                 short_task_titles(&tasks)?;
                 let after = if after.is_empty() { Value::Null } else { json!(after) };
-                let body = json!({"name": name, "outcome": outcome, "tldr": tldr, "project": project, "product": product, "after": after, "tasks": tasks, "area": area, "pr_base": base, "not_backlog": not_backlog});
+                let body = json!({"name": name, "outcome": outcome, "tldr": tldr, "project": project, "product": product, "after": after, "tasks": tasks, "area": area, "pr_base": base, "not_backlog": not_backlog, "est": est});
                 match c.report("tb.goal", body, None, TB_TIMEOUT)? {
                     None => out(SAVED),
                     Some(v) => {
@@ -6859,6 +7034,7 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                             format!("#/goals/{}", v["goal"].as_str().unwrap_or(""))
                         ));
                         print_warnings(&v);
+                        print_estimates(&v);
                         c.midna_pin(v["goal"].as_str().unwrap_or(""), v["name"].as_str().unwrap_or(""));
                     }
                 }
@@ -6890,9 +7066,12 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                 }
                 Ok(0)
             }
-            GoalCmd::Set { goal, name, outcome, tldr, paused, in_order, max_terminals, epic, product, jira, worktrees, lane, base, run, deprioritize, prioritize, area, devices, after } => {
+            GoalCmd::Set { goal, name, outcome, tldr, paused, in_order, max_terminals, epic, product, jira, worktrees, lane, base, run, deprioritize, prioritize, area, devices, after, est } => {
                 let g = goal_ref(&goal)?;
                 let mut b = json!({});
+                if let Some(x) = est {
+                    b["est"] = json!(x);
+                }
                 if let Some(x) = name {
                     b["name"] = json!(x);
                 }
@@ -7146,7 +7325,11 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
             Ok(0)
         }
         Cmd::Task { action } => match action {
-            TaskCmd::New { title, issue, detail, goal, also, wave, files, project, planned, here, next, now, waits_for, lock, alone, lane, base, bring, jira, ticket_summary, ticket_text, devices, bits, stack_on, stack_merge, same_pr, pr, no_pr, area, model, effort, human, kind, not_backlog } => {
+            TaskCmd::New { title, issue, detail, goal, also, wave, files, project, planned, here, next, now, waits_for, lock, alone, lane, base, bring, jira, ticket_summary, ticket_text, devices, bits, stack_on, stack_merge, same_pr, pr, no_pr, area, model, effort, human, kind, not_backlog, est, allow } => {
+                allow_args(&allow)?;
+                if human && !allow.is_empty() {
+                    return Err("--allow is for a task a terminal works on; a human task has none".into());
+                }
                 if wave.is_some() && goal.is_none() {
                     return Err("--wave needs --goal: waves are a goal's".into());
                 }
@@ -7162,7 +7345,7 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                 let goal = goal.map(|g| goal_ref(&g)).transpose()?;
                 let also = also.iter().map(|g| goal_ref(g)).collect::<Result<Vec<_>, _>>()?;
                 let title = title.as_deref().map(short_title).transpose()?.unwrap_or_default();
-                let mut body = json!({"title": title, "detail": &detail, "goal": goal, "project": project, "planned": planned, "area": area, "not_backlog": not_backlog});
+                let mut body = json!({"title": title, "detail": &detail, "goal": goal, "project": project, "planned": planned, "area": area, "not_backlog": not_backlog, "est": est});
                 let linked = issue_refs(&issue)?;
                 match linked.as_slice() {
                     [] => {}
@@ -7251,12 +7434,15 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                 // which can run past TB_TIMEOUT, and says it's still screening every couple of seconds meanwhile.
                 match c.report_progress_or("tb.new_task", body, None, |e| new_task_unconfirmed(e, &title, human))? {
                     None if human => out(&human_task_saved(&title)),
+                    None if !allow.is_empty() => out(&format!("{SAVED} Its --allow grants weren't asked for: add them with tb task set <task> --allow once the board is back.")),
                     None => out(SAVED),
                     Some(v) if here => {
                         let r = v["created"][0].as_str().unwrap_or("").to_string();
                         out(v["context"].as_str().filter(|s| !s.trim().is_empty()).map(|s| s.to_string()).unwrap_or(format!("Added {r} and you're on it.")).as_str());
+                        print_estimates(&v);
                         unlinked_note(c, &r, detail.as_deref(), &linked);
                         c.midna_pin(&r, v["title"].as_str().unwrap_or(&title));
+                        grant_new(c, &r, &allow)?;
                         if lane.as_deref() == Some("slot") {
                             slot_claim(c, &r, bring, &[])?;
                         }
@@ -7270,16 +7456,22 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                         };
                         out(&format!("Added {r}{where_}. {}#/?task={r}", c.cfg.page_url));
                         print_warnings(&v);
+                        print_estimates(&v);
                         print_wait_line(&v);
                         unlinked_note(c, &r, detail.as_deref(), &linked);
                         c.midna_pin(&r, v["title"].as_str().unwrap_or(&title));
+                        grant_new(c, &r, &allow)?;
                     }
                 }
                 Ok(0)
             }
-            TaskCmd::Set { task, title, detail, goal, also, not_also, wave, priority, waits_for, lock, alone, lane, base, jira, ticket_summary, ticket_text, devices, bits, not_bits, stack_on, stack_merge, same_pr, pr, kind, status, merged_note, landed, pr_link, issue, area, model, effort, project } => {
+            TaskCmd::Set { task, title, detail, goal, also, not_also, wave, priority, waits_for, lock, alone, lane, base, jira, ticket_summary, ticket_text, devices, bits, not_bits, stack_on, stack_merge, same_pr, pr, kind, status, merged_note, landed, pr_link, issue, area, model, effort, project, est, allow } => {
                 let t = task_ref(&task)?;
+                allow_args(&allow)?;
                 let mut b = json!({});
+                if let Some(x) = est {
+                    b["est"] = json!(x);
+                }
                 if let Some(x) = title {
                     b["title"] = json!(short_title(&x)?);
                 }
@@ -7378,6 +7570,11 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                     b["project"] = json!(x);
                 }
                 if b.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+                    if !allow.is_empty() {
+                        let v = c.call("POST", &format!("/tasks/{t}/grants"), Some(json!({"allow": allow, "via_session": c.session})))?;
+                        out(v["line"].as_str().unwrap_or(""));
+                        return Ok(0);
+                    }
                     return Err("say what to change, for example: tb task set T12 --priority high".into());
                 }
                 let moving = b.get("project").is_some();
@@ -7415,6 +7612,15 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                 out(&format!("Changed {t} “{}”{bits}.", v["title"].as_str().unwrap_or("")));
                 print_warnings(&v);
                 unlinked_note(c, &t, detail.as_deref(), &linked);
+                grant_new(c, &t, &allow)?;
+                Ok(0)
+            }
+            TaskCmd::Grant { action } => {
+                let v = match action {
+                    GrantCmd::List { task } => c.call("GET", &format!("/tasks/{}/grants", task_ref(&task)?), None)?,
+                    GrantCmd::Drop { id } => c.call("POST", &format!("/grants/{id}/drop"), Some(json!({"via_session": c.session})))?,
+                };
+                out(v["line"].as_str().unwrap_or(""));
                 Ok(0)
             }
             TaskCmd::Delete { task } => {
@@ -7803,14 +8009,14 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
             out(v["line"].as_str().unwrap_or(""));
             Ok(0)
         }
-        Cmd::Limits { compact_window, cold_idle_mins, warm_tokens, warm_idle_mins, max_compactions, generated, project, review_gap, step, reset } => {
+        Cmd::Limits { compact_window, cold_idle_mins, warm_tokens, warm_idle_mins, max_compactions, idle_close_mins, generated, project, review_gap, step, reset } => {
             let mut b = json!({});
             for (k, v) in [("compact_window", compact_window), ("warm_tokens", warm_tokens)] {
                 if let Some(n) = v {
                     b[k] = json!(n);
                 }
             }
-            for (k, v) in [("cold_idle_mins", cold_idle_mins), ("warm_idle_mins", warm_idle_mins), ("max_compactions", max_compactions)] {
+            for (k, v) in [("cold_idle_mins", cold_idle_mins), ("warm_idle_mins", warm_idle_mins), ("max_compactions", max_compactions), ("idle_close_mins", idle_close_mins)] {
                 if let Some(n) = v {
                     b[k] = json!(n);
                 }
@@ -7941,10 +8147,12 @@ fn run_cmd(c: &Ctx, cmd: Cmd) -> Result<i32, String> {
                 out(&format!("Merged {t}'s PR and deleted its branch. You can stop here."));
                 Ok(0)
             }
-            PrCmd::Close { task, reason } => {
+            PrCmd::Close { task, reason, superseded_by } => {
                 let t = c.pr_task(task)?;
-                c.call_progress("POST", &format!("/tasks/{t}/pr/close"), Some(json!({"reason": reason.unwrap_or_default(), "agent": !c.session.is_empty(), "via_session": c.session})))?;
-                out(&format!("Closed {t}'s PR without merging it; its branch stays. You can stop here."));
+                let body = json!({"reason": reason.unwrap_or_default(), "superseded_by": superseded_by.unwrap_or_default(), "agent": !c.session.is_empty(), "via_session": c.session});
+                let v = c.call_progress("POST", &format!("/tasks/{t}/pr/close"), Some(body))?;
+                let said = v["pr"]["closed"]["line"].as_str().map(|l| format!(" ({l})")).unwrap_or_default();
+                out(&format!("Closed {t}'s PR without merging it{said}; its branch stays. You can stop here."));
                 Ok(0)
             }
             PrCmd::Reviewed { task } => {
@@ -8962,6 +9170,15 @@ mod tests {
     }
 
     #[test]
+    fn a_step_failure_answered_from_the_rules_says_carry_on() {
+        let a = step_fail_text(&json!({"step": "Design parity", "answer": "Fix the app and rerun.", "source": "parity.md"}), "Morgan");
+        assert!(a.starts_with("Answered without asking Morgan, from parity.md:\nFix the app and rerun."), "{a}");
+        assert!(a.contains("Carry on with Design parity") && !a.contains("End your turn"), "{a}");
+        let w = step_fail_text(&json!({"step": "Design parity"}), "Morgan");
+        assert_eq!(w, "Told Morgan that Design parity can't pass; the task waits for their answer. End your turn now.");
+    }
+
+    #[test]
     fn tb_speaks_for_its_terminal_only_when_claude_runs_it() {
         assert_eq!(own_terminal("429902dc".into(), true), "429902dc");
         assert_eq!(own_terminal("429902dc".into(), false), "", "a tb typed into a plain Midna shell");
@@ -9521,6 +9738,17 @@ mod tests {
         assert_eq!(list_query(&c, None, Some("G41".into())).unwrap(), ["project=all", "goal=G41"], "a goal says which project");
         assert_eq!(list_query(&c, Some("my app".into()), Some("none".into())).unwrap(), ["project=my%20app", "goal=none"]);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn tb_pr_close_says_where_the_work_went() {
+        assert!(Cli::try_parse_from(["tb", "pr", "close", "T4"]).is_err(), "a reason or what replaced it");
+        let Cmd::Pr { action: PrCmd::Close { reason, superseded_by, .. } } = Cli::try_parse_from(["tb", "pr", "close", "T4", "--superseded-by", "#12"]).unwrap().cmd else { panic!("not tb pr close") };
+        assert_eq!((reason, superseded_by.as_deref()), (None, Some("#12")));
+        let Cmd::Pr { action: PrCmd::Close { reason, .. } } = Cli::try_parse_from(["tb", "pr", "close", "--reason", "Not needed"]).unwrap().cmd else { panic!("not tb pr close") };
+        assert_eq!(reason.as_deref(), Some("Not needed"));
+        let v = json!({"ref": "T4", "status": "done", "title": "Fix it", "pr": {"num": 9, "state": "DECLINED", "url": "u", "closed": {"line": "Superseded by #12"}}});
+        assert_eq!(task_show_lines(&v, 0)[2..4], ["PR: #9 DECLINED u", "Superseded by #12"]);
     }
 
     #[test]

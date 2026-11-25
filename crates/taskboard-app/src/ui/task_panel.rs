@@ -230,7 +230,7 @@ fn log_list_item(m: &mut MainWindow, ix: usize, window: &mut Window, cx: &mut Co
     let t = cx.global::<Theme>().clone();
     let Some(l) = &m.task_panel.log_list else { return div().into_any_element() };
     let (rows, more) = (l.rows.clone(), l.more);
-    let mut d = Draw { t: &t, window, path: Vec::new(), within: Vec::new() };
+    let mut d = Draw { t: &t, window, path: Vec::new(), within: Vec::new(), down: m.paused() };
     if ix == 0 {
         return match build(m) {
             Some(tree) => d.sheet(m, &tree, false, cx).1.into_any_element(),
@@ -395,6 +395,9 @@ fn drop_field(m: &mut MainWindow, key: &str) {
 
 /// Run one control, exactly as the web board's `ACTIONS[act]` did.
 pub fn act(m: &mut MainWindow, a: &Act, cx: &mut Context<MainWindow>) {
+    if a.posts() && m.paused() {
+        return;
+    }
     let id = a.id.clone();
     let tp = |suffix: &str| format!("tasks/{id}{suffix}");
     match a.act {
@@ -601,6 +604,8 @@ pub fn act(m: &mut MainWindow, a: &Act, cx: &mut Context<MainWindow>) {
         }
         // Reopen on a done human task: back in Needs you, waiting on the owner.
         "owner-reopen" => run(m, a, tp("/owner-reopen"), json!({}), |_, _| String::new(), cx),
+        // The owner's OK on a pending grant (A3): the row turns to its fired count, so no note.
+        "grant-confirm" => run(m, a, format!("grants/{}/confirm", a.arg), json!({}), |_, _| String::new(), cx),
         "talk" => run(m, a, tp("/talk"), json!({}), |m, _| sent(m), cx),
         "open-url" => open_target(&a.arg, cx),
         // Another of the task's terminals (the PR's, or one still open from before): bring it up in Midna.
@@ -869,7 +874,7 @@ fn body(m: &mut MainWindow, t: &Theme, window: &mut Window, cx: &mut Context<Mai
         load_older_log(m, cx);
     }
     m.task_panel.focused = m.task_panel.fields.values().find(|i| i.focus.is_focused(window)).map(|i| i.focus.clone());
-    let mut d = Draw { t, window, path: Vec::new(), within: Vec::new() };
+    let mut d = Draw { t, window, path: Vec::new(), within: Vec::new(), down: m.paused() };
     Some(d.panel(m, &tree, cx))
 }
 
@@ -877,7 +882,7 @@ fn body(m: &mut MainWindow, t: &Theme, window: &mut Window, cx: &mut Context<Mai
 pub fn draw_note(m: &MainWindow, text: &str, window: &mut Window, cx: &mut Context<MainWindow>) -> AnyElement {
     let t = cx.global::<Theme>().clone();
     // Its own id space, apart from the panel's under the dialog.
-    let mut d = Draw { t: &t, window, path: vec![usize::MAX], within: Vec::new() };
+    let mut d = Draw { t: &t, window, path: vec![usize::MAX], within: Vec::new(), down: m.paused() };
     d.node(m, &view::note_body(text), None, cx)
 }
 
@@ -898,6 +903,8 @@ struct Draw<'a> {
     /// The containers the node being drawn sits in (innermost last): some leaves look different
     /// inside some containers, as the web's descendant selectors made them.
     within: Vec<K>,
+    /// The board is down: what would change it waits (greyed, sends nothing).
+    down: bool,
 }
 
 impl Draw<'_> {
@@ -1048,7 +1055,7 @@ impl Draw<'_> {
             _ if boxed.is_some() && !matches!(look, Look::Icon(_) | Look::Menu | Look::Ref) => button(self.t, self.id("btn"), label, look).px(px(12.)),
             _ => button(self.t, self.id("btn"), label, look),
         };
-        let b = if disabled {
+        let b = if disabled || (self.down && a.posts()) {
             kit::disabled(b)
         } else {
             let a = a.clone();
@@ -1167,6 +1174,17 @@ impl Draw<'_> {
             St::LrowKey => d.text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(t.muted),
             // No color of its own: a step still to come is muted.
             St::TlHWarn => d.text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(t.warn_fg),
+            St::WaitLabel { late } => {
+                let fg = if late { t.warn_fg } else { t.muted };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .min_w_0()
+                    .child(div().flex_none().child(paint(if late { Ic::Alert } else { Ic::Clock }, 13., 2., fg)))
+                    .child(div().min_w_0().child(s.to_uppercase()).text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(fg))
+            }
+            St::BannerPlan => d.text_size(px(14.)).line_height(relative(1.5)).font_weight(FontWeight::SEMIBOLD).text_color(if boxed == Some(BoxTone::Ask) { t.warn_text } else { t.text }),
             St::BannerText => d.text_size(px(14.)).line_height(relative(1.5)).text_color(if matches!(boxed, Some(BoxTone::Lost | BoxTone::Quiet)) { t.text } else { t.warn_text }),
             St::TlH => d.text_size(px(13.)).font_weight(FontWeight::SEMIBOLD),
             St::TlS => d.text_size(px(12.)).text_color(t.muted),
@@ -1532,6 +1550,7 @@ impl Draw<'_> {
         let dot = match st {
             TlSt::Done => dot.bg(t.up),
             TlSt::Now => dot.bg(t.accent),
+            TlSt::Wait => div().size(px(10.)).child(paint(Ic::Dashed, 10., 2.5, t.accent)),
             TlSt::Warn => dot.bg(t.warn),
             TlSt::Fail => dot.bg(t.down),
             TlSt::Todo => dot.border_2().border_color(t.border_2),
@@ -1851,18 +1870,17 @@ impl Draw<'_> {
             _ => String::new(),
         };
         let tint = t.tint;
-        focus::stop(t, div().id(self.id("menu-item")))
-            .flex()
+        let item = div().id(self.id("menu-item"));
+        // With the board down it waits, greyed.
+        let item = if self.down && a.posts() { kit::disabled(item) } else { focus::stop(t, item).cursor_pointer().hover(move |d| d.bg(tint)).on_click(cx.listener(move |m, _, _, cx| act(m, &a, cx))) };
+        item.flex()
             .flex_col()
             .gap(px(2.))
             .px(px(10.))
             .py(px(7.))
             .rounded(px(6.))
-            .cursor_pointer()
-            .hover(move |d| d.bg(tint))
             .child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).text_color(if danger { t.down } else { t.text }).child(label))
             .child(div().text_size(px(12.)).text_color(t.muted).child(sub))
-            .on_click(cx.listener(move |m, _, _, cx| act(m, &a, cx)))
             .into_any_element()
     }
 
@@ -2111,6 +2129,7 @@ fn pill(t: &Theme, s: &str, tone: Tone, small: bool) -> Div {
         Tone::Failed => (t.down, t.down_soft, None),
         Tone::Planned => (t.muted, t.card, Some(t.border)),
         Tone::Working | Tone::Jira => (t.accent_fg, t.accent_soft, None),
+        Tone::Waiting => (t.accent_fg, transparent_black(), Some(t.accent)),
         Tone::Idle => (t.text_2, t.panel_2, None),
         Tone::Gone => (t.muted, t.panel_2, None),
         Tone::Closed => (t.faint, transparent_black(), Some(t.border)),
@@ -2351,6 +2370,10 @@ enum Ic {
     Focus,
     Check,
     Clock,
+    /// A circle with an exclamation mark.
+    Alert,
+    /// A dashed ring: eight dashes round the circle.
+    Dashed,
     Comment,
     /// `.s-now`: a ring with its right quarter open, turned this many degrees.
     Spinner(f32),
@@ -2426,6 +2449,17 @@ fn paint(ic: Ic, size: f32, stroke: f32, color: Hsla) -> impl IntoElement {
                 Ic::Clock => {
                     arc((12., 12.), 8.5, 0., 360., window);
                     line(&[(12., 7.5), (12., 12.), (15., 14.)], window);
+                }
+                Ic::Alert => {
+                    arc((12., 12.), 8.5, 0., 360., window);
+                    line(&[(12., 7.5), (12., 12.5)], window);
+                    fill_dot((12., 16.), 1.3, window);
+                }
+                Ic::Dashed => {
+                    for i in 0..8 {
+                        let a = i as f32 * 45.;
+                        arc((12., 12.), 9.5, a, a + 25., window);
+                    }
                 }
                 Ic::Comment => {
                     arc((12., 12.), 8., 0., 117., window);

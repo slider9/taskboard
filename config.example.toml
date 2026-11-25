@@ -77,6 +77,11 @@ no_task = true                       # also screen tb question from a terminal w
 # Rule files the screener reads: a file, a folder (its MEMORY.md, then every other .md in it, so a
 # new memory note counts at once) or a glob (`*`, `?`, `[…]`, `**` for any depth of folders).
 rules = []                           # example: ["~/.claude/CLAUDE.md", "~/.claude/projects/-Users-alex-code-web/memory", "~/.claude/projects/*/memory/*.md"]
+# Re-read open questions and human tasks during work hours: ones raised before the screener read
+# such items, or before a rule file last changed. `model` reads first; what it would keep with you
+# goes to `human_model`. Each item is read again only once it or the rules change.
+recheck = true
+recheck_every_mins = 45              # 10 at least
 
 # Check-ins on long turns: once a task's terminal has been working `after_mins` (and every
 # `every_mins` after), a headless `claude -p` reads its last lines and the processes under it and says
@@ -135,6 +140,7 @@ tidy = true                          # Claude closes open issues that repeat ano
 tidy_every_hours = 24.0              # how often (1 for hourly); skipped when no issue was added since the last one
 critical_max = 3                     # items holding a PR a goal makes into pre-merge fix tasks; past it, Needs you
 critical = "ask"                     # ask: you approve each item that holds a PR from Needs you before its fix task runs; auto: it runs at once
+misses_to_agent = true               # a miss on a goal's done-when an agent can fix becomes a task in the goal; off: every miss goes to Needs you
 
 # Pull requests. Any GitHub, GitLab or Bitbucket PR link an agent reports is linked to its task.
 # GitHub PRs are watched with the gh CLI (which must be logged in).
@@ -288,6 +294,7 @@ cold_idle_mins = 60                  # a conversation idle longer is compacted b
 warm_tokens = 60000                  # a task or PR conversation resumes only under this many tokens…
 warm_idle_mins = 60                  # …and idle under this long; otherwise it starts fresh from the handoff
 max_compactions = 3                  # a task terminal that has compacted this often carries on in a fresh one from its handoff
+idle_close_mins = 30                 # a task terminal the board opened, idle this long, saves a checkpoint and closes to free memory
 # Generated files, marked `-diff` in a block the board keeps in each active project's (and
 # worktree's) .git/info/attributes, so agents' diffs skip them. `tb limits --generated` changes them.
 generated = []                       # example: ["*.g.dart", "*.freezed.dart", "Cargo.lock"]
@@ -309,6 +316,9 @@ refuse_message = "The board doesn't take {ext} files as attachments: publish it 
 background = ["jira_desk", "slots", "reopen", "pr:rebase", "pr:steps", "pr:merge", "pr:follow", "pr:note"]
 project_max = 5                      # a queued task opens its terminal while fewer of its project's terminals are busy (tb project set --max-terminals)
 global_max = 8                       # a task opens its terminal while fewer task terminals run across every project (tb terminals --max)
+hold_load_per_core = 1.5             # task starts wait while the 1-minute load average per core is at or above this; 0 never waits
+hold_memory = "warning"              # task starts wait while macOS's memory pressure is at least this: warning, critical or off
+hold_free_memory_gb = 2.0            # task starts wait while less memory than this is free (read from Midna); 0 never waits
 deny = ["mcp__midna"]                # tools every board terminal starts without (--disallowedTools): mcp__<server> drops an MCP server, Agent(<type>) a subagent; [] keeps all
 
 # The model each task's terminal starts with (`--model`, unless its flags name one). A task picks
@@ -324,6 +334,8 @@ large_effort = "high"                # the --effort large tasks run at
 default_effort = ""                  # tasks that name a model: "" for Claude's own (tb task set --effort sets one task's)
 pr_visit = "sonnet"                  # PR visits that don't change code (merge, ask for reviews); "" for the task's model
 fresh_pr_visits = true               # those visits start a fresh, short conversation instead of resuming the task's
+pr_work = ""                         # PR visits that resume the task's conversation (fix checks, rebase, review comments, tester notes): small, large, a model name, or "" for the task's model
+pr_work_effort = "medium"            # the most effort those visits run at (a lower task or tier keeps its own); "" for the task's effort
 
 # How goals get planned. After tb goal new (with tasks) and each tb propose, Claude reads the plan
 # against the goal's outcome and lists what it misses (tb goal review G<n>); it never holds the goal up.
@@ -331,11 +343,12 @@ fresh_pr_visits = true               # those visits start a fresh, short convers
 review = true                        # false: no plan reviews
 review_model = "small"               # small or large (through [models]), a model name, or "" for [backlog] model
 
-# Cargo builds in the board's terminals and the worktree subagents they start (Rust repos only),
-# so many worktree agents don't each cold-build the project with every core at once.
+# Builds in the board's terminals and the worktree subagents they start, so many agents don't each
+# build with every core at once. Midna runs at most guard.build_slots builds at once (the rest wait in line).
 [builds]
 shared_target = true                 # CARGO_TARGET_DIR = the main checkout's target/, shared by its worktrees (a pool slot keeps its own target/); builds take turns and reuse each other
-jobs = 4                             # CARGO_BUILD_JOBS per terminal; 0 leaves cargo's default (every core)
+seed_slots = true                    # a worktree slot with no target/ starts with a copy-on-write clone of a warm one (its dependencies built), less the repo's own crates
+# jobs = 4                           # jobs per build (CARGO_BUILD_JOBS, Gradle's org.gradle.workers.max); unset: the cores ÷ Midna's guard.build_slots; 0 leaves each tool's default (every core)
 
 # The worktree slot pool. A goal set with --worktrees starts each task in a reusable worktree at
 # <repo>/.claude/worktrees/slot-<n>: the free one used last (its build is warmest), else a new one up to
@@ -449,6 +462,20 @@ focus = ""                           # example: "open -a Simulator"
 focus_timeout_secs = 15.0
 goal_pool_only = true                # a goal with devices of its own (tb goal devices) lends its tasks only those; false: those first, then the rest
 
+# Stopping what a task's agent left running (Chrome on a debugging port, Gradle and Kotlin daemons, the
+# pool's booted simulators and emulators, and what its terminal left behind) once the task is done with it.
+# Each task's log says what was stopped. Chrome with no live task goes once it's orphan_hours old;
+# a Gradle or Kotlin daemon or Android Studio that no task started is never touched.
+# Simulators are leased like devices: a booted one no task has leased (in the pool or not, the owner's own
+# too) is shut down once it's been up unleased_simulator_mins, and at once while more simulators are booted
+# than the pool has. A pool emulator no task has leased is shut down once it's been up
+# unleased_emulator_mins; an emulator outside the pool is never touched.
+[cleanup]
+on = true
+orphan_hours = 12.0
+unleased_simulator_mins = 10.0
+unleased_emulator_mins = 10.0
+
 # Bits (feature flags, `tb bit add newCheckout --backend --task T4`). Tasks build behind a flag whether or
 # not it's made; a goal whose tasks are done waits until its backend bits are made in the flag tool
 # (`tb bit made`, or "Mark created" on the goal page, which links each one to the tool's new-flag page).
@@ -532,8 +559,8 @@ bot_due_mins = 45.0
 # reviewer); one with nobody to swap in is noted once.
 swap = false
 swap_after_mins = 90.0
-# The ask stage: after you mark a green PR reviewed, it waits until reviewers are asked. The agent is
-# brought back to ask (tb pr reviewers); outside work hours (or with pr.wake off) the board asks itself.
+# The ask stage: after you mark a green PR reviewed, it waits until reviewers are asked. The board asks
+# them itself, at any hour; no agent terminal is opened for it.
 ask_stage = false
 ask_retry_waits = [60, 300, 900]      # seconds between the board's tries when it can't ask
 

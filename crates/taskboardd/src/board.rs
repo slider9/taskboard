@@ -334,6 +334,8 @@ pub fn pr_card(app: &App, t: &Row) -> Value {
         "approvals": approvals, "stage": stage,
         // When the board last read the PR (a poll or a feed event): how fresh its checks and review are.
         "checked_at": flow.get("checked_at").cloned().unwrap_or(Value::Null),
+        // Where a PR closed without merging sent its work (`pr_closed.rs`).
+        "closed": crate::pr_closed::card(&flow),
     })
 }
 
@@ -449,6 +451,11 @@ pub fn task_card(app: &App, t: &Row) -> Result<Value> {
         o.insert("pr_base".into(), t.v("pr_base"));
         o.insert("start_retry_at".into(), start_retry_at(t, &status));
         o.insert("start_at".into(), t.v("start_at"));
+        // When a working task that parked itself resumes, and what it does then (`wait_until.rs`).
+        let (until, plan) = crate::wait_until::card(t);
+        o.insert("waiting_until".into(), until);
+        o.insert("resume_plan".into(), plan);
+        o.insert("wait_missed".into(), crate::wait_until::missed(t));
         // The terminal its start opened, while no agent has checked in from it (`startwatch.rs`).
         o.insert("start_terminal".into(), crate::startwatch::card(app, t)?);
         o.insert("looks_finished".into(), crate::lost_done::card(t));
@@ -462,6 +469,8 @@ pub fn task_card(app: &App, t: &Row) -> Result<Value> {
         o.insert("kind".into(), json!(t.s("kind").unwrap_or("agent")));
         o.insert("owner_note".into(), json!(crate::human::note(t)));
         o.insert("owner_answer".into(), t.v("owner_answer"));
+        // The agent's estimate of its working time (`estimate.rs`); the detail adds the actual time.
+        o.insert("est_min".into(), t.v("est_min"));
         o.insert("lane".into(), crate::worklane::card(app, t)?);
         // The PR bar's review step (a step with `bar`) before the PR opens, from its first round.
         o.insert("code_review".into(), crate::code_review::card(app, t)?);
@@ -1056,7 +1065,7 @@ fn read_goal_dict(app: &App, g: &Row) -> Result<(Value, Option<Vec<i64>>)> {
         "epic_url": jira_url(app, g.s("epic_key").unwrap_or("")), "product": g.v("product"),
         "run_in_order": g.b("run_in_order"), "max_terminals": g.v("max_terminals"),
         "auto_close": g.b("auto_close"), "archived": g.b("archived"), "paused": g.b("paused"),
-        "jira_off": g.b("jira_off"), "accepted": accepted_dict(g), "deprioritized": g.b("deprioritized"), "set_aside": g.b("deprioritized"), "worktree_base": g.v("worktree_base"), "pr_base": g.v("pr_base"), "setup": g.v("setup"),
+        "jira_off": g.b("jira_off"), "accepted": accepted_dict(g), "deprioritized": g.b("deprioritized"), "set_aside": g.b("deprioritized"), "worktree_base": g.v("worktree_base"), "pr_base": g.v("pr_base"), "setup": g.v("setup"), "est_min": g.v("est_min"),
         "lane": crate::worklane::goal_lane(g),
         "after": crate::chain::ids(g).iter().map(|n| rf("goal", *n)).collect::<Vec<_>>(),
         "after_blocker": crate::chain::blocker(app, g)?,
@@ -1553,6 +1562,9 @@ pub const USAGE_CLOSE: &str = "usage_close";
 pub const HOURS_CLOSE: &str = "hours_close";
 /// Closed after compacting `max_compactions` times, to carry on in a fresh terminal.
 pub const COMPACT_CLOSE: &str = "compact_close";
+/// Closed after sitting idle `idle_close_mins` to free its memory; the task keeps its status and slot
+/// and carries on in a new terminal when the board next has something for it (`idle_close.rs`).
+pub const IDLE_CLOSE: &str = "idle_close";
 
 fn requeue_reason(purpose: &str) -> (&'static str, &'static str) {
     match purpose {
@@ -1564,8 +1576,8 @@ fn requeue_reason(purpose: &str) -> (&'static str, &'static str) {
 
 pub fn requeue_close(app: &App, sid: &str) -> Result<Option<String>> {
     for j in app.db.q(
-        "SELECT args, purpose FROM jobs WHERE kind = 'close' AND purpose IN (?, ?, ?) ORDER BY id DESC LIMIT 50",
-        p![USAGE_CLOSE, HOURS_CLOSE, COMPACT_CLOSE],
+        "SELECT args, purpose FROM jobs WHERE kind = 'close' AND purpose IN (?, ?, ?, ?) ORDER BY id DESC LIMIT 50",
+        p![USAGE_CLOSE, HOURS_CLOSE, COMPACT_CLOSE, IDLE_CLOSE],
     )? {
         if job_args(&j).get("session").and_then(|v| v.as_str()) == Some(sid) {
             return Ok(j.s("purpose").map(|s| s.to_string()));
@@ -1694,6 +1706,7 @@ pub fn claim(app: &App, t: &Row, sid: &str, claude: Option<&str>, who: Option<&s
         f.push(("claude_session_id", json!(c)));
     }
     update_task(app, t.id(), f)?;
+    crate::idle_close::picked_up(app, t.id())?;
     add_terminal(app, t.id(), sid, "Worked on the task")?;
     if !already {
         if let Some(s) = get_session(app, Some(sid))? {
@@ -1764,7 +1777,8 @@ pub fn mark_lost_with(app: &App, t: &Row, reason: &str, detail: Option<&str>) ->
     };
     let closed = format!("The terminal closed at {} before the task was done.", local_clock(None));
     let asked = t.s("status") == Some("needs") && t.s("needs_reason") == Some("question");
-    if !DELIBERATE_EXITS.contains(&reason) && !asked && restarts_left(app, t)? {
+    let retryable = !DELIBERATE_EXITS.contains(&reason) && !asked;
+    if retryable && restarts_left(app, t)? {
         let pickup = if matches!(t.s("pickup"), Some("manual") | Some("attach")) { "new".to_string() } else { t.st("pickup") };
         update_task(
             app,
@@ -1782,13 +1796,28 @@ pub fn mark_lost_with(app: &App, t: &Row, reason: &str, detail: Option<&str>) ->
         Some(s) => format!(" Its context was saved at {}.", local_clock(Some(&s))),
         None => " Nothing was saved yet.".into(),
     };
+    let mut latest = format!("{closed}{saved_line}");
+    // Out of quick restarts: during the work hours the board tries again on its own, with longer waits.
+    use crate::needs_retry::{self as nr, Kind, Outcome};
+    if retryable && nr::will_retry(app, t) {
+        log_event(app, t.id(), MIDNA, "status", &format!("Terminal ended ({why}) before the task was done{QUEUED_AGAIN}"))?;
+        nr::try_again(app, t, Kind::Lost, &latest)?;
+        return Ok(());
+    }
+    let gave_up = if retryable { if let Outcome::GaveUp(n) = nr::try_again(app, t, Kind::Lost, &latest)? { Some(n) } else { None } } else { None };
+    if let Some(n) = gave_up {
+        latest = nr::gave_up_line(&latest, Kind::Lost, n);
+    }
     update_task(
         app,
         t.id(),
         fields!["status" => "needs", "lost" => 1, "needs_reason" => "lost", "start_job" => null,
-                "latest" => format!("{closed}{saved_line}"), "looks_finished" => crate::lost_done::lost_now()],
+                "latest" => latest.clone(), "looks_finished" => crate::lost_done::lost_now()],
     )?;
     log_event(app, t.id(), MIDNA, "status", &format!("Terminal ended ({why}) before the task was done"))?;
+    if gave_up.is_some() {
+        log_event(app, t.id(), BOARD, "midna", &latest)?;
+    }
     // Whether it was closed by hand is read from that line, logged after the update queued the panel.
     crate::midna::queue_panel(app, t.id());
     app.info(format!("task {} lost: {why}", rf("task", t.id())));
@@ -1865,7 +1894,11 @@ pub fn detach_closed(app: &App, t: &Row) -> Result<()> {
         log_event(app, t.id(), MIDNA, "midna", &format!("Closed {name}"))?;
         return Ok(());
     }
-    if let Some(purpose) = requeue_close(app, &t.st("session_id"))? {
+    let purpose = requeue_close(app, &t.st("session_id"))?;
+    if purpose.as_deref() == Some(IDLE_CLOSE) {
+        return crate::idle_close::detached(app, t, &name);
+    }
+    if let Some(purpose) = purpose {
         let (why, until) = requeue_reason(&purpose);
         let asked = t.s("status") == Some("needs") && t.s("needs_reason") == Some("question");
         let pickup = if matches!(t.s("pickup"), Some("manual") | Some("attach")) { "new".to_string() } else { t.st("pickup") };

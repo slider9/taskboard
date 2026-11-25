@@ -1,6 +1,7 @@
 //! A queued start waits only while its project has as many busy terminals as it may
 //! (`[terminals] project_max`, or `tb project set --max-terminals`), and any task start waits while the
-//! board runs as many task terminals as it may (`[terminals] global_max`, or `tb terminals --max`); its card says so.
+//! board runs as many task terminals as it may (`[terminals] global_max`, or `tb terminals --max`) or the Mac's load or memory
+//! pressure is too high (`[terminals] hold_load_per_core`, `hold_memory`); its card says so.
 
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use taskboardd::api::{self, Query};
 use taskboardd::app::App;
 use taskboardd::config::Config;
 use taskboardd::util::RowExt;
-use taskboardd::{board, fields, jobs, midna, runner};
+use taskboardd::{board, fields, jobs, midna, pressure, runner};
 
 struct Board {
     app: Arc<App>,
@@ -190,4 +191,119 @@ fn the_board_cap_is_a_count_from_one_to_a_hundred() {
     assert_eq!(b.post("terminals", json!({"max_terminals": 100}))["max_terminals"], 100);
     let e = api::dispatch(&b.app, "POST", "terminals", &Query::new(), &json!({"max_terminals": 101})).unwrap_err();
     assert_eq!((e.status, e.message.as_str()), (400, "max_terminals is a count from 1 to 100, or default."));
+}
+
+/// A board that holds task starts while the Mac reads `load1` on 12 cores with this memory pressure.
+fn board_on_a_mac(load1: f64, memory: &str) -> Board {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::for_tests(dir.path());
+    cfg.terminals.hold_load_per_core = 1.5;
+    cfg.terminals.hold_memory = "warning".into();
+    cfg.terminals.hold_free_memory_gb = 2.0;
+    let repo = dir.path().join("webapp");
+    std::fs::create_dir_all(&repo).unwrap();
+    let repo = repo.to_string_lossy().to_string();
+    let app = App::for_tests(cfg);
+    app.db.set_setting("midna_projects", Some(&json!([{"name": "webapp", "path": repo}]).to_string())).unwrap();
+    let b = Board { app, repo, _dir: dir };
+    b.mac(load1, memory);
+    b
+}
+
+impl Board {
+    fn mac(&self, load1: f64, memory: &str) {
+        pressure::fix_for_tests(&self.app, Some(pressure::Reading { load1, cpus: 12, memory: memory.into(), from: "mac", ..Default::default() }));
+    }
+}
+
+#[test]
+fn a_start_waits_while_the_mac_is_loaded_and_says_why() {
+    let b = board_on_a_mac(30.0, "normal");
+    let t = b.queued_task();
+    assert_eq!(b.get(&format!("tasks/T{t}"))["waiting"], "Waits for the Mac to calm down: load 30.0 on 12 cores (starts wait from 18)");
+    assert!(!b.takes_start(), "terminals are free, the Mac isn't");
+    assert_eq!(b.get("terminals")["line"], "0 of 8 task terminals running (cap from config.toml)\nNew starts wait: load 30.0 on 12 cores (starts wait from 18)");
+
+    b.mac(12.0, "normal");
+    assert!(b.get(&format!("tasks/T{t}"))["waiting"].is_null());
+    assert!(b.takes_start(), "the load calmed down");
+}
+
+#[test]
+fn a_start_waits_while_memory_runs_low() {
+    let b = board_on_a_mac(2.0, "warning");
+    let t = b.queued_task();
+    assert_eq!(b.get(&format!("tasks/T{t}"))["waiting"], "Waits for free memory: macOS memory pressure is warning");
+    assert!(!b.takes_start());
+    let out = b.get("terminals");
+    assert_eq!((out["held"].clone(), out["pressure"]["memory"].clone()), (json!("Waits for free memory: macOS memory pressure is warning"), json!("warning")));
+
+    b.mac(2.0, "normal");
+    assert!(b.takes_start());
+}
+
+#[test]
+fn held_starts_open_one_per_fresh_reading_once_the_load_calms() {
+    let b = board_on_a_mac(30.0, "normal");
+    let held: Vec<i64> = (0..3).map(|_| b.queued_task()).collect();
+    assert!(!b.takes_start());
+
+    b.mac(12.0, "normal");
+    runner::start_queued(&b.app).unwrap();
+    assert!(b.takes_start(), "the first held start opens");
+    assert!(!b.takes_start(), "the rest wait for a fresh reading");
+    let waiting: Vec<Value> = held.iter().map(|t| b.get(&format!("tasks/T{t}"))["waiting"].clone()).collect();
+    assert!(waiting.contains(&json!(pressure::PACED)), "{waiting:?}");
+
+    b.mac(12.0, "normal");
+    assert!(b.takes_start(), "one more opens on the next reading");
+    assert!(!b.takes_start());
+    b.mac(12.0, "normal");
+    assert!(b.takes_start());
+
+    // A reading on which no start opened ends the pacing.
+    b.mac(12.0, "normal");
+    b.mac(12.0, "normal");
+    b.queued_task();
+    b.queued_task();
+    assert!(b.takes_start() && b.takes_start(), "no hold cleared just now: starts open together");
+}
+
+#[test]
+fn a_hold_coming_back_while_pacing_holds_again() {
+    let b = board_on_a_mac(30.0, "normal");
+    b.queued_task();
+    b.queued_task();
+    b.mac(12.0, "normal");
+    runner::start_queued(&b.app).unwrap();
+    assert!(b.takes_start());
+    b.mac(30.0, "normal");
+    runner::start_queued(&b.app).unwrap();
+    assert!(!b.takes_start(), "held on the load again");
+    b.mac(12.0, "normal");
+    runner::start_queued(&b.app).unwrap();
+    assert!(b.takes_start(), "the hold cleared again: the next opens");
+}
+
+#[test]
+fn a_start_waits_while_free_memory_is_under_the_floor() {
+    let b = board_on_a_mac(2.0, "normal");
+    let low = pressure::Reading { load1: 2.0, cpus: 12, memory: "normal".into(), memory_free: 1 << 30, midnad_cpu: 150, midnad_memory: 2 << 30, from: "midna" };
+    pressure::fix_for_tests(&b.app, Some(low.clone()));
+    let t = b.queued_task();
+    assert_eq!(b.get(&format!("tasks/T{t}"))["waiting"], "Waits for free memory: 1 GB free (starts wait under 2 GB); midnad itself runs hot (150% CPU, 2 GB)");
+    assert!(!b.takes_start());
+    assert_eq!(b.get("terminals")["pressure"]["memory_free_bytes"], json!(1u64 << 30));
+
+    // An older Midna sends no free memory: unknown, never a hold.
+    pressure::fix_for_tests(&b.app, Some(pressure::Reading { memory_free: 0, ..low }));
+    assert!(b.takes_start());
+}
+
+#[test]
+fn the_mac_s_load_holds_no_start_when_the_check_is_off() {
+    let b = new_board(5);
+    pressure::fix_for_tests(&b.app, Some(pressure::Reading { load1: 280.0, cpus: 12, memory: "critical".into(), from: "mac", ..Default::default() }));
+    b.queued_task();
+    assert!(b.takes_start(), "tests' boards turn the check off");
 }

@@ -274,6 +274,12 @@ impl Fake {
         if std::env::var("TASKBOARD_FAKE_SLOTS").is_ok() {
             seed_slots(&board);
         }
+        if std::env::var("TASKBOARD_FAKE_GRANTS").is_ok() {
+            seed_grants(&board);
+        }
+        if std::env::var("TASKBOARD_FAKE_WAIT").is_ok() {
+            seed_wait(&board);
+        }
         if jira {
             seed_jira(&board);
         }
@@ -411,6 +417,46 @@ fn seed_slots(board: &Board) {
         );
     }
     let _ = api::dispatch(board, "POST", "/projects/webapp", &Query::new(), &json!({"min_slots": 1, "max_slots": 4, "idle_trim_days": 3, "idle_remove_days": 7}));
+}
+
+/// Dev (`TASKBOARD_FAKE_WAIT=1`): webapp's "Re-measure and compare" parked until three hours from
+/// now, and "Batch the session writes" past its resume time by the grace period, so it needs you.
+fn seed_wait(board: &Board) {
+    use taskboardd::{board as b, fields, util::RowExt};
+    let at = |mins: i64| (chrono::Utc::now() + chrono::Duration::minutes(mins)).format("%Y-%m-%dT%H:%M:00Z").to_string();
+    let id = |title: &str| board.db.q("SELECT * FROM tasks WHERE title = ?", taskboardd::p![title]).ok().and_then(|r| r.first().map(|t| t.id()));
+    if let Some(t) = id("Re-measure and compare") {
+        let _ = b::update_task(board, t, fields!["status" => "working", "started_at" => at(-52), "latest" => "Nothing more can be checked before the 5:00 PM benchmark run."]);
+        let _ = board.db.x("UPDATE tasks SET waiting_until = ?, resume_plan = ? WHERE id = ?",
+                           taskboardd::p![at(180), "Read the 5:00 PM benchmark run, then compare it with the numbers from before the change.", t]);
+    }
+    if let Some(t) = id("Batch the session writes") {
+        let _ = board.db.x("UPDATE tasks SET waiting_until = ?, resume_plan = ? WHERE id = ?",
+                           taskboardd::p![at(-20), "Read the overnight load test, then batch the remaining writes.", t]);
+    }
+    // Both in terminals left idle while they wait.
+    let now = taskboardd::util::now_iso();
+    for (sid, title) in [("fake-w1", "Re-measure and compare"), ("fake-w2", "Batch the session writes")] {
+        let Some(t) = id(title) else { continue };
+        let name = format!("T{t} {title}");
+        let _ = board.db.insert("sessions", fields!["id" => sid, "name" => name.clone(), "project" => "webapp", "project_path" => "/tmp/webapp", "status" => "idle",
+                                                    "agent" => "claude", "last_activity" => now.clone(), "seen_at" => now.clone(), "branch" => "feature/latency"]);
+        let _ = board.db.x("UPDATE tasks SET session_id = ?, session_name = ? WHERE id = ?", taskboardd::p![sid, name, t]);
+    }
+    let _ = board.db.tx(|| taskboardd::wait_until::sweep(board));
+}
+
+/// Dev (`TASKBOARD_FAKE_GRANTS=1`): T5's Midna grants: a Slack post the owner confirmed, which its
+/// terminal's rule let through three times, and a push an agent asked for, waiting on the owner.
+fn seed_grants(board: &Board) {
+    use taskboardd::task_grants::add;
+    let _ = add(board, 5, &["tool:mcp__slack__chat_post*".into()], true, "");
+    let _ = add(board, 5, &["command:git push origin *".into()], false, "");
+    let now = taskboardd::util::now_iso();
+    let _ = board.db.insert(
+        "task_grant_rules",
+        taskboardd::fields!["rule_id" => "r_seed", "grant_id" => 1, "session_id" => "s1", "at" => now.clone(), "fired" => 3, "last_fired_at" => now],
+    );
 }
 
 /// Dev (`TASKBOARD_FAKE_PANEL=1`): the task panel's need boxes: a lost task that looks finished,

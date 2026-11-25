@@ -150,9 +150,9 @@ fn hook_payload(app: &App, query: &Query) -> Result<Value> {
 /// A read shares the settings and steps it loads across everything it builds (`reqcache`).
 /// A `tb pr …` command someone asked for makes its reads as the PR poll's: they still go while an
 /// account restarts slowly after a limit (`prhost::limit`). The host calls a request makes count as
-/// the `agent` reader's in the account's split.
+/// its `tb pr` command's reader in the account's split (`agent (merge)`, …), else the `agent` reader's.
 pub fn dispatch(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Result<Value> {
-    crate::prhost::limit::reader("agent", || scoped(app, method, path, query, body))
+    crate::prhost::limit::reader(crate::prhost::limit::agent_reader(method, path), || scoped(app, method, path, query, body))
 }
 
 fn scoped(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Result<Value> {
@@ -353,6 +353,18 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
             })
         }
         ("POST", ["tasks", id, "delete"]) => delete_task(app, tid(id)?),
+        ("GET", ["tasks", id, "grants"]) => crate::task_grants::list(app, tid(id)?),
+        ("POST", ["tasks", id, "grants"]) => task_grant_add(app, tid(id)?, query, body),
+        ("POST", ["grants", g, "confirm"]) => {
+            if !from_app(query) {
+                return err(403, format!("Only {} confirms a grant: in the app, or with Grant on its notification.", app.cfg.owner));
+            }
+            crate::task_grants::confirm(app, crate::task_grants::parse_gref(g)?, &format!("{} in the app", app.cfg.owner))
+        }
+        ("POST", ["grants", g, "drop"]) => {
+            let by = if from_app(query) { format!("{} in the app", app.cfg.owner) } else { board::session_name(app, Some(&body_str(body, "via_session")).filter(|s| !s.is_empty()).map(|s| s.as_str()), None) };
+            crate::task_grants::drop_grant(app, crate::task_grants::parse_gref(g)?, &by)
+        }
         ("POST", ["tasks", id, "pr", "wait"]) => pr_wait(app, tid(id)?),
         ("POST", ["tasks", id, "slot", "claim"]) => slot_claim(app, tid(id)?, body),
         ("GET", ["tasks", id, "slot"]) => slot_held(app, tid(id)?),
@@ -541,6 +553,8 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
             app.take_reports(None);
             reports::handle(app, body.clone(), false)
         }
+        ("GET", ["handled"]) => crate::handled::list(app, query),
+        ("POST", ["handled", id, "pull-back"]) => crate::handled::pull_back(app, id.parse().map_err(|_| ApiError::new(404, "The board has no record of handling that."))?),
         ("GET", ["home"]) => crate::home::page(app, q(query, "project", "all")),
         ("POST", ["home", "talk"]) => crate::needs_talk::start(app, body),
         ("GET", ["reviews"]) => crate::review::list(app),
@@ -581,6 +595,7 @@ fn route(app: &App, method: &str, path: &str, query: &Query, body: &Value) -> Re
         ("GET", ["planning", "lessons"]) => crate::planning::suggest(app, query),
         ("POST", ["planning", "lessons"]) => crate::planning::accept(app, body),
         ("GET", ["quality"]) => crate::quality::get(app, query),
+        ("GET", ["estimates"]) => crate::accuracy::get(app, query),
         ("GET", ["jira", "jobs", id]) => {
             let n = need_ref(&json!(id), "job")?;
             match app.db.q1("SELECT * FROM jobs WHERE id = ? AND kind = 'jira'", p![n])? {
@@ -1246,6 +1261,9 @@ fn patch_task(app: &App, id: i64, body: &Value) -> Result<Value> {
         let who = board::caller(app, body, OWNER);
         crate::devices::take_needs(app, "task", id, body, &who)?;
         crate::bits::take_task_bits(app, id, body, &who)?;
+        if let Some(m) = crate::estimate::parse(body.get("est"))? {
+            crate::estimate::set_task(app, &t, m, &who)?;
+        }
         let mut f: Vec<(&str, Value)> = vec![];
         let mut bump = false;
         let has_key = |k: &str| body.get(k).is_some();
@@ -1842,6 +1860,17 @@ fn start_grant_add(app: &App, query: &Query, body: &Value) -> Result<Value> {
     crate::start_grants::ask(app, &body_str(body, "via_session"), body)
 }
 
+/// Grants on a task (`tb task set T5 --allow 'tool:mcp__slack__chat_post*'`): the owner's from the app are
+/// granted; a terminal's wait for the owner's Grant on a notification. What a prompt says never grants one.
+fn task_grant_add(app: &App, id: i64, query: &Query, body: &Value) -> Result<Value> {
+    let allow: Vec<String> = match &body["allow"] {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+        _ => vec![],
+    };
+    crate::task_grants::add(app, id, &allow, from_app(query), &body_str(body, "via_session"))
+}
+
 /// A start at a set time (`at`: `5pm`, `tomorrow 9am`, or `off` to drop it) for `what`: the owner's from
 /// the app, or on their word in terminal `via` (`startword::schedule_word`). A refused one asks no one:
 /// the notification's Start would start it now.
@@ -2025,59 +2054,87 @@ fn answer(app: &App, id: i64, body: &Value) -> Result<Value> {
     if when != "now" && when != "morning" {
         return err(400, "Send the answer now or in the morning.");
     }
+    let message = format!("[task-board:{}] {} answer: {text}", rf("task", id), capitalize(&app.cfg.owners()));
     app.db.tx(|| {
-        let t = board::get_task(app, id)?;
-        let mut ctx = board::task_context(&t);
-        let mut entry = format!("“{text}” ({})", local_clock(None));
-        if let Some(q) = t.s("question").filter(|q| !q.is_empty()) {
-            entry = format!("{} → {entry}", clip(q, 160));
-        }
-        let mut answers = str_list(ctx.get("answers"));
-        answers.push(entry);
-        ctx.insert("answers".into(), json!(answers));
-        let s = board::live_session(app, &t)?;
-        board::save_context(app, id, &ctx, s.is_none())?;
         let later = if when == "morning" { hours::until_open(app) } else { None };
-        if later.is_none() {
-            board::update_task(app, id, fields!["answered_at" => now_iso()])?;
+        match later {
+            Some(later) => answer_later(app, id, &text, &message, &later),
+            None => give_answer(app, id, &text, &message, OWNER, &format!("Answered: {text}")),
         }
-        let message = format!("[task-board:{}] {} answer: {text}", rf("task", id), capitalize(&app.cfg.owners()));
-        let visiting = t.s("status") == Some("done") && (prflow::visitor(&t).is_some() || prflow::waking(app, &t)?);
-        let asked_or_lost = t.s("status") == Some("needs") && matches!(t.s("needs_reason"), Some("question") | Some("lost"));
-        let pickup = if matches!(t.s("pickup"), Some("manual") | Some("attach")) { "new".to_string() } else { t.st("pickup") };
-        if let Some(later) = later {
-            let at = hours::say_when(&later);
-            board::log_event(app, id, OWNER, "answer", &format!("Answered: {text} (sends {at})"))?;
-            if s.is_some() || visiting {
-                deliver::add(app, "answer", &message, id, None, Some(&later))?;
-            } else if asked_or_lost {
-                board::update_task(
-                    app,
-                    id,
-                    fields!["status" => "queued", "needs_reason" => null, "question" => null, "lost" => 0, "session_id" => null,
-                            "pickup_session" => null, "pickup" => pickup, "latest" => format!("Answered; it starts {at} with your answer in its handoff.")],
-                )?;
-            }
-        } else if s.is_some() {
-            deliver::add(app, "answer", &message, id, None, None)?;
-            board::log_event(app, id, OWNER, "answer", &format!("Answered: {text}"))?;
-        } else {
-            board::log_event(app, id, OWNER, "answer", &format!("Answered: {text}"))?;
-            if asked_or_lost {
-                board::update_task(
-                    app,
-                    id,
-                    fields!["status" => "queued", "needs_reason" => null, "question" => null, "lost" => 0, "session_id" => null,
-                            "latest" => "Answered; it starts again from its handoff."],
-                )?;
-            }
-            if t.s("status") != Some("done") || visiting {
-                deliver::answer_in_new_tab(app, &board::get_task(app, id)?, &message)?;
-            }
-        }
-        Ok(())
     })?;
     task_detail(app, id)
+}
+
+/// Keeps `text` in task `t`'s handoff as the answer to its question.
+fn keep_answer(app: &App, t: &Row, text: &str, live: bool) -> Result<()> {
+    let mut ctx = board::task_context(t);
+    let mut entry = format!("“{text}” ({})", local_clock(None));
+    if let Some(q) = t.s("question").filter(|q| !q.is_empty()) {
+        entry = format!("{} → {entry}", clip(q, 160));
+    }
+    let mut answers = str_list(ctx.get("answers"));
+    answers.push(entry);
+    ctx.insert("answers".into(), json!(answers));
+    board::save_context(app, t.id(), &ctx, !live)
+}
+
+/// The task waits on its question, or its terminal was lost: an answer starts it again.
+fn asked_or_lost(t: &Row) -> bool {
+    t.s("status") == Some("needs") && matches!(t.s("needs_reason"), Some("question") | Some("lost"))
+}
+
+/// A done task a PR visit still answers to.
+fn visiting(app: &App, t: &Row) -> Result<bool> {
+    Ok(t.s("status") == Some("done") && (prflow::visitor(t).is_some() || prflow::waking(app, t)?))
+}
+
+/// Answers task `id`'s question now with `text`, as the owner's Answer does: `message` goes to its
+/// terminal, or it starts again from its handoff with the answer in it. `who` and `line` go in its log.
+/// The Needs you re-check (`recheck.rs`) answers this way too. Call it in a transaction.
+pub fn give_answer(app: &App, id: i64, text: &str, message: &str, who: &str, line: &str) -> Result<()> {
+    let t = board::get_task(app, id)?;
+    let s = board::live_session(app, &t)?;
+    keep_answer(app, &t, text, s.is_some())?;
+    board::update_task(app, id, fields!["answered_at" => now_iso()])?;
+    if s.is_some() {
+        deliver::add(app, "answer", message, id, None, None)?;
+        return board::log_event(app, id, who, "answer", line).map(|_| ());
+    }
+    board::log_event(app, id, who, "answer", line)?;
+    let visiting = visiting(app, &t)?;
+    if asked_or_lost(&t) {
+        board::update_task(
+            app,
+            id,
+            fields!["status" => "queued", "needs_reason" => null, "question" => null, "lost" => 0, "session_id" => null,
+                    "latest" => "Answered; it starts again from its handoff."],
+        )?;
+    }
+    if t.s("status") != Some("done") || visiting {
+        deliver::answer_in_new_tab(app, &board::get_task(app, id)?, message)?;
+    }
+    Ok(())
+}
+
+/// The owner's answer sent at `later`, when work hours open.
+fn answer_later(app: &App, id: i64, text: &str, message: &str, later: &str) -> Result<()> {
+    let t = board::get_task(app, id)?;
+    let s = board::live_session(app, &t)?;
+    keep_answer(app, &t, text, s.is_some())?;
+    let at = hours::say_when(later);
+    board::log_event(app, id, OWNER, "answer", &format!("Answered: {text} (sends {at})"))?;
+    if s.is_some() || visiting(app, &t)? {
+        deliver::add(app, "answer", message, id, None, Some(later))?;
+    } else if asked_or_lost(&t) {
+        let pickup = if matches!(t.s("pickup"), Some("manual") | Some("attach")) { "new".to_string() } else { t.st("pickup") };
+        board::update_task(
+            app,
+            id,
+            fields!["status" => "queued", "needs_reason" => null, "question" => null, "lost" => 0, "session_id" => null,
+                    "pickup_session" => null, "pickup" => pickup, "latest" => format!("Answered; it starts {at} with your answer in its handoff.")],
+        )?;
+    }
+    Ok(())
 }
 
 /// The daemon's code-signing identifier, which Midna's `agents.trusted_clients` names to let it answer pickers.
@@ -2585,6 +2642,9 @@ fn patch_goal(app: &App, id: i64, body: &Value) -> Result<Value> {
     app.db.tx(|| {
         let g = board::get_goal(app, id)?;
         crate::devices::take_needs(app, "goal", id, body, OWNER)?;
+        if let Some(m) = crate::estimate::parse(body.get("est"))? {
+            crate::estimate::set_goal(app, &g, m, &board::caller(app, body, OWNER))?;
+        }
         let mut f: Vec<(&str, Value)> = vec![];
         let hk = |k: &str| body.get(k).is_some();
         if hk("name") {
@@ -3940,7 +4000,15 @@ fn slot_claim(app: &App, id: i64, body: &Value) -> Result<Value> {
     let held = app.db.q1("SELECT id FROM worktree_slots WHERE task_id = ?", p![id])?.is_some();
     let before = board::task_context(&t);
     let start = if held { None } else { crate::bring::start_at(app, &t)? };
-    let path = match crate::slots::reclaim(app, &t)? {
+    // A PR visit's wait is queued (`slots::resume_pr_waits`): it hears where to work once a slot frees.
+    let reclaimed = crate::slots::reclaim(app, &t).map_err(|e| {
+        if e.message == crate::slots::WAIT && t.s("status") == Some("done") {
+            ApiError::new(e.status, format!("{}: the pool is full. Stop here: once one frees, the board claims it for {me} and types its path into this terminal.", crate::slots::WAIT))
+        } else {
+            e
+        }
+    })?;
+    let path = match reclaimed {
         Some(p) => p,
         None => match &start {
             Some((sha, _)) => crate::worktrees::make(app, &t, Some(sha))?,

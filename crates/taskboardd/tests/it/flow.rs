@@ -191,13 +191,39 @@ fn a_closed_terminal_requeues_the_task_then_waits_for_the_owner() {
     b.add_session("s2", "working");
     b.report("tb.take", "s2", json!({"task": "T1"}));
     b.report("hook.session_end", "s2", json!({"reason": "other"}));
-    b.add_session("s3", "working");
-    b.report("tb.take", "s3", json!({"task": "T1"}));
-    b.report("hook.session_end", "s3", json!({"reason": "other"}));
+    // Out of quick restarts, the board starts it again on its own during the work hours, waiting longer each time.
+    for n in 3..=6 {
+        let s = format!("s{n}");
+        b.add_session(&s, "working");
+        b.report("tb.take", &s, json!({"task": "T1"}));
+        b.report("hook.session_end", &s, json!({"reason": "other"}));
+        if n < 6 {
+            let t = b.task(id);
+            assert_eq!(t.s("status"), Some("queued"), "board try {} of 3 restarts it from its handoff", n - 2);
+            assert!(t.s("retry_at").is_some());
+            assert!(t.st("latest").contains(&format!("({} of 3)", n - 2)));
+        }
+    }
     let t = b.task(id);
-    assert_eq!(t.s("status"), Some("needs"), "after two restarts in an hour it waits for the owner");
+    assert_eq!(t.s("status"), Some("needs"), "after the board's own tries it waits for the owner");
     assert_eq!(t.s("needs_reason"), Some("lost"));
     assert!(t.b("lost"));
+    assert!(t.st("latest").contains("The board started it again from its handoff 3 times during work hours"), "{}", t.st("latest"));
+    assert_retries_handled(&b, id, "lost");
+}
+
+/// Each of the board's own tries is on Handled for you, saying what Pull back puts back.
+fn assert_retries_handled(b: &Board, id: i64, item: &str) {
+    let rows = b.app.db.q("SELECT * FROM events WHERE task_id = ? AND kind = ? ORDER BY id", p![id, taskboardd::handled::KIND]).unwrap();
+    assert_eq!(rows.len(), 3, "one record per try");
+    for (n, r) in rows.iter().enumerate() {
+        assert_eq!(r.s("who"), Some(board::BOARD));
+        let d: Value = serde_json::from_str(&r.st("data")).unwrap();
+        assert_eq!(d["by"], "retry");
+        assert_eq!(d["item"], item);
+        assert_eq!(d["try"], n as i64 + 1);
+        assert!(d["was"].as_str().is_some_and(|w| !w.is_empty()));
+    }
 }
 
 #[test]
@@ -424,7 +450,8 @@ fn spooled_reports_are_read_in_order_and_deduplicated() {
 fn a_failed_start_retries_then_waits_for_the_owner() {
     let b = new_board();
     let id = new_task(&b, "Flaky start", json!({}));
-    for _ in 0..4 {
+    // Four quick tries, then three of the board's own with longer waits.
+    for n in 0..8 {
         runner::start_queued(&b.app).unwrap();
         let j = b.app.db.q1("SELECT * FROM jobs WHERE kind = 'agent' AND state = 'pending'", p![]).unwrap().unwrap();
         b.app.db.x("UPDATE jobs SET state = 'running' WHERE id = ?", p![j.id()]).unwrap();
@@ -433,11 +460,15 @@ fn a_failed_start_retries_then_waits_for_the_owner() {
         if b.task(id).s("status") == Some("needs") {
             break;
         }
+        assert!(n < 7, "it waits for the owner after the board's own tries");
         assert_eq!(b.task(id).s("status"), Some("queued"));
+        assert!(b.get("/state")["alerts"].as_array().unwrap().is_empty(), "no alert while the board still tries");
     }
     let t = b.task(id);
     assert_eq!(t.s("status"), Some("needs"));
     assert_eq!(t.s("needs_reason"), Some("start_failed"));
+    assert!(t.st("latest").contains("The board tried to start it 3 times during work hours"), "{}", t.st("latest"));
+    assert_retries_handled(&b, id, "start");
     assert_eq!(b.get("/state")["alerts"].as_array().unwrap().len(), 1);
 }
 
@@ -627,17 +658,18 @@ fn a_turn_that_loses_the_network_waits_for_midna_to_carry_it_on() {
     assert!(b.task(id).st("question").contains("type anything"), "a plain 429 isn't a limit Claude Code waits out");
 }
 
-/// Terminal `s1` as Midna lists it: needs_you, either held by the board's Question tab (`labelled`)
-/// or by a prompt of Claude's, and settled long enough for the board to type in it.
+/// Terminal `s1` as Midna lists it under the board's Question tab: idle on the tab's own base
+/// (`labelled`), or needs_you by a prompt of Claude's, and settled long enough for the board to type in it.
 fn needs_you(b: &Board, labelled: bool) {
     let repo = b._dir.path().join("webapp");
-    let (reason, custom) = if labelled {
-        ("Question", json!({"label": "Question", "color": "amber", "base": "needs_you"}))
+    let custom = json!({"label": "Question", "color": "amber", "base": "idle"});
+    let status = if labelled {
+        json!({"state": "idle", "reason": "Question"})
     } else {
-        ("Claude needs your permission to use Bash", json!({"label": "Question", "color": "amber", "base": "needs_you"}))
+        json!({"state": "needs_you", "reason": "Claude needs your permission to use Bash"})
     };
     let s = json!({"id": "s1", "name": "Term s1", "agent": "claude", "cwd": repo.to_string_lossy(),
-                   "status": {"state": "needs_you", "reason": reason}, "custom_status": custom});
+                   "status": status, "custom_status": custom});
     midna::sync(&b.app, &[s], &[]).unwrap();
     b.app.db.x("UPDATE sessions SET status_at = '2026-01-01T00:00:00Z' WHERE id = 's1'", p![]).unwrap();
 }
@@ -1154,4 +1186,67 @@ fn the_task_list_comes_a_page_at_a_time_still_to_do_first() {
     let mut got: Vec<i64> = picked["tasks"].as_array().unwrap().iter().map(|t| t["id"].as_i64().unwrap()).collect();
     got.sort();
     assert_eq!(got, [ids[5], ids[9]]);
+}
+
+#[test]
+fn a_pulled_back_retry_goes_back_on_needs_you_and_isnt_tried_again() {
+    let b = new_board();
+    let id = new_task(&b, "Flaky start", json!({}));
+    // The quick tries, then the board's first own try.
+    let handled = |b: &Board| b.app.db.q("SELECT * FROM events WHERE task_id = ? AND kind = ?", p![id, taskboardd::handled::KIND]).unwrap();
+    while handled(&b).is_empty() {
+        runner::start_queued(&b.app).unwrap();
+        let j = b.app.db.q1("SELECT * FROM jobs WHERE kind = 'agent' AND state = 'pending'", p![]).unwrap().unwrap();
+        b.app.db.x("UPDATE jobs SET state = 'running' WHERE id = ?", p![j.id()]).unwrap();
+        b.app.db.tx(|| jobs::result(&b.app, j.id(), false, "", "midna: the folder is gone", 1)).unwrap();
+        if handled(&b).is_empty() {
+            b.app.db.x("UPDATE tasks SET retry_at = NULL WHERE id = ?", p![id]).unwrap();
+        }
+    }
+    let l = b.get("/handled");
+    assert_eq!((l["items"][0]["can_pull"].as_bool(), l["items"][0]["ref"].as_str()), (Some(true), Some(format!("T{id}").as_str())), "{l}");
+
+    let rec = handled(&b)[0].id();
+    let out = b.post(&format!("/handled/{rec}/pull-back"), json!({}));
+    assert_eq!(out["said"], format!("T{id} is back on Needs you"));
+    let t = b.task(id);
+    assert_eq!((t.s("status"), t.s("needs_reason"), t.s("retry_at")), (Some("needs"), Some("start_failed"), None));
+    assert!(t.st("latest").contains("the folder is gone"), "{}", t.st("latest"));
+    taskboardd::needs_retry::sweep(&b.app).unwrap();
+    assert_eq!(b.task(id).s("status"), Some("needs"), "the board leaves it with the owner");
+    assert_eq!(b.get("/handled")["total"], 0);
+}
+
+#[test]
+fn handled_for_you_lists_newest_first_a_page_at_a_time() {
+    let b = new_board();
+    let a = new_task(&b, "One", json!({}));
+    let c = new_task(&b, "Two", json!({"project": "api"}));
+    for (t, n) in [(a, 1), (c, 2), (a, 3)] {
+        taskboardd::handled::record(&b.app, t, "recheck", &format!("Took it off {n}"), json!({"item": "question", "verdict": "answered", "was": format!("Q{n}")})).unwrap();
+    }
+    let first = b.get("/handled?limit=2");
+    let titles = |v: &Value| v["items"].as_array().unwrap().iter().map(|i| i["title"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!((titles(&first), first["total"].as_i64()), (vec!["Q3".to_string(), "Q2".to_string()], Some(3)));
+    let next = first["next"].as_str().unwrap();
+    let rest = b.get(&format!("/handled?limit=2&before={next}"));
+    assert_eq!((titles(&rest), rest["next"].is_null()), (vec!["Q1".to_string()], true));
+    assert_eq!(titles(&b.get("/handled?project=api")), vec!["Q2".to_string()]);
+}
+
+#[test]
+fn a_sweep_of_many_failed_starts_spaces_their_retries() {
+    let b = new_board();
+    let ids: Vec<i64> = (0..3).map(|i| new_task(&b, &format!("Flaky start {i}"), json!({}))).collect();
+    for id in &ids {
+        b.app
+            .db
+            .x("UPDATE tasks SET status = 'needs', needs_reason = 'start_failed', latest = 'Couldn''t start: git fetch failed' WHERE id = ?", p![id])
+            .unwrap();
+    }
+    b.app.db.tx(|| taskboardd::needs_retry::sweep(&b.app)).unwrap();
+    let mut at: Vec<f64> = ids.iter().map(|id| b.task(*id).s("retry_at").and_then(taskboardd::util::parse_iso).expect("queued to try again")).collect();
+    at.sort_by(f64::total_cmp);
+    let gap = taskboardd::start_pace::GAP_SECS;
+    assert!(at.windows(2).all(|w| w[1] - w[0] >= gap - 1.0), "each starts on its own: {at:?}");
 }

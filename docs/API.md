@@ -225,6 +225,28 @@ goal it holds open; a to-do answered `dont_wait` holds nothing. `later` says wha
 In flight or queued only: a goal with nothing of either (planned, finished, archived or deprioritized) isn't
 listed. Ordered by project, then goals that need you, then working ones, newest goal first.
 
+### `GET /handled`
+
+Handled for you, under Needs you: what the board took off the list by itself, newest first, without the ones
+pulled back. Query: `project=all|<name>`, `ids=12,9` (only these records), `limit` (1–500) and `before=<id>`, the
+`next` of the page before.
+```
+{"items": [{
+   "id": int,                        // the record: POST /handled/:id/pull-back
+   "at": iso,
+   "by": "recheck"|"retry"|"misses", // the sweep that took it off
+   "item": "question"|"human"|"miss"|"start"|"lost",
+   "verdict": "answered"|"agent"|"retry",
+   "text": str,                      // what the board did
+   "why": str|null,                  // the screener's reason, or "From <source>" for an answer
+   "ref": "T12"|"H4"|"B9",           // the item as it was on Needs you
+   "title": str,                     // the question asked, the human task's title or the miss
+   "task": "T12",                    // the task the record is on (for a miss, the task the board made)
+   "project": str, "goal": "G3"|null,
+   "can_pull": bool                  // false once the item moved on (finished, asked again, already started)
+ }], "total": int, "next": str|null}
+```
+
 ### `GET /goals`
 
 No query. Returns `{"goals": [goal_summary]}` for every non-archived goal (all projects). The goals rail, goal
@@ -1007,7 +1029,7 @@ Pipelines steps and tests with. `GET /ci-token` → `{set, source: "board"|"env"
 |---|---|---|
 | `GET /projects` | | Every known project with `remote: bool\|null`, `pr_flow: "auto"\|"on"\|"off"`, `ships_prs: bool`, `pr_rules: {approvals, expected: [str]\|null, expected_wait_mins, required: [str]\|null, ask_stage: bool, swap: bool, review: bool, agents_merge: bool, owner_review: bool, set: {…what tb project set changed}}`, `releases: bool`, `releases_set: bool\|null` (what `tb project set --releases` chose; null: config.toml's `[releases] on`), `release_tags: str\|null` (the tag pattern that cuts releases; see Releases), `code_review: str\|null` (the reviewer command its tasks get, see REVIEW-PROTOCOL.md) and `code_review_set: str\|null` (what `tb project set --code-review` chose: a command, `""` for none; null: config.toml's `[code_review] command`) (`tb project show`). |
 | `POST /projects/:name` | `{pr_flow?: "auto"\|"on"\|"off", approvals?: int\|null, expected?: [str]\|null, expected_wait_mins?: number\|null, required?: [str]\|null, ask_stage?: bool\|"on"\|"off"\|null, swap?: bool\|"on"\|"off"\|null, review?: bool\|"on"\|"off"\|null, agents_merge?: bool\|"on"\|"off"\|null, owner_review?: bool\|"on"\|"off"\|null, max_terminals?: int\|"default"\|null, waits_on?: [str]\|str\|null, releases?: bool\|"on"\|"off"\|"default"\|null, release_tags?: str\|"none"\|null, release_script?: str\|"none"\|null, release_branch?: str\|"default"\|null, code_review?: str\|"none"\|"default"\|null, stack_merge_default?: "head"\|"tail"\|"default"\|null, devices?: str\|[str]\|"none"\|null}` | `pr_flow`: whether the project's work ends in PRs; `auto` follows its git remote (`tb project set --pr-flow`). `max_terminals` (1–100, `tb project set --max-terminals N`; null or `default` goes back to config.toml's `[terminals] project_max`, 5): a queued start (pickup `queue`) opens its terminal only while fewer of the project's terminals are busy (working, needs you, or idle with background commands or agents running; a monitor doesn't count); until then its card's `waiting` says so. `waits_on` (`tb project set --waits-on api,core`; null, `[]` or `"none"` clears it): the other projects whose tasks this project's tasks may wait for (`tb wait-for`, `waits_for`), one way only; unknown names are a 404. Without it, waiting for another project's task is a 409. `releases` (`tb project set --releases on|off|default`): whether the project cuts releases (see Releases); null or `default` goes back to config.toml's `[releases] on` (off). `release_tags` (`tb project set --release-tags 'v*'`; null, `""` or `none` clears it): a git tag pattern; a new matching tag on the default branch cuts a release (see Releases). No spaces, `..` or leading `-`, 100 characters at most (400). `release_branch` (`tb project set --release-branch <branch>\|default`): the branch its release script runs from, or `prefix/*` for any branch under it; null, `""`, `none` or `default` goes back to `main` or `release/*` (see Releases). A branch name git takes, 100 characters at most (400); `GET /projects` gives it as `release_branch` (null when unset). `code_review` (`tb project set --code-review '<command>'\|none\|default`): the project's own pre-PR reviewer command, run with `sh -c` (see REVIEW-PROTOCOL.md); `none` turns review off for it, null or `default` goes back to config.toml's `[code_review] command`; one line (400). `stack_merge_default` (`tb project set --stack-merge-default head|tail|default`): how the project's stacked tasks merge when `stack_on` comes without `stack_merge`; null or `default` clears it (tail). Anything else is a 400. `devices` (`tb project set --device ios`, repeat for more; `none` or `[]` clears it): what each of the project's tasks asks for from the device pool when neither it nor its goal asks (see Devices); `GET /projects` gives it as `devices` (`"ios"`, `""` when unset). `GET /projects` gives `stack_merge_default` (in force) and `stack_merge_set` (`"head"`, `"tail"` or null), `GET /planning` gives `stack_merge: {default, set}` for its project, and the planner's prompt names a default once the project sets one. The PR rules (`tb project set --approvals N`, `--expected-check NAME` (repeat; `none` = `[]`), `--expected-wait MINS`, `--required-check NAME` (repeat; `none` = `[]`), `--ask-stage on|off`, `--swap on|off`, `--review on|off`, `--agents-merge on|off`; `default` sends null) change the project's rules on the board; null goes back to config.toml's. At least one key. **Response read:** the project as in `GET /projects`. |
-| `GET /terminals` | — | The board-wide cap on task terminals: `{max_terminals, max_terminals_set: int\|null, running, line}`. A task's start opens its terminal only while fewer than `max_terminals` task terminals run across every project (a task's own terminal while the task works or the terminal is busy, plus starts being opened); until then its card's `waiting` reads `Waits for a free slot: 8 of 8 task terminals running across the board` and it starts as slots free. Goal and project limits still apply under it. |
+| `GET /terminals` | — | The board-wide cap on task terminals: `{max_terminals, max_terminals_set: int\|null, running, pressure: {load1, cpus, memory, memory_free_bytes, midnad: {cpu_percent, memory_bytes}, from}\|null, held: string\|null, line}`. A task's start opens its terminal only while fewer than `max_terminals` task terminals run across every project (a task's own terminal while the task works or the terminal is busy, plus starts being opened); until then its card's `waiting` reads `Waits for a free slot: 8 of 8 task terminals running across the board` and it starts as slots free. Goal and project limits still apply under it. Task starts also wait while the Mac's 1-minute load average per core is at or above `[terminals] hold_load_per_core` (1.5; 0 turns it off) or macOS's memory pressure reaches `[terminals] hold_memory` (`warning`, `critical` or `off`), or less memory is free than `[terminals] hold_free_memory_gb` (2; 0 turns it off): `held` and the card's `waiting` say so (`Waits for the Mac to calm down: load 30.0 on 12 cores (starts wait from 18)`, `Waits for free memory: macOS memory pressure is warning`, `Waits for free memory: 1.5 GB free (starts wait under 2 GB)`), with `; midnad itself runs hot (140% CPU, 1 GB)` after it while midnad uses a whole core or more. The daemon log notes when starts begin and stop waiting. Once a hold clears, held starts open one per fresh reading (about every 15s) and the rest read `Waits its turn: the Mac just calmed down, so held starts open one per load reading`; the pacing ends at the first reading on which none opened. `pressure` is the reading, from Midna's `system.load` while Midna is up (`from: "midna"`), else the kernel's (`"mac"`). Free memory and midnad's use come only from Midna: 0 is unknown and never holds. |
 | `POST /terminals` | `{max_terminals: int\|"default"\|null}` | Sets the cap (1–100, `tb terminals --max N`); null or `default` goes back to config.toml's `[terminals] global_max` (8). **Response read:** as `GET /terminals`. |
 | `GET /projects/agents-merge` | | `tb project agents-merge`: `{agents_merge: bool, set: bool\|null, config: bool}`: whether agents merge on projects whose own rules don't say, what the board set (null: nothing), and config.toml's `pr.agents_merge`. |
 | `POST /projects/agents-merge` | `{agents_merge: bool\|"on"\|"off"\|null}` | `tb project agents-merge on\|off\|default`: the board-wide switch, over config.toml's `pr.agents_merge` and under a project's own `agents_merge`; null goes back to config.toml's. `taskboardd import` sets it on unless the board already says or config.toml sets `pr.agents_merge` (unset: off). **Response read:** as `GET /projects/agents-merge`. |
@@ -1064,11 +1086,12 @@ Pipelines steps and tests with. `GET /ci-token` → `{set, source: "board"|"env"
 | `POST /alerts` | `{text, urgent?: bool, key?: str, task?: "T12", goal?: "G3"}` | Raise an alert (`tb alert raise`). With a `key`, raising it again while it's up returns the one that's up. 409 for a plain alert on a task that has an urgent one up. A new alert is marked `suggest: "pending"` (unless `[alerts] suggest = false`), as an agent's question alert is: the board then asks Haiku for its card's `title`, `detail` and one to three `actions` (`{label, prompt, command: ""}`, each opening a Claude terminal with `prompt` typed in), and sets `suggest` to `"done"`, or `"failed"` with the alert left as plain text. **Response read:** `{alert}`. |
 | `POST /alerts/:id/talk` | `{}` | Talk it over on Needs you: a Claude terminal in the alert's project's checkout (the home folder when it has none) with the alert in its context. Settles nothing. 404 for an alert that's gone, 409 while Midna is down. **Response read:** `{ok, job}`. |
 | `POST /alerts/:id/clear` | `{}` | Clear an alert by its id or key, urgent ones too (`tb alert clear`). **Response read:** `{alerts}`. |
+| `POST /handled/:id/pull-back` | `{}` | Pull back on Handled for you (only from the app): the item goes back on Needs you and off Handled for you. A question is asked again (its terminal is told the board's answer was pulled back; a task not yet started drops it from its handoff); a human task reopens, and a task the board made to do it goes when nothing started it; a miss is marked the owner's call and its alert comes back, and the task the board made for it goes; a retry is back on Needs you as it was, and the board doesn't try it again while it's there. The board doesn't re-check a pulled-back item until it changes. 409 once the item moved on (finished, asks something else, or the board's task already started), or for a record with no way back. **Response read:** `{ok, said}`. |
 | `POST /home/talk` | `{project?}` | Talk it over in the Needs you header: an agent job (purpose `needs_talk`) opens a Claude terminal and brings it to the front, with every Needs you item (only `project`'s when given) in its context and "What needs me, and what should I do first?" typed in for the owner to send. In `project`'s checkout when given and checked out, the home folder otherwise. Settles nothing; Claude acts on an item only on the owner's word, through `tb needs`. 409 while Midna is down. **Response read:** `{ok, job}`. |
 | `POST /alerts/:id/snooze` | `{mins}`, `{until: "tomorrow"\|"next_week"\|"back"}` or `{after_goal: "G3"}` | Put a Needs you item off: an alert, a task with no alert (`task:T12`) or a finished stage (`stage:G3:1`). `mins` is up to a week; `tomorrow` and `next_week` are when those work hours start (`next_week` is next Monday); `back` is after the owner's next stretch away; `after_goal` is when that goal finishes or is archived, and is 409 for a goal that's over or that the item holds open. A put-off agent question still counts in `waiting` on `GET /home`. **Response read:** `{alert}`. |
 
 ### Context limits (`tb limits`)
-`GET /limits` → `{compact_window, cold_idle_mins, warm_tokens, warm_idle_mins, max_compactions, generated: [glob], project_generated: {project: [glob]}, defaults: {…the same, from config.toml}, review_gaps: [{step, mins}], line: str}`.
+`GET /limits` → `{compact_window, cold_idle_mins, warm_tokens, warm_idle_mins, max_compactions, idle_close_mins, generated: [glob], project_generated: {project: [glob]}, defaults: {…the same, from config.toml}, review_gaps: [{step, mins}], line: str}`.
 `review_gaps` lists each step that keeps its rounds apart (its `min_gap_mins`, or the board's change), and `line` adds
 "Review rounds, <step>: one round per branch every N min" for each.
 `POST /limits` takes any of those numbers (0 turns one off, null puts config.toml's back), `generated` (a list, a
@@ -1096,6 +1119,17 @@ by the board's, and once after an upgrade every repo the board has known is swep
   force-closes it as it starts one more compaction, and the task is queued to start again from its handoff in a fresh
   terminal ("Closed after compacting its conversation too many times"). PR visits aren't counted. Only terminals the
   board opened are closed: one the owner opened that took a task (`tb task new --here`, `tb take`) stays open.
+- `idle_close_mins` (default 30; 0 keeps them open): a task terminal the board opened that has sat idle at its prompt this
+  long (no background work, not offline or usage-limited, no message on its way to it, no line of tasks behind it, not
+  waiting on a set time) gives its memory back. A working task is first sent a deliver job (purpose `idle_checkpoint`)
+  asking it to save a checkpoint and end its turn; once that turn is over (or it sat idle as long again without taking
+  it in) the board closes the terminal (close purpose `idle_close`, never forced). A task waiting on the owner's answer
+  isn't asked, it's just closed. The task keeps its status, its question and its worktree slot, and its context keeps
+  `idle_closed: {session, at}` ("Closed its idle terminal to free memory"). The next deliver job for it (a code review's
+  word or findings, a rebase note, a freed slot, the owner's answer; not a checkpoint request or a check-in) starts it in
+  a new terminal with that message: its conversation carries on (`--resume`) under `warm_tokens`/`warm_idle_mins`,
+  else it starts fresh from the handoff with the message after it. Answering its question does the same. Jobs that come
+  while that terminal opens wait and reach it once it takes the task, which clears `idle_closed`.
 
 ### History
 | Path | Body | Notes |
@@ -1563,11 +1597,13 @@ request for changes doesn't make it one.
 `tb project set <name> --ask-stage on|off|default`, which `taskboardd import` turns on for a project where the old
 board used the stage). Once the owner has marked a green PR reviewed
 (`POST /tasks/:id/pr/reviewed`, "I reviewed it"), its phase is `ask` until reviewers are asked (`pr_flow.asked`).
-In work hours, with `pr.wake` on, the agent is brought back to run `tb pr reviewers` (which finishes the visit);
-otherwise the board picks and asks them itself through the host (asks with `why: "stage"`, by "Task board"),
+No agent is brought back for it: the board picks and asks them itself through the host, at any hour (asks with
+`why: "stage"`, by "Task board"),
 retrying after each of `ask_retry_waits` seconds (`pr_flow.ask_tries`, `ask_retry_at`) and alerting once they're
-spent. Then the phase moves on to `review`. While the feed holds (`feed::holding`), the agent isn't brought back to
-ask and the board doesn't ask; the sweep brings the agent back once the feed has settled. `tb pr reviewers` (besides
+spent. Then the phase moves on to `review`. While the feed holds (`feed::holding`), the board doesn't ask; the
+sweep asks once the feed has settled. A terminal an older board brought back to ask (`pr_flow.woke` `ask:…`) no
+longer holds itself open: its tab closes once idle, and `tb pr reviewers` there finishes the visit even after the
+PR has moved on. `tb pr reviewers` (besides
 `--dry-run`) answers 409 while the feed holds, and, with the stage on, when it would ask someone before the owner
 has reviewed the PR and before anyone was asked on it, whatever the task's status (a reopened task waits too); a
 later `--replace` or `--drop` doesn't wait for the owner. Asked on it counts the host too: anyone on the PR's

@@ -31,6 +31,8 @@ pub struct Shared {
     pub keep_awake_pushed: Option<(Instant, Value)>,
     /// Midna's `agents.resume_after_network`, and when the board last read it.
     pub midna_resumes_network: Option<(Instant, bool)>,
+    /// Midna's `guard.build_slots` as last read with it: builds that run at once (`builds::jobs`).
+    pub midna_build_slots: Option<i64>,
     /// When the board last checked its link patterns in Midna, and the Midna (pid and start) that has them.
     pub midna_links: Option<(Instant, Option<String>)>,
     /// The Midna run that has the board's link menus and the menus it was given (empty when that
@@ -50,6 +52,15 @@ pub struct Shared {
     pub midna_panels_sent: HashMap<String, Value>,
     /// Terminals Midna said it doesn't have (closed and gone from its Summary): no panel goes to them again.
     pub midna_panels_gone: HashSet<String>,
+    /// The Mac's last load and memory reading and when it was taken (`pressure.rs`).
+    pub pressure: Option<(Instant, crate::pressure::Reading)>,
+    /// A reading tests put in place of the Mac's.
+    pub pressure_fixed: Option<crate::pressure::Reading>,
+    /// What last held task starts back on the Mac's load or memory, as logged: a change logs again.
+    pub pressure_held: Option<String>,
+    /// Some while held starts open one per reading after a hold cleared; true once one opened on the
+    /// current reading (`pressure::pace_hold`).
+    pub pressure_pace: Option<bool>,
     pub recent_reports: VecDeque<String>,
     pub recent_set: HashSet<String>,
     pub prs_checked_at: Option<String>,

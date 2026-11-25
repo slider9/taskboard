@@ -248,16 +248,28 @@ fn kind_params(kind: &str) -> Option<Value> {
 
 /// Sends a notification (`notify.send`). Midna refuses a category it has no kind for, so when one of the
 /// board's kinds isn't there (a Midna that never had it, or the owner removed it) it adds the kind and sends again.
+/// A send that still doesn't go through leaves a line in server.log: callers send on their own thread and drop it.
 pub fn notify_send(exe: &Path, params: &Value) -> MResult<Value> {
     let kind = params["category"].as_str().unwrap_or(NOTIFY_KIND);
-    match call_exe(exe, "notify.send", params, CALL_TIMEOUT) {
+    let r = match call_exe(exe, "notify.send", params, CALL_TIMEOUT) {
         Err(MidnaError::Refused(m)) if m.contains(&format!("no kind `{kind}`")) && kind_params(kind).is_some() => {
             // Another send may have added it meanwhile; the second send says whether it's there.
             let _ = call_exe(exe, "notify.kinds.add", &kind_params(kind).unwrap_or_default(), CALL_TIMEOUT);
             call_exe(exe, "notify.send", params, CALL_TIMEOUT)
         }
         r => r,
+    };
+    if let Err(e) = &r {
+        crate::slowlog::line(not_sent(params, e));
     }
+    r
+}
+
+/// The server.log line for a notification Midna didn't take: its kind, title and Midna's reason.
+fn not_sent(params: &Value, e: &MidnaError) -> String {
+    let kind = params["category"].as_str().unwrap_or(NOTIFY_KIND);
+    let title = crate::slowlog::short(params["title"].as_str().unwrap_or(""), 80);
+    format!("notification not sent ({kind}) \"{title}\": {e}")
 }
 
 pub fn call(app: &App, method: &str, params: Value) -> MResult<Value> {
@@ -459,6 +471,9 @@ fn run_agent(app: &App, j: &Row, a: &Row) -> MResult<String> {
         return Err(MidnaError::Refused("Midna opened no terminal".into()));
     };
     set_target(app, j.id(), "session", json!(sid))?;
+    if let Some(tid) = j.i("task_id") {
+        crate::task_grants::on_open(app, tid, &sid);
+    }
     // The prompt goes in even when its compact couldn't: a full-size conversation beats one with no prompt.
     if cold {
         let compacted = send(app, &sid, "/compact");
@@ -582,7 +597,7 @@ fn git_of(s: &Value) -> (Value, Value) {
     }
 }
 
-/// Midna's state for terminal `s` is only held by a tab status (the board's own Question puts it in
+/// Midna's state for terminal `s` is only held by a tab status (the board's own Alert puts it in
 /// needs_you), not by a prompt of the agent's: Midna's own rule for typing into a terminal.
 fn labelled(s: &Value) -> bool {
     let (st, cs) = (&s["status"], &s["custom_status"]);
@@ -803,6 +818,11 @@ fn read_settings(app: &App) {
         let on = v["value"].as_bool().unwrap_or(true);
         app.shared.lock().midna_resumes_network = Some((Instant::now(), on));
     }
+    if let Ok(v) = call_timeout(app, "settings.get", json!({"key": "guard.build_slots"}), 5.0) {
+        if let Some(n) = v["value"].as_i64() {
+            app.shared.lock().midna_build_slots = Some(n);
+        }
+    }
 }
 
 /// How often the board checks that Midna (maybe restarted) has its link patterns.
@@ -926,11 +946,13 @@ fn register_menus(app: &App, run: &str) {
 }
 
 /// The tab statuses the board gives a task's terminal: what it sends, the label, its color and the
-/// state Midna sorts and notifies by. Each comes off with the terminal's next prompt.
+/// state Midna sorts and notifies by. Each comes off with the terminal's next prompt. A question
+/// shows in Midna on an idle base: the board's own alert is the one that asks Morgan, so Midna
+/// raises no second needs-you card for it.
 pub const TAB_STATUSES: [(&str, &str, &str, &str); 7] = [
     ("in_review", "In review", "purple", "done"),
     ("done", "Done", "green", "done"),
-    ("question", "Question", "amber", "needs_you"),
+    ("question", "Question", "amber", "idle"),
     ("alert", "Alert", "red", "needs_you"),
     ("urgent", "Alert", "red", "needs_you"),
     ("failed", "Task failed", "red", "failed"),
@@ -946,7 +968,7 @@ pub fn tab_field(field: &str) -> bool {
 }
 
 /// The Midna call that puts a tab status (one of `TAB_STATUSES`, or `TAB_CLEAR`) on terminal `sid`.
-/// `detail` says what it's waiting on; Midna shows it on the needs-you card a needs_you status raises.
+/// `detail` says what it's waiting on; Midna shows it with the status.
 /// A `held` one goes on with an idle base, so Midna raises no needs-you item for it (`held_tab`).
 pub fn tab_call(sid: &str, tab: &str, detail: Option<&str>, held: bool) -> (&'static str, Value) {
     match TAB_STATUSES.iter().find(|(t, ..)| *t == tab) {
@@ -1573,15 +1595,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let app = App::for_tests(crate::config::Config::for_tests(dir.path()));
         crate::hours::shut_for_tests(&app);
-        assert!(held_tab(&app, "question"));
         assert!(held_tab(&app, "alert"));
         assert!(!held_tab(&app, "urgent"));
         assert!(!held_tab(&app, "done"));
-        let (_, held) = tab_call("s1", "question", Some("T1 · Fix: which port?"), true);
-        assert_eq!((held["base"].as_str(), held["label"].as_str()), (Some("idle"), Some("Question")));
+        let (_, held) = tab_call("s1", "alert", Some("T1 · Fix: stuck"), true);
+        assert_eq!((held["base"].as_str(), held["label"].as_str()), (Some("idle"), Some("Alert")));
         let (_, urgent) = tab_call("s1", "urgent", None, false);
         assert_eq!((urgent["base"].as_str(), urgent["label"].as_str()), (Some("needs_you"), Some("Alert")));
         crate::hours::set(&app, &json!({"on": false})).unwrap();
+        assert!(!held_tab(&app, "alert"));
+    }
+
+    #[test]
+    fn a_question_tab_shows_in_midna_without_raising_a_needs_you_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::for_tests(crate::config::Config::for_tests(dir.path()));
+        crate::hours::shut_for_tests(&app);
+        let (method, tab) = tab_call("s1", "question", Some("T1 · Fix: which port?"), false);
+        assert_eq!(method, "session.set_status");
+        assert_eq!((tab["label"].as_str(), tab["base"].as_str()), (Some("Question"), Some("idle")));
+        assert_eq!(tab["detail"].as_str(), Some("T1 · Fix: which port?"));
         assert!(!held_tab(&app, "question"));
     }
 
