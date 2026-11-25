@@ -576,3 +576,108 @@ fn the_owners_word_moves_this_terminals_task_to_a_terminal_of_its_own() {
     let held = b.app.db.count("SELECT COUNT(*) FROM worktree_slots WHERE task_id = ?", p![id(&t1)]).unwrap();
     assert_eq!(held, 1, "the slot stays the task's");
 }
+
+fn git(path: &std::path::Path, args: &[&str]) -> String {
+    let o = std::process::Command::new("git").arg("-C").arg(path).args(args).output().unwrap();
+    assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+/// The board's project folder as a clone of a bare origin with one commit on main.
+fn git_repo(b: &Board) -> String {
+    let origin = b.dir.path().join("origin.git");
+    let repo = b.dir.path().join("webapp");
+    std::fs::remove_dir_all(&repo).unwrap();
+    git(b.dir.path(), &["init", "-q", "--bare", "-b", "main", &origin.to_string_lossy()]);
+    git(b.dir.path(), &["clone", "-q", &origin.to_string_lossy(), &repo.to_string_lossy()]);
+    git(&repo, &["config", "core.autocrlf", "false"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    git(&repo, &["switch", "-q", "-c", "main"]);
+    std::fs::write(repo.join("README"), "webapp\n").unwrap();
+    git(&repo, &["add", "README"]);
+    git(&repo, &["commit", "-q", "-m", "First"]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    repo.to_string_lossy().to_string()
+}
+
+#[test]
+fn the_next_task_in_line_starts_in_its_own_slot_not_the_one_another_task_took() {
+    // B32: T96 waited in T72's terminal, which sat in slot-1. T72 gave slot-1 back and T75 took it; when
+    // the terminal moved on to T96, T96 cut its branch in slot-1, under T75.
+    let b = new_board();
+    git_repo(&b);
+    let t72 = b.on_task("s1", "Time it under load");
+    board::update_task(&b.app, id(&t72), fields!["lane" => "slot"]).unwrap();
+    let slot1 = b.post(&format!("tasks/{t72}/slot/claim"), json!({}))["path"].as_str().unwrap().to_string();
+    b.app.db.x("UPDATE sessions SET cwd = ? WHERE id = 's1'", p![slot1.clone()]).unwrap();
+    let t96 = b.split("s1", "Export every play", "next")["created"][0].as_str().unwrap().to_string();
+    board::update_task(&b.app, id(&t96), fields!["lane" => "slot"]).unwrap();
+
+    b.post(&format!("tasks/{t72}/slot/release"), json!({}));
+    let t75 = b.on_task("s2", "Count the plays");
+    board::update_task(&b.app, id(&t75), fields!["lane" => "slot"]).unwrap();
+    assert_eq!(b.post(&format!("tasks/{t75}/slot/claim"), json!({}))["path"].as_str(), Some(slot1.as_str()), "T75 takes the slot T72 gave back");
+
+    let t75_head = git(std::path::Path::new(&slot1), &["rev-parse", "HEAD"]);
+    git(std::path::Path::new(&slot1), &["switch", "-q", "-c", "export/every-play"]);
+
+    let out = b.report("tb.done", "s1", json!({"summary": "Timed it.", "no_pr": "Test"}));
+    let c = out["context"].as_str().unwrap();
+    assert!(c.starts_with(&format!("[task-board:{t96}] {t72} is done")), "{c}");
+    assert_eq!(b.on("s1").as_deref(), Some(t96.as_str()));
+    let own = b.get(&format!("tasks/{t96}/slot"))["path"].as_str().expect("the board claimed the next task a slot of its own").to_string();
+    assert_ne!(taskboardd::util::path_key(&own), taskboardd::util::path_key(&slot1), "not the slot T75 holds");
+    assert!(c.contains(&format!("This terminal is in {slot1}, a worktree slot {t96} doesn't hold. {t96} has its own: cd \"{own}\"")), "{c}");
+    assert!(c.contains(&format!("The board gave the task the worktree slot-2 from its pool: {own}")), "{c}");
+    assert!(!c.contains("worktree slot-1 from its pool") && !c.contains("slot claim"), "{c}");
+    assert_eq!(b.get(&format!("tasks/{t75}/slot"))["path"].as_str(), Some(slot1.as_str()), "T75 keeps slot-1");
+    assert_eq!(git(std::path::Path::new(&slot1), &["branch", "--show-current"]), "export/every-play", "T75's branch stays put");
+    assert_eq!(git(std::path::Path::new(&slot1), &["rev-parse", "HEAD"]), t75_head);
+}
+
+#[test]
+fn the_next_task_in_line_takes_the_slot_its_terminal_left_when_no_one_else_did() {
+    let b = new_board();
+    git_repo(&b);
+    let t1 = b.on_task("s1", "Fix the header");
+    board::update_task(&b.app, id(&t1), fields!["lane" => "slot"]).unwrap();
+    let slot1 = b.post(&format!("tasks/{t1}/slot/claim"), json!({}))["path"].as_str().unwrap().to_string();
+    b.app.db.x("UPDATE sessions SET cwd = ? WHERE id = 's1'", p![slot1.clone()]).unwrap();
+    let t2 = b.split("s1", "Make the footer sticky", "next")["created"][0].as_str().unwrap().to_string();
+    board::update_task(&b.app, id(&t2), fields!["lane" => "slot"]).unwrap();
+
+    let out = b.report("tb.done", "s1", json!({"summary": "Fixed it.", "no_pr": "Test"}));
+    let c = out["context"].as_str().unwrap();
+    assert_eq!(b.get(&format!("tasks/{t2}/slot"))["path"].as_str(), Some(slot1.as_str()), "the slot its last task gave back");
+    assert!(c.contains(&format!("The board gave the task the worktree slot-1 from its pool: {slot1}")), "{c}");
+    assert!(!c.contains("cd \""), "it's already there: {c}");
+}
+
+#[test]
+fn a_next_task_sent_to_its_terminal_later_gets_its_slot_first() {
+    // The owner marks the task done: the board moves the terminal on inside its tick, then claims the
+    // slot and sends the text on its worker, outside the transaction.
+    let mut b = new_board();
+    Arc::get_mut(&mut b.app).unwrap().inline_deferred = false;
+    git_repo(&b);
+    let t1 = b.on_task("s1", "Fix the header");
+    board::update_task(&b.app, id(&t1), fields!["lane" => "slot"]).unwrap();
+    let slot1 = b.post(&format!("tasks/{t1}/slot/claim"), json!({}))["path"].as_str().unwrap().to_string();
+    b.app.db.x("UPDATE sessions SET cwd = ? WHERE id = 's1'", p![slot1.clone()]).unwrap();
+    let t2 = b.split("s1", "Make the footer sticky", "next")["created"][0].as_str().unwrap().to_string();
+    board::update_task(&b.app, id(&t2), fields!["lane" => "slot"]).unwrap();
+
+    b.post(&format!("tasks/{t1}/done"), json!({"summary": "Done by hand."}));
+    b.app.db.tx(|| lines::tick(&b.app)).unwrap();
+    assert_eq!(b.on("s1").as_deref(), Some(t2.as_str()));
+    assert!(b.get(&format!("tasks/{t2}/slot"))["path"].is_null(), "no git inside the transaction");
+    while let Some(f) = b.app.next_deferred(std::time::Duration::ZERO) {
+        f(&b.app);
+    }
+    let own = b.get(&format!("tasks/{t2}/slot"))["path"].as_str().expect("claimed before its text went").to_string();
+    assert_ne!(taskboardd::util::path_key(&own), taskboardd::util::path_key(&slot1), "T1 hadn't given slot-1 back yet");
+    let out = b.report("hook.stop", "s1", json!({"last_message": "ok"}));
+    let text = out["deliver"]["text"].as_str().unwrap();
+    assert!(text.contains(&format!("[task-board:{t2}]")) && text.contains(&format!("{t2} has its own: cd \"{own}\"")), "{text}");
+}

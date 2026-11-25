@@ -140,9 +140,28 @@ fn next_ready(app: &App, sid: &str) -> Result<Option<Row>> {
     Ok(None)
 }
 
+/// A terminal moved on to a task that needs a worktree slot the board claims for it first. Claiming
+/// checks the slot out with git (seconds, more on a big repository), so a move made inside a
+/// transaction leaves the claim and the text that brings the agent on to `finish`, once it's over.
+pub struct Later {
+    sid: String,
+    task: i64,
+    why: String,
+    resuming: bool,
+}
+
+/// Where a move left its terminal: on its next task with the text that brings the agent onto it, or
+/// on a task whose slot is claimed first.
+pub enum Moved {
+    Now(Row, String),
+    Later(Later),
+}
+
 /// Moves terminal `sid`, on no task now, on to the next ready task in its line. The task and the text
-/// that brings the agent onto it (`why` first: "T12 is done"), its handoff included.
-pub fn advance(app: &App, sid: &str, claude: Option<&str>, why: &str) -> Result<Option<(Row, String)>> {
+/// that brings the agent onto it (`why` first: "T12 is done"), its handoff included. A task on the
+/// slot lane holding no slot gets one first, so it never starts in the slot its terminal sits in;
+/// inside a transaction that's `Later`.
+pub fn advance(app: &App, sid: &str, claude: Option<&str>, why: &str) -> Result<Option<Moved>> {
     if board::task_for_session(app, Some(sid))?.is_some() {
         return Ok(None);
     }
@@ -162,26 +181,71 @@ pub fn advance(app: &App, sid: &str, claude: Option<&str>, why: &str) -> Result<
     waitsfor::started(app, &next)?;
     let next = board::get_task(app, next.id())?;
     app.db.x("UPDATE sessions SET ctx_task = ?, ctx_version = ? WHERE id = ?", p![next.id(), next.v("ctx_version"), sid])?;
-    let r = rf("task", next.id());
-    let how = if resuming { "picks up where it left off on" } else { "moves on to" };
-    let place = where_to_work(app, &s, &next)?.map(|w| format!("\n\n{w}")).unwrap_or_default();
-    let text = format!(
-        "{} {why}; this terminal {how} {r} “{}”, next in its line.{place}\n\n{}",
-        handoff::marker(next.id()),
-        next.st("title"),
-        handoff::build(app, next.id())?
-    );
-    Ok(Some((next, text)))
+    let later = Later { sid: sid.to_string(), task: next.id(), why: why.to_string(), resuming };
+    if needs_slot(app, &next)? {
+        if app.db.held_here() {
+            return Ok(Some(Moved::Later(later)));
+        }
+        claim_slot(app, next.id());
+    }
+    let text = move_text(app, &later)?;
+    Ok(Some(Moved::Now(board::get_task(app, next.id())?, text)))
 }
 
-/// Where `next` works when its terminal sits in a worktree slot `next` doesn't hold: the slot its last
-/// task used, which the board gives to other tasks, so switching its branch there takes another task's
-/// worktree from under it. Its own slot, else a slot it claims (slot lane), else the project's shared
-/// checkout. None when the terminal isn't in such a slot.
+/// Whether `t` works in a worktree slot and holds none, nor a worktree of its own from before the pool.
+fn needs_slot(app: &App, t: &Row) -> Result<bool> {
+    if t.s("pickup") == Some("attach") || crate::slots::held(app, t)?.is_some() || crate::worktrees::made(app, t)?.is_some() {
+        return Ok(false);
+    }
+    Ok(crate::worktrees::slot_repo(app, t)?.is_some())
+}
+
+/// Claims task `id`'s worktree slot. When it can't (the pool is full, git failed), the move's text
+/// tells the agent to claim one.
+fn claim_slot(app: &App, id: i64) {
+    if let Err(e) = board::get_task(app, id).and_then(|t| crate::worktrees::ensure(app, &t)) {
+        app.info(format!("lines: {} moved on without a worktree slot: {}", rf("task", id), e.message));
+    }
+}
+
+/// The text that brings the agent onto the task a move left its terminal on: why, where it works and
+/// its handoff.
+fn move_text(app: &App, l: &Later) -> Result<String> {
+    let s = board::get_session(app, Some(&l.sid))?.unwrap_or_default();
+    let next = board::get_task(app, l.task)?;
+    let r = rf("task", next.id());
+    let how = if l.resuming { "picks up where it left off on" } else { "moves on to" };
+    let place = where_to_work(app, &s, &next)?.map(|w| format!("\n\n{w}")).unwrap_or_default();
+    Ok(format!(
+        "{} {}; this terminal {how} {r} “{}”, next in its line.{place}\n\n{}",
+        handoff::marker(next.id()),
+        l.why,
+        next.st("title"),
+        handoff::build(app, next.id())?
+    ))
+}
+
+/// A `Later` move once its transaction is over: claims the task's slot, then the text that brings the
+/// agent onto it. None when the terminal has gone on to another task meanwhile.
+pub fn finish(app: &App, l: &Later) -> Result<Option<String>> {
+    claim_slot(app, l.task);
+    if board::task_for_session(app, Some(&l.sid))?.map(|t| t.id()) != Some(l.task) {
+        return Ok(None);
+    }
+    move_text(app, l).map(Some)
+}
+
+/// Where `next` works when its terminal isn't there. A terminal in a worktree slot `next` doesn't hold
+/// sits in the slot its last task used, which the board gives to other tasks, so switching its branch
+/// there takes another task's worktree from under it. Its own slot, else a slot it claims (slot lane),
+/// else the project's shared checkout. None when the terminal is already where it works.
 fn where_to_work(app: &App, s: &Row, next: &Row) -> Result<Option<String>> {
     let cwd = s.s("cwd").filter(|c| !c.is_empty()).or(s.s("project_path"));
-    let Some(slot) = crate::worktrees::root_of(cwd).filter(|p| crate::slots::is_slot(p)) else { return Ok(None) };
     let r = rf("task", next.id());
+    let Some(slot) = crate::worktrees::root_of(cwd).filter(|p| crate::slots::is_slot(p)) else {
+        let Some(own) = crate::slots::held(app, next)?.map(|o| o.st("path")) else { return Ok(None) };
+        return Ok(Some(format!("{r} works in its own worktree slot: cd \"{own}\" and work there.")));
+    };
     if let Some(own) = crate::slots::held(app, next)? {
         let path = own.st("path");
         if crate::util::path_key(&path) == crate::util::path_key(&slot) {
@@ -201,11 +265,29 @@ fn where_to_work(app: &App, s: &Row, next: &Row) -> Result<Option<String>> {
     }))
 }
 
-/// `advance`, its text sent to the terminal (by its next hook, or typed in once it's idle).
+/// `advance`, its text sent to the terminal (by its next hook, or typed in once it's idle). A task
+/// whose slot is claimed first has its text sent once the claim is done, outside the transaction.
 pub fn deliver_next(app: &App, sid: &str, why: &str) -> Result<Option<Row>> {
-    let Some((next, text)) = advance(app, sid, None, why)? else { return Ok(None) };
-    deliver::add(app, "line_next", &text, next.id(), None, None)?;
-    Ok(Some(next))
+    match advance(app, sid, None, why)? {
+        None => Ok(None),
+        Some(Moved::Now(next, text)) => {
+            deliver::add(app, "line_next", &text, next.id(), None, None)?;
+            Ok(Some(next))
+        }
+        Some(Moved::Later(l)) => {
+            let next = board::get_task(app, l.task)?;
+            app.defer(Box::new(move |app: &App| {
+                let sent = finish(app, &l).and_then(|text| match text {
+                    Some(text) => app.db.tx(|| deliver::add(app, "line_next", &text, l.task, None, None).map(|_| ())),
+                    None => Ok(()),
+                });
+                if let Err(e) = sent {
+                    app.info(format!("lines: couldn't send {} its next task: {}", rf("task", l.task), e.message));
+                }
+            }));
+            Ok(Some(next))
+        }
+    }
 }
 
 /// One line naming terminal `sid`'s line, or "" when it's empty.
