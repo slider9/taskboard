@@ -11,5 +11,9 @@ rustc-wrapper = "scripts/rustc-wrapper.sh"
 RUST_MIN_STACK = "8388608"
 
 # Windows gives a program's main thread 1 MiB, not macOS's 8 MiB; give it the same 8 MiB.
+# The C runtime is linked in (+crt-static): a clean Windows 10 has the Universal CRT but not
+# VCRUNTIME140.dll, so a dynamically linked taskboard-app.exe wouldn't start without Microsoft's
+# Visual C++ redistributable. packaging/windows/check-runtime.sh fails a build that still imports it.
+# A RUSTFLAGS variable replaces these flags: packaging/windows/build.sh clears it.
 [target.'cfg(all(windows, target_env = "msvc"))']
-rustflags = ["-C", "link-arg=/STACK:8388608"]
+rustflags = ["-C", "link-arg=/STACK:8388608", "-C", "target-feature=+crt-static"]

@@ -60,6 +60,9 @@ if [ "$BUILD" = 1 ]; then
   echo "==> cargo build --release ($NAME $VERSION, target $TARGET_DIR)"
   icon_env=()
   [ -n "$ICON" ] && icon_env=(TASKBOARD_ICON="$(cygpath -w "$(cd "$(dirname "$ICON")" && pwd)/$(basename "$ICON")")")
+  # RUSTFLAGS would replace .cargo/config.toml's rustflags, and with them the static C runtime a
+  # clean Windows needs (check-runtime.sh, below, catches a build without it).
+  unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
   env ${icon_env[@]+"${icon_env[@]}"} CARGO_TARGET_DIR="$TARGET_DIR" \
     cargo build --release -p taskboard-app -p taskboardd -p taskboard-cli --bin taskboard-app --bin taskboardd --bin tb
 fi
@@ -99,6 +102,7 @@ json_str() {  # a JSON string: backslashes and quotes escaped (Windows paths)
 } > "$DIR/install.json"
 python -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$DIR/install.json" 2>/dev/null \
   || python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$DIR/install.json"
+packaging/windows/check-runtime.sh "$DIR"
 echo "==> built $DIR ($VERSION, $(du -sh "$DIR" | cut -f1))"
 
 # ---------------------------------------------------------------- update zip
