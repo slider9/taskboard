@@ -1,0 +1,207 @@
+name: Release (Windows)
+
+# Pushing a windows-v tag (windows-v0.1.0-beta.97.w.1, see scripts/release-windows.sh) builds
+# Taskboard for Windows, its installer and the zip the app's updater downloads, and publishes a
+# GitHub release with both. A bare v tag runs release.yml (macOS, upstream's) instead; this one
+# never does, and release.yml never runs for a windows-v tag.
+#
+# The version is the upstream version this branch merged (what Cargo.toml says) plus a Windows
+# counter: 0.1.0-beta.97.w.1, .w.2, … on a beta base, 0.2.0-w.1 on a stable one. The rule and
+# why it sorts right are in docs/RELEASING.md ("Windows releases").
+#
+# The Windows app's updater reads this repository's releases: a beta build takes prereleases
+# too, a stable build only releases. So a build of a beta base is published as a prerelease, and
+# a build of a stable base as the latest release.
+#
+# Run by hand (workflow_dispatch) on a branch, it makes a draft release of the version you give:
+# that's how to try the workflow without a public release. Run by hand on a windows-v tag, it
+# publishes that tag unless you leave "draft" on.
+#
+# Two jobs, so a failed publish doesn't cost a rebuild ("Re-run failed jobs"):
+#   build    compile, the install folder, the update zip and the installer (Windows)
+#   publish  the GitHub release
+on:
+  push:
+    tags: ["windows-v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build when run on a branch (e.g. 0.1.0-beta.97.w.1); a tag run takes the tag's"
+        required: false
+      draft:
+        description: "Publish as a draft release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-windows
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    # Only the fork's owner releases (docs/RELEASING.md, "Windows releases").
+    if: github.actor == 'slider9'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      draft: ${{ steps.version.outputs.draft }}
+      beta: ${{ steps.version.outputs.beta }}
+
+    steps:
+      # The files as they are in the repo (LF), not converted to CRLF: the plugin ships as is.
+      - name: Check out without CRLF
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      # The tag (or the version input) is <files' version>.w.N on a beta base, <files' version>-w.N
+      # on a stable one. The files keep the upstream version, so a merge from upstream never
+      # conflicts on it; the counter lives only in the tag.
+      - name: Version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRAFT: ${{ inputs.draft }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+            [[ "$tag" == windows-v* ]] || { echo "::error::$tag isn't a windows-v tag"; exit 1; }
+            version="${tag#windows-v}"
+            draft=false
+            [ "$GITHUB_EVENT_NAME" != workflow_dispatch ] || draft="$INPUT_DRAFT"
+          else
+            version="${INPUT_VERSION#v}"
+            [ -n "$version" ] || { echo "::error::Run on a branch, it needs a version (or push a windows-v tag)"; exit 1; }
+            [ "$INPUT_DRAFT" = true ] || { echo "::error::Run on a branch, it only makes drafts; push a windows-v tag to publish"; exit 1; }
+            tag="windows-v$version"
+            draft=true
+          fi
+          if [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+)\.w\.([0-9]+)$ ]]; then
+            beta=true
+          elif [[ "$version" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-w\.([0-9]+)$ ]]; then
+            beta=false
+          else
+            echo "::error::$version isn't a Windows version: <base>.w.N on a beta base (0.1.0-beta.97.w.1) or <base>-w.N on a stable one (0.2.0-w.1)"
+            exit 1
+          fi
+          base="${BASH_REMATCH[1]}"
+          ./scripts/set-version.sh --check "$base"
+          ./scripts/plugin-version.sh --check
+          { echo "tag=$tag"; echo "version=$version"; echo "base=$base"; echo "draft=$draft"; echo "beta=$beta"; } >> "$GITHUB_OUTPUT"
+          echo "$tag: Windows build $version of $base (draft $draft, beta $beta)"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/package"
+
+      # Inno Setup 6 is on GitHub's Windows images; installed if it isn't.
+      - name: Inno Setup
+        run: |
+          if ! command -v iscc >/dev/null && [ ! -f "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]; then
+            choco install innosetup --no-progress -y
+          fi
+
+      # TASKBOARD_BUILD_VERSION is the full Windows version, compiled in so the app reports it
+      # rather than Cargo.toml's base: a build that said the base would take its own release for
+      # an update, again and again. install.json gets it from --version.
+      - name: Build install folder, update zip and installer
+        env:
+          TASKBOARD_BUILD_VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          packaging/windows/build.sh --version "$VERSION" --out dist/release --zip --installer
+          grep -qaF "$VERSION" dist/release/Taskboard/taskboard-app.exe ||
+            { echo "::error::taskboard-app.exe doesn't have $VERSION compiled in (TASKBOARD_BUILD_VERSION)"; exit 1; }
+          got=$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' dist/release/Taskboard/install.json)
+          [ "$got" = "$VERSION" ] || { echo "::error::install.json says $got, expected $VERSION"; exit 1; }
+
+      - name: Release notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BASE: ${{ steps.version.outputs.base }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          mkdir -p release
+          cp "dist/release/Taskboard-$VERSION-windows-x64-setup.exe" "dist/release/Taskboard-$VERSION-windows-x64.zip" release/
+          cat > release/notes.md <<EOF
+          Taskboard for Windows $VERSION: upstream $BASE with the Windows port, from $GITHUB_SHA.
+
+          Download \`Taskboard-$VERSION-windows-x64-setup.exe\` and run it. It installs for you alone, with no admin, into \`%LOCALAPPDATA%\\Programs\\Taskboard\`, and an installed copy updates itself from here (the \`.zip\`). Builds aren't code-signed yet, so Windows SmartScreen may warn the first time: More info, then Run anyway. The steps are in the [install guide](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/docs/INSTALL-windows.md).
+          EOF
+          cat release/notes.md
+          ls -l release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: release/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.build.outputs.tag }}
+      VERSION: ${{ needs.build.outputs.version }}
+      DRAFT: ${{ needs.build.outputs.draft }}
+      BETA: ${{ needs.build.outputs.beta }}
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-windows
+          path: release
+
+      # A re-run finds the release already made and replaces its files. A draft run never touches
+      # a published release, and a real run replaces a leftover draft of its version with a
+      # fresh release (deleting a draft leaves the tag alone).
+      - name: Publish release
+        run: |
+          files=("release/Taskboard-$VERSION-windows-x64-setup.exe" "release/Taskboard-$VERSION-windows-x64.zip")
+          existing=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null || true)
+          if [ "$existing" = false ] && [ "$DRAFT" = true ]; then
+            echo "::error::$TAG is already published; a draft run never replaces its files. Pick an unused version."
+            exit 1
+          fi
+          if [ "$existing" = true ] && [ "$DRAFT" != true ]; then
+            echo "Replacing the leftover draft of $TAG with the release."
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+            existing=
+          fi
+          if [ -n "$existing" ]; then
+            gh release upload "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file release/notes.md
+          else
+            if [ "$DRAFT" = true ]; then
+              flags=(--draft --target "$GITHUB_SHA")
+              [ "$BETA" != true ] || flags+=(--prerelease)
+            elif [ "$BETA" = true ]; then
+              flags=(--prerelease --latest=false)
+            else
+              flags=(--latest)
+            fi
+            gh release create "$TAG" "${files[@]}" --repo "$GITHUB_REPOSITORY" \
+              --title "Taskboard $VERSION for Windows" --notes-file release/notes.md "${flags[@]}"
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,isDraft,isPrerelease,assets \
+            -q '{url, isDraft, isPrerelease, assets: [.assets[] | {name, size, digest}]}'
