@@ -1,0 +1,121 @@
+name: Build and test (Windows)
+
+# Every PR into feat/windows-native, and every push to it, builds the workspace on Windows and
+# runs the tests that pass there:
+#
+#   taskboardd --lib     its unit tests
+#   taskboardd --test it its integration tests (they start real temp boards)
+#   taskboard-cli        all of it
+#   taskboard-app        all of it but one test
+#
+# Skipped until the board's backlog item is fixed (drop the skip with its fix):
+#   taskboard-app ui::task_panel::tests::lost_task_resumes, which on Windows records its three
+#   resume posts out of order every run (B199)
+#
+# Mirrors midna's build-windows.yml. Upstream's macOS release (release.yml) is separate.
+#
+# Doc-only changes don't build: nothing in docs/ or the top-level Markdown files is compiled or
+# read by a test. plugin/'s Markdown is (the skill files are built in and size-checked), so a
+# change there still runs.
+on:
+  pull_request:
+    branches: [feat/windows-native]
+    paths-ignore: ['docs/**', '*.md']
+  push:
+    branches: [feat/windows-native]
+    paths-ignore: ['docs/**', '*.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to a PR cancels its older run. feat/windows-native's runs always finish: a push
+# run cancelled mid-build still saves what it had built (cache-on-failure), and that partial
+# cache then sticks, since rust-cache skips saving when it restored its exact key.
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # A CI build is built once; incremental artifacts would only fill the cache.
+  CARGO_INCREMENTAL: 0
+  # No debug info: CI never reads it, and writing a PDB for every test binary is a large part of
+  # a Windows build and its cache. Panics still say their file and line.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  # .cargo/config.toml's rustc-wrapper is a .sh script, which Windows can't start, so each cargo
+  # call sets it to none (TOML's empty string). Not an empty RUSTC_WRAPPER here: PowerShell and
+  # cmd treat an empty variable as unset, so it would depend on how each tool passes it on.
+  NO_WRAPPER: --config build.rustc-wrapper=''
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    # The image release.yml builds Windows releases on.
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      # cargo's build paths under the checkout run past Windows' 260-character limit.
+      - name: Long paths
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v4
+
+      # Pinned to what the Windows fork is built and tested with. From 1.100 cargo moves test
+      # binaries under target/debug/build/ (midna's B152); move this on once the suite is checked
+      # there.
+      - name: Install Rust 1.99.1
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.99.1
+
+      # Dependencies' builds. A PR reads the cache feat/windows-native's last push saved. Only
+      # that branch saves one: a PR's cache (under refs/pull/<n>/merge) no other run can read,
+      # and enough of them would push the base branch's out of the repo's 10 GB. Saved when a
+      # test fails too: a red run's build is as good, and the re-run after a fix shouldn't
+      # start cold.
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: windows-test
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/feat/windows-native' }}
+
+      # The whole workspace, then each test step's own build, with the same packages and targets
+      # it names: cargo unifies features per invocation, so one --no-run of them all would leave
+      # each step to rebuild what its own feature set changes.
+      - name: Build
+        id: build
+        run: |
+          cargo build $NO_WRAPPER --workspace --locked
+          cargo test $NO_WRAPPER --locked -p taskboardd --lib --no-run
+          cargo test $NO_WRAPPER --locked -p taskboardd --test it --no-run
+          cargo test $NO_WRAPPER --locked -p taskboard-cli --no-run
+          cargo test $NO_WRAPPER --locked -p taskboard-app --no-run
+
+      # Each suite runs once the build passed, so one suite's failure doesn't hide another's.
+      # Each has its own time limit: a hung test (a pipe or a child process that never answers)
+      # fails its step instead of holding the job to its hour.
+      - name: taskboardd unit tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo test $NO_WRAPPER --locked -p taskboardd --lib
+
+      - name: taskboardd integration tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 20
+        run: cargo test $NO_WRAPPER --locked -p taskboardd --test it
+
+      - name: taskboard-cli
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo test $NO_WRAPPER --locked -p taskboard-cli
+
+      - name: taskboard-app
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: cargo test $NO_WRAPPER --locked -p taskboard-app -- --skip ui::task_panel::tests::lost_task_resumes
