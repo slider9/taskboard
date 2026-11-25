@@ -171,9 +171,47 @@ fn idle_secs() -> Option<f64> {
     (s.is_finite() && s >= 0.0).then_some(s)
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Milliseconds between the last input's tick count and the current one. Both are `u32` tick counts
+/// that wrap every 49.7 days, so the difference wraps too.
+#[cfg(any(windows, test))]
+fn idle_ms(now_tick: u32, last_input_tick: u32) -> u32 {
+    now_tick.wrapping_sub(last_input_tick)
+}
+
+/// Seconds since the owner's last keyboard or mouse input.
+#[cfg(windows)]
+fn idle_secs() -> Option<f64> {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    if unsafe { GetLastInputInfo(&mut info) } == 0 {
+        return None;
+    }
+    Some(idle_ms(unsafe { GetTickCount() }, info.dwTime) as f64 / 1000.0)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn idle_secs() -> Option<f64> {
     None
+}
+
+/// When the owner's current stretch away began, if one is going on.
+pub fn away_now() -> Option<f64> {
+    logs(|l| l.away_now)
+}
+
+/// The stretches the owner was away (not the Mac's sleeps) that touch `[from, to)`, clipped, in order.
+/// One still going on runs to `to`.
+pub fn aways_between(from: f64, to: f64) -> Vec<(f64, f64)> {
+    let mut all = logs(|l| {
+        let mut all = l.aways.clone();
+        if let Some(a) = l.away_now {
+            all.push((a, f64::INFINITY));
+        }
+        all
+    });
+    all.retain(|&(a, b)| b > from && a < to);
+    merge(all.into_iter().map(|(a, b)| (a.max(from), b.min(to))).collect())
 }
 
 /// The next away state from the current one and `idle` seconds without input at `now`, and the
@@ -248,6 +286,23 @@ mod tests {
         assert_eq!(away_step(None, idle, now), (Some(now - idle), None));
         assert_eq!(away_step(Some(5_000.0), idle, now), (Some(5_000.0), None), "still away");
         assert_eq!(away_step(Some(5_000.0), 3.0, now), (None, Some((5_000.0, now - 3.0))), "back: it ends at the input");
+    }
+
+    #[test]
+    fn tick_counts_difference_survives_a_wrap() {
+        assert_eq!(idle_ms(5_000, 2_000), 3_000);
+        assert_eq!(idle_ms(7, u32::MAX - 2), 10, "the counter wrapped between the input and now");
+        assert_eq!(idle_ms(0, 0), 0);
+    }
+
+    #[test]
+    fn aways_between_leaves_out_sleeps() {
+        own_logs();
+        note_sleep(0.0, 50.0);
+        note_away(100.0, 200.0);
+        set_away_now(Some(900.0));
+        assert_eq!(aways_between(150.0, 1000.0), vec![(150.0, 200.0), (900.0, 1000.0)]);
+        assert_eq!(aways_between(300.0, 800.0), vec![]);
     }
 
     #[test]

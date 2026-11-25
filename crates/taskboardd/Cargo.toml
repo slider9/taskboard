@@ -50,7 +50,7 @@ core-foundation = "0.10"
 uds_windows = "1.2"
 # proc.rs: a command's process tree as a job object, whether this process has a console, and the
 # daemon's stop event. slot_ageing.rs: free disk. instance.rs: the data folder's lock.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 tempfile = "3"

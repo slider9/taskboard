@@ -51,3 +51,25 @@ fn a_wait_leaves_out_time_away_and_outside_work_hours() {
     assert_eq!(kinds, vec!["away", "needs", "away", "needs", "done"], "8 to 9 is before the hours, 10 to 10:30 away");
     assert_eq!(page["day"]["wait_min"], 150.0, "9 to 10, then 10:30 to 12");
 }
+
+#[test]
+fn info_reports_the_away_stretches_of_the_last_day() {
+    reset_clock();
+    clock::own_logs();
+    let dir = tempfile::tempdir().unwrap();
+    let app = App::for_tests(Config::for_tests(dir.path()));
+    let info = api::dispatch(&app, "GET", "info", &Default::default(), &json!({})).unwrap();
+    assert_eq!(info["away"], json!({"since": null, "recent": []}));
+
+    let now = now_ts();
+    clock::note_away(now - 7200.0, now - 3600.0);
+    clock::note_away(now - 3.0 * 86400.0, now - 2.0 * 86400.0);
+    clock::set_away_now(Some(now - 600.0));
+    let info = api::dispatch(&app, "GET", "info", &Default::default(), &json!({})).unwrap();
+    assert_eq!(info["away"]["since"], json!(taskboardd::util::iso(now - 600.0)));
+    let recent = info["away"]["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 2, "the old stretch is left out: {recent:?}");
+    assert_eq!(recent[0]["from"], json!(taskboardd::util::iso(now - 7200.0)));
+    assert_eq!(recent[0]["to"], json!(taskboardd::util::iso(now - 3600.0)));
+    assert!(recent[1]["to"].is_string());
+}
