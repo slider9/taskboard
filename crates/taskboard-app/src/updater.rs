@@ -16,7 +16,11 @@
 //! Only an installed, Developer ID-signed Taskboard.app updates itself: Taskboard Dev (ad-hoc), a
 //! `cargo run` and the sample board never do.
 //!
-//! **Windows**: the release's `Taskboard-<version>-windows-x64.zip` holds the install folder
+//! **Windows**: the feed is the fork's releases (slider9/taskboard): upstream publishes no Windows build.
+//! Only `windows-v<version>` tags count there, bare `v` tags being macOS's. A Windows version is
+//! `<base>.w.<n>` on a beta base (`0.1.0-beta.97.w.1`) or `<base>-w.<n>` on a stable one (`0.2.0-w.1`),
+//! `<base>` being Cargo.toml's; the build gets it as `TASKBOARD_BUILD_VERSION` (release-windows.yml).
+//! The release's `Taskboard-<version>-windows-x64.zip` holds the install folder
 //! (`packaging/windows/build.sh`). It must match GitHub's digest; it's unpacked inside the install
 //! (`.update-<version>`), and its `install.json` must name the same id and the release's version. When the
 //! running install is Authenticode-signed, the new programs must be signed by the same publisher.
@@ -32,13 +36,37 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-const RELEASES: &str = "https://api.github.com/repos/mrgnhnt96/taskboard/releases?per_page=30";
-pub const RELEASES_PAGE: &str = "https://github.com/mrgnhnt96/taskboard/releases";
+/// Cargo.toml's version, which the daemon and `tb` report.
+pub const BASE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// This build's own version, the one updates compare against: a Windows release's
+/// `TASKBOARD_BUILD_VERSION` (`0.1.0-beta.97.w.1`), else [`BASE_VERSION`].
+pub const VERSION: &str = match option_env!("TASKBOARD_BUILD_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => BASE_VERSION,
+};
+/// Where this platform's releases are: Windows builds only ever come from the fork.
+const RELEASES: &str = if cfg!(windows) {
+    "https://api.github.com/repos/slider9/taskboard/releases?per_page=30"
+} else {
+    "https://api.github.com/repos/mrgnhnt96/taskboard/releases?per_page=30"
+};
+pub const RELEASES_PAGE: &str = if cfg!(windows) { "https://github.com/slider9/taskboard/releases" } else { "https://github.com/mrgnhnt96/taskboard/releases" };
 const BUNDLE_ID: &str = "com.mrgnhnt.taskboard";
-/// How a release's update archive for this platform is named: `Taskboard-1.2.0.app.tar.gz`,
-/// `Taskboard-1.2.0-windows-x64.zip`.
-const ARCHIVE_SUFFIX: &str = if cfg!(windows) { "-windows-x64.zip" } else { ".app.tar.gz" };
+
+/// Which of a repo's releases a platform takes, and its update archive.
+#[derive(Clone, Copy, Debug)]
+struct Feed {
+    /// What the tag has before the version: `v0.1.0`, `windows-v0.1.0-beta.97.w.1`.
+    tag_prefix: &'static str,
+    /// How the update archive is named after `Taskboard-<version>`: `Taskboard-1.2.0.app.tar.gz`,
+    /// `Taskboard-1.2.0-w.1-windows-x64.zip`.
+    archive_suffix: &'static str,
+}
+
+const MAC_FEED: Feed = Feed { tag_prefix: "v", archive_suffix: ".app.tar.gz" };
+const WINDOWS_FEED: Feed = Feed { tag_prefix: "windows-v", archive_suffix: "-windows-x64.zip" };
+const FEED: Feed = if cfg!(windows) { WINDOWS_FEED } else { MAC_FEED };
+const ARCHIVE_SUFFIX: &str = FEED.archive_suffix;
 const FIRST_CHECK: Duration = Duration::from_secs(20);
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
@@ -110,20 +138,36 @@ pub struct Release {
     pub sha256: Option<String>,
 }
 
-/// `1.2.0` or `1.2.0-beta.3` as a sortable key; a beta sorts before its release
-/// (`scripts/newest-version.py` orders them the same way).
-pub fn version_key(v: &str) -> Option<(u64, u64, u64, bool, u64)> {
+/// A version as a sortable key, in semver's order: `1.2.0-beta.3` < `1.2.0-beta.3.w.1` (a Windows
+/// build of that beta) < `1.2.0-beta.4` < `1.2.0-w.1` (a Windows build of the release) < `1.2.0`
+/// (`scripts/newest-version.py` orders macOS's `1.2.0` and `1.2.0-beta.3` the same way).
+pub fn version_key(v: &str) -> Option<(u64, u64, u64, u8, u64, u64)> {
     let v = v.strip_prefix('v').unwrap_or(v);
-    let (core, beta) = match v.split_once("-beta.") {
-        Some((c, b)) => (c, Some(b.parse().ok()?)),
+    let n = |s: &str| s.bytes().all(|b| b.is_ascii_digit()).then(|| s.parse::<u64>().ok()).flatten();
+    let (core, pre) = match v.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
         None => (v, None),
     };
-    let mut it = core.split('.').map(|p| p.parse::<u64>());
-    let (a, b, c) = (it.next()?.ok()?, it.next()?.ok()?, it.next()?.ok()?);
+    // (0 beta, 1 Windows build of a release, 2 release), the beta's number, the Windows build's
+    let (rank, beta, w) = match pre {
+        None => (2, 0, 0),
+        Some(p) => match p.strip_prefix("w.") {
+            Some(w) => (1, 0, n(w)?),
+            None => {
+                let b = p.strip_prefix("beta.")?;
+                match b.split_once(".w.") {
+                    Some((b, w)) => (0, n(b)?, n(w)?),
+                    None => (0, n(b)?, 0),
+                }
+            }
+        },
+    };
+    let mut it = core.split('.').map(n);
+    let (a, b, c) = (it.next()??, it.next()??, it.next()??);
     if it.next().is_some() {
         return None;
     }
-    Some((a, b, c, beta.is_none(), beta.unwrap_or(0)))
+    Some((a, b, c, rank, beta, w))
 }
 
 pub fn is_newer(candidate: &str, current: &str) -> bool {
@@ -132,14 +176,25 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 
 /// The newest release in GitHub's list that updates `current`: a beta build takes prereleases too.
 pub fn pick(releases: &Value, current: &str) -> Option<Release> {
+    pick_from(FEED, releases, current)
+}
+
+fn pick_from(feed: Feed, releases: &Value, current: &str) -> Option<Release> {
     let beta = current.contains("-beta.");
     releases
         .as_array()?
         .iter()
         .filter(|r| r["draft"] != true && (beta || r["prerelease"] != true))
         .filter_map(|r| {
-            let version = r["tag_name"].as_str()?.trim_start_matches('v').to_string();
-            let asset = r["assets"].as_array()?.iter().find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(ARCHIVE_SUFFIX)))?;
+            let tag = r["tag_name"].as_str()?;
+            // macOS's tags have always been read with or without the `v`; a Windows one needs its prefix.
+            let version = match tag.strip_prefix(feed.tag_prefix) {
+                Some(v) => v,
+                None if feed.tag_prefix == MAC_FEED.tag_prefix => tag,
+                None => return None,
+            }
+            .to_string();
+            let asset = r["assets"].as_array()?.iter().find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(feed.archive_suffix)))?;
             Some(Release {
                 page: r["html_url"].as_str().unwrap_or(RELEASES_PAGE).to_string(),
                 archive: asset["browser_download_url"].as_str()?.to_string(),
@@ -673,6 +728,32 @@ mod tests {
         assert!(!is_newer("garbage", "0.1.0"));
     }
 
+    #[test]
+    fn windows_versions_order_like_semver() {
+        let order = ["0.1.0-beta.97", "0.1.0-beta.97.w.1", "0.1.0-beta.97.w.2", "0.1.0-beta.97.w.10", "0.1.0-beta.98", "0.2.0-beta.1", "0.2.0-w.1", "0.2.0-w.2", "0.2.0", "0.2.1-beta.1.w.1"];
+        for w in order.windows(2) {
+            assert!(is_newer(w[1], w[0]), "{} after {}", w[1], w[0]);
+            assert!(!is_newer(w[0], w[1]), "{} not after {}", w[0], w[1]);
+        }
+        for bad in ["0.1.0-beta.97.w.", "0.1.0-beta.97.w.x", "0.1.0-w", "0.1.0-w.1.w.2", "0.1.0-rc.1", "0.1.0-beta.+1", "0.1.0-beta.97-w.1", "windows-v0.1.0"] {
+            assert_eq!(version_key(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn this_build_s_version_is_its_base_or_a_windows_build_of_it() {
+        assert!(VERSION.starts_with(BASE_VERSION), "{VERSION} builds on {BASE_VERSION}");
+        assert!(version_key(VERSION).is_some(), "{VERSION} sorts");
+    }
+
+    #[test]
+    fn releases_and_issues_go_to_the_same_repo() {
+        let repo = taskboardd::report::REPO;
+        assert!(RELEASES.contains(&format!("/repos/{repo}/releases")), "{RELEASES}");
+        assert_eq!(RELEASES_PAGE, format!("https://github.com/{repo}/releases"));
+        assert_eq!(repo, if cfg!(windows) { "slider9/taskboard" } else { "mrgnhnt96/taskboard" });
+    }
+
     fn release(tag: &str, prerelease: bool, archive: bool) -> Value {
         let dmg = json!({"name": format!("Taskboard-{tag}.dmg"), "browser_download_url": format!("https://x/{tag}.dmg"), "size": 9, "digest": "sha256:CD"});
         let tgz = json!({"name": format!("Taskboard-{tag}.app.tar.gz"), "browser_download_url": format!("https://x/{tag}.app.tar.gz"), "size": 5, "digest": "sha256:AB"});
@@ -684,13 +765,46 @@ mod tests {
     #[test]
     fn picks_the_newest_release_for_the_channel() {
         let list = json!([release("v0.2.0-beta.2", true, true), release("v0.1.1", false, true), release("v0.2.0-beta.3", true, false), release("v0.1.0", false, true)]);
-        let beta = pick(&list, "0.1.0-beta.44").unwrap();
-        let want = format!("https://x/v0.2.0-beta.2{ARCHIVE_SUFFIX}");
-        assert_eq!((beta.version.as_str(), beta.archive.as_str(), beta.sha256.as_deref()), ("0.2.0-beta.2", want.as_str(), Some("ab")), "this platform's archive");
-        assert_eq!(pick(&list, "0.1.0").unwrap().version, "0.1.1");
-        assert_eq!(pick(&list, "0.1.1"), None);
+        let beta = pick_from(MAC_FEED, &list, "0.1.0-beta.44").unwrap();
+        assert_eq!((beta.version.as_str(), beta.archive.as_str(), beta.sha256.as_deref()), ("0.2.0-beta.2", "https://x/v0.2.0-beta.2.app.tar.gz", Some("ab")), "the app's archive");
+        assert_eq!(pick_from(MAC_FEED, &list, "0.1.0").unwrap().version, "0.1.1");
+        assert_eq!(pick_from(MAC_FEED, &list, "0.1.1"), None);
         let draft = json!([{"tag_name": "v9.0.0", "draft": true, "prerelease": false, "assets": [{"name": "a.app.tar.gz", "browser_download_url": "u"}]}]);
-        assert_eq!(pick(&draft, "0.1.0"), None);
+        assert_eq!(pick_from(MAC_FEED, &draft, "0.1.0"), None);
+        let windows = json!([windows_release("0.9.0-w.1", false, true)]);
+        assert_eq!(pick_from(MAC_FEED, &windows, "0.1.0"), None, "a Windows release never updates the Mac app");
+    }
+
+    /// A release as `release-windows.yml` publishes it on the fork.
+    fn windows_release(version: &str, prerelease: bool, zip: bool) -> Value {
+        let setup = json!({"name": format!("Taskboard-{version}-windows-x64-setup.exe"), "browser_download_url": format!("https://x/{version}-setup.exe"), "size": 9});
+        let archive = json!({"name": format!("Taskboard-{version}-windows-x64.zip"), "browser_download_url": format!("https://x/Taskboard-{version}-windows-x64.zip"), "size": 6, "digest": "sha256:EF"});
+        let assets = if zip { json!([setup, archive]) } else { json!([setup]) };
+        json!({"tag_name": format!("windows-v{version}"), "draft": false, "prerelease": prerelease, "html_url": format!("https://x/windows-v{version}"), "assets": assets})
+    }
+
+    #[test]
+    fn windows_takes_the_fork_s_windows_releases_on_its_channel() {
+        let mut macos = release("v0.9.0", false, true);
+        macos["assets"][2]["name"] = json!("Taskboard-0.9.0-windows-x64.zip");
+        let list = json!([
+            windows_release("0.1.0-beta.97.w.2", true, true),
+            macos,
+            windows_release("0.1.0-beta.97.w.1", true, true),
+            windows_release("0.0.9-w.2", false, false),
+            windows_release("0.0.9-w.1", false, true),
+        ]);
+        let next = pick_from(WINDOWS_FEED, &list, "0.1.0-beta.97.w.1").unwrap();
+        assert_eq!(
+            (next.version.as_str(), next.archive.as_str(), next.page.as_str(), next.sha256.as_deref()),
+            ("0.1.0-beta.97.w.2", "https://x/Taskboard-0.1.0-beta.97.w.2-windows-x64.zip", "https://x/windows-v0.1.0-beta.97.w.2", Some("ef"))
+        );
+        assert_eq!(pick_from(WINDOWS_FEED, &list, "0.1.0-beta.97").unwrap().version, "0.1.0-beta.97.w.2", "a build of the bare base takes its Windows builds");
+        assert_eq!(pick_from(WINDOWS_FEED, &list, "0.1.0-beta.97.w.2"), None, "v0.9.0 is macOS's, whatever it carries");
+        assert_eq!(pick_from(WINDOWS_FEED, &list, "0.0.8-w.3").unwrap().version, "0.0.9-w.1", "a stable build takes stable releases only");
+        assert_eq!(pick_from(WINDOWS_FEED, &list, "0.0.9-w.1"), None, "and only those with an update zip");
+        let stable = json!([windows_release("0.2.0-w.1", false, true), windows_release("0.2.0-beta.1.w.1", true, true)]);
+        assert_eq!(pick_from(WINDOWS_FEED, &stable, "0.1.0-beta.97.w.2").unwrap().version, "0.2.0-w.1", "a beta build moves on to a release");
     }
 
     #[cfg(target_os = "macos")]

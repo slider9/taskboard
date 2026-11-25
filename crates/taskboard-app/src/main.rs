@@ -123,7 +123,7 @@ fn main() {
         },
         _ => None,
     };
-    log::info(format!("started v{} ({} backend)", env!("CARGO_PKG_VERSION"), backend.label()));
+    log::info(format!("started v{} ({} backend)", updater::VERSION, backend.label()));
     #[cfg(windows)]
     updater::clean_up();
     // The reader's UI state (the web board's localStorage); the sample board keeps it in memory.
