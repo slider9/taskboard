@@ -909,8 +909,9 @@ fn build_state_board(app: &App, query: &Query) -> Result<Value> {
     }))
 }
 
-/// The running daemon: its version, how long it has been up, its pid (Settings › System) and the
-/// launchd job running it (`tb daemon restart` kicks that one).
+/// The running daemon: its version, how long it has been up, its pid (Settings › System), the
+/// launchd job running it (`tb daemon restart` kicks that one) and its own program (on Windows,
+/// `tb daemon restart` runs the `taskboard-app.exe` beside it).
 fn info() -> Value {
     // launchd sets XPC_SERVICE_NAME to the job's label; a shell's is "0"
     let label = std::env::var("XPC_SERVICE_NAME").ok().filter(|l| !l.is_empty() && l != "0");
@@ -920,7 +921,8 @@ fn info() -> Value {
         .map(|(a, b)| json!({"from": crate::util::iso(a), "to": crate::util::iso(b)}))
         .collect();
     let since = crate::clock::away_now().map(crate::util::iso);
-    json!({"version": env!("CARGO_PKG_VERSION"), "uptime_secs": crate::server::STARTED.elapsed().as_secs(), "pid": std::process::id(), "launchd_label": label,
+    let exe = std::env::current_exe().ok().map(|p| p.to_string_lossy().into_owned());
+    json!({"version": env!("CARGO_PKG_VERSION"), "uptime_secs": crate::server::STARTED.elapsed().as_secs(), "pid": std::process::id(), "launchd_label": label, "exe": exe,
            "away": {"since": since, "recent": recent}})
 }
 

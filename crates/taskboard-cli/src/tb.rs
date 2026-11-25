@@ -10,7 +10,7 @@ use taskboardd::config::Config;
 use taskboardd::hooks;
 use taskboardd::steps::{self, Step};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -794,7 +794,8 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum DaemonCmd {
-    /// Restart the daemon under launchd and wait for it to answer again
+    /// Restart the daemon (under launchd on macOS, the Taskboard app's on Windows) and wait for it
+    /// to answer again
     Restart,
 }
 
@@ -2675,20 +2676,11 @@ static STDOUT_GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// than panicking or stopping before the work is done.
 /// A failed call as a sentence: the board's refusal, a board that isn't there, or one that `went_quiet`
 /// (it took the request and may still be working on it, so a retry could do it twice).
-/// `tb daemon restart`: `launchctl kickstart -k` the daemon's job, then wait for a new pid to answer.
+/// `tb daemon restart`: have whatever runs the daemon start it again (launchd on macOS, the app
+/// beside it on Windows), then wait for a new pid to answer.
 fn daemon_restart(cfg: &taskboardd::config::Config) -> Result<i32, String> {
     let before = client::request(cfg, "GET", "/info", None, 2.0).ok();
-    let label = before
-        .as_ref()
-        .and_then(|i| i["launchd_label"].as_str().map(str::to_string))
-        .or_else(bundle_daemon_label)
-        .ok_or("the daemon isn't run by launchd here (no app bundle around this tb), so restart it the way you started it")?;
-    let uid = Command::new("/usr/bin/id").arg("-u").output().map_err(|e| e.to_string())?;
-    let target = format!("gui/{}/{label}", String::from_utf8_lossy(&uid.stdout).trim());
-    let kick = Command::new("/bin/launchctl").args(["kickstart", "-k", &target]).output().map_err(|e| e.to_string())?;
-    if !kick.status.success() {
-        return Err(format!("launchctl kickstart {target} failed: {}", String::from_utf8_lossy(&kick.stderr).trim()));
-    }
+    let why_slow = if cfg!(windows) { restart_beside(cfg, before.as_ref())? } else { kickstart(before.as_ref())? };
     let old_pid = before.as_ref().and_then(|i| i["pid"].as_u64());
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
@@ -2700,7 +2692,69 @@ fn daemon_restart(cfg: &taskboardd::config::Config) -> Result<i32, String> {
             }
         }
     }
-    Err(format!("restarted {label}, but it isn't answering yet: launchctl print {target} shows why"))
+    Err(why_slow)
+}
+
+/// macOS: `launchctl kickstart -k` the daemon's job. Ok: what to say if it doesn't answer in time.
+fn kickstart(before: Option<&Value>) -> Result<String, String> {
+    let label = before
+        .and_then(|i| i["launchd_label"].as_str().map(str::to_string))
+        .or_else(bundle_daemon_label)
+        .ok_or("the daemon isn't run by launchd here (no app bundle around this tb), so restart it the way you started it")?;
+    let uid = Command::new("/usr/bin/id").arg("-u").output().map_err(|e| e.to_string())?;
+    let target = format!("gui/{}/{label}", String::from_utf8_lossy(&uid.stdout).trim());
+    let kick = Command::new("/bin/launchctl").args(["kickstart", "-k", &target]).output().map_err(|e| e.to_string())?;
+    if !kick.status.success() {
+        return Err(format!("launchctl kickstart {target} failed: {}", String::from_utf8_lossy(&kick.stderr).trim()));
+    }
+    Ok(format!("restarted {label}, but it isn't answering yet: launchctl print {target} shows why"))
+}
+
+/// Windows: `taskboard-app.exe --restart-daemon`, the installed app beside the daemon, which ends
+/// the daemon and its supervisor and starts them again. Ok: what to say if it doesn't answer in time.
+fn restart_beside(cfg: &taskboardd::config::Config, before: Option<&Value>) -> Result<String, String> {
+    use std::process::Stdio;
+    let app = restarter(before)?;
+    // No pipes, and not tb's own stdio either: the supervisor it starts inherits the app's handles
+    // and keeps them open, so a reader waiting for their end (tb, or whoever runs tb) would wait for
+    // good. The app's reason is in app.log instead.
+    let log = cfg.data.join("app.log");
+    let from = std::fs::metadata(&log).map_or(0, |m| m.len());
+    let run = Command::new(&app).arg("--restart-daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let run = run.map_err(|e| format!("couldn't run {}: {e}", app.display()))?;
+    if !run.success() {
+        return Err(restart_failed(&app, run.code(), &written_since(&log, from)));
+    }
+    Ok(NOT_ANSWERING_YET.into())
+}
+
+/// What `log` gained past its first `from` bytes; all of it when it rolled over meanwhile.
+fn written_since(log: &Path, from: u64) -> String {
+    let bytes = std::fs::read(log).unwrap_or_default();
+    let start = usize::try_from(from).ok().filter(|&f| f <= bytes.len()).unwrap_or(0);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
+const APP_EXE: &str = "taskboard-app.exe";
+const NOT_ANSWERING_YET: &str = "restarted the daemon, but it isn't answering yet: server.log and app.log in the board's data folder show why";
+
+/// The app that restarts the daemon `/info` describes: the `taskboard-app.exe` beside its program.
+fn restarter(info: Option<&Value>) -> Result<PathBuf, String> {
+    let info = info.ok_or("the daemon isn't running: opening Taskboard starts it")?;
+    // Its app is as old, and would open a window for `--restart-daemon`.
+    let exe = info["exe"].as_str().map(PathBuf::from).ok_or("this daemon is older than tb daemon restart on Windows: restart it with Restart the board in Taskboard's Settings")?;
+    let app = exe.parent().map(|d| d.join(APP_EXE)).filter(|a| a.is_file());
+    app.ok_or_else(|| format!("the daemon isn't run by the Taskboard app here (no {APP_EXE} beside {}), so restart it the way you started it", exe.display()))
+}
+
+/// `--restart-daemon` exited with an error: its own words (its last line in app.log, after the
+/// `<date> <time>`), else the exit code and where the app logs.
+fn restart_failed(app: &Path, code: Option<i32>, logged: &str) -> String {
+    let said = logged.lines().map(|l| l.trim().splitn(3, ' ').nth(2).unwrap_or("").trim()).rfind(|l| !l.is_empty());
+    match said {
+        Some(why) => format!("{} --restart-daemon failed: {why}", app.display()),
+        None => format!("{} --restart-daemon failed (exit {}): app.log in the board's data folder shows why", app.display(), code.map_or("?".into(), |c| c.to_string())),
+    }
 }
 
 /// The label of the LaunchAgent in the app bundle this tb runs from (`Contents/MacOS/tb` or the plugin's copy).
@@ -8871,6 +8925,41 @@ pub fn main_with(args: Vec<String>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_restart_on_windows_runs_the_app_beside_the_daemon() {
+        let dir = std::env::temp_dir().join(format!("tb-restarter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("taskboardd.exe");
+        let info = json!({"pid": 7, "exe": exe.to_string_lossy()});
+        let alone = restarter(Some(&info)).unwrap_err();
+        assert_eq!(alone, format!("the daemon isn't run by the Taskboard app here (no taskboard-app.exe beside {}), so restart it the way you started it", exe.display()));
+        std::fs::write(dir.join(APP_EXE), b"").unwrap();
+        assert_eq!(restarter(Some(&info)).unwrap(), dir.join(APP_EXE));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(restarter(None).unwrap_err(), "the daemon isn't running: opening Taskboard starts it");
+        assert_eq!(restarter(Some(&json!({"pid": 7}))).unwrap_err(), "this daemon is older than tb daemon restart on Windows: restart it with Restart the board in Taskboard's Settings", "its app doesn't know --restart-daemon");
+    }
+
+    #[test]
+    fn a_failed_restart_says_what_the_app_said() {
+        let app = Path::new(r"C:\Taskboard\taskboard-app.exe");
+        let logged = "2026-11-24 10:00:01 restarting the daemon failed: the daemon's supervisor didn't stop\r\n";
+        assert_eq!(restart_failed(app, Some(1), logged), format!("{} --restart-daemon failed: restarting the daemon failed: the daemon's supervisor didn't stop", app.display()));
+        assert_eq!(restart_failed(app, Some(2), ""), format!("{} --restart-daemon failed (exit 2): app.log in the board's data folder shows why", app.display()));
+        assert_eq!(restart_failed(app, None, "  \n"), format!("{} --restart-daemon failed (exit ?): app.log in the board's data folder shows why", app.display()));
+
+        let dir = std::env::temp_dir().join(format!("tb-applog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("app.log");
+        let older = "2026-11-24 09:00:00 an older run\n";
+        std::fs::write(&log, format!("{older}2026-11-24 10:00:01 this run\n")).unwrap();
+        assert_eq!(written_since(&log, older.len() as u64), "2026-11-24 10:00:01 this run\n", "only what this run wrote");
+        assert_eq!(written_since(&log, 999), format!("{older}2026-11-24 10:00:01 this run\n"), "it rolled over meanwhile");
+        assert_eq!(written_since(&dir.join("none.log"), 0), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn tb_speaks_for_its_terminal_only_when_claude_runs_it() {

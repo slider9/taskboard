@@ -19,7 +19,8 @@
 //! the hooks that run this bundle's `tb` out of Claude Code's settings and withdraws the board's alert
 //! notifications (used by `scripts/dev-app.sh --uninstall`). On Windows it also quits the app and
 //! stops the daemon, so the uninstaller can delete them; `--stop` does just that (before an
-//! installer replaces them).
+//! installer replaces them). `--restart-daemon` restarts the daemon and its supervisor on the
+//! programs now in the install (`tb daemon restart` on Windows).
 //!
 //! Everything here blocks; `start` runs it on its own thread and publishes the result in
 //! [`status`] for the banner. [`recheck`] looks again while a banner shows, so a fix made
@@ -484,6 +485,22 @@ pub fn headless(args: &[String]) -> Option<i32> {
             }
             withdraw_alerts();
             Some(code)
+        }
+        // Windows: `tb daemon restart` runs this one, beside the daemon, and waits for a new pid itself.
+        #[cfg(windows)]
+        Some("--restart-daemon") => {
+            let exe = std::env::current_exe().ok()?;
+            let Some(dir) = install_dir_of(&exe) else {
+                crate::log::info("--restart-daemon only works from an installed Taskboard");
+                return Some(2);
+            };
+            match crate::win::restart_daemon(&dir, &crate::win::Manifest::read(&dir)) {
+                Ok(()) => Some(0),
+                Err(e) => {
+                    crate::log::info(format!("restarting the daemon failed: {e}"));
+                    Some(1)
+                }
+            }
         }
         Some("--version") => {
             println!("taskboard-app {}", env!("CARGO_PKG_VERSION"));
