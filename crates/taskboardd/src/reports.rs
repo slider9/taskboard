@@ -55,6 +55,8 @@ pub struct Report<'a> {
     pub turn_commit: Option<(String, String)>,
     /// What Midna knew of how a terminal that ended for no reason Claude named went, read before the transaction.
     pub exit_detail: Option<String>,
+    /// This terminal's move on to a next task whose worktree slot is claimed after the transaction.
+    pub line_later: std::cell::RefCell<Option<lines::Later>>,
 }
 
 fn s_of(v: &Value, k: &str) -> Option<String> {
@@ -89,6 +91,7 @@ impl<'a> Report<'a> {
             turn_at: None,
             turn_commit: None,
             exit_detail: None,
+            line_later: std::cell::RefCell::new(None),
         }
     }
 
@@ -2322,7 +2325,7 @@ fn on_wait_for(r: &mut Report) -> Result<Value> {
         let t = board::get_task(app, t.id())?;
         let next = next_in_line(r, Some(&sid), &format!("{} waits for {names}", rf("task", t.id())))?;
         let moved = next.is_some();
-        let text = [b, next].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
+        let text = [b, next].into_iter().flatten().filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n\n");
         return Ok(with(ok(Some(&t), Some(text)), json!({"parked": true, "moved_on": moved})));
     }
     app.wake_runner();
@@ -2493,16 +2496,23 @@ fn on_done(r: &mut Report) -> Result<Value> {
 
 /// Once terminal `held`'s task is done, fails or parks, moves it on to the next task in its line: the
 /// text that brings this terminal's agent onto it, or, for another terminal or a report sent late, a
-/// message delivered there.
+/// message delivered there. A next task whose worktree slot is claimed first gets its text after the
+/// transaction (`handle`): an empty one here.
 fn next_in_line(r: &Report, held: Option<&str>, why: &str) -> Result<Option<String>> {
     let Some(held) = held.filter(|h| !h.is_empty()) else { return Ok(None) };
     if Some(held) != r.sid() || r.spooled {
         lines::deliver_next(r.app, held, why)?;
         return Ok(None);
     }
-    let Some((_, text)) = lines::advance(r.app, held, r.claude.as_deref(), why)? else { return Ok(None) };
+    let Some(moved) = lines::advance(r.app, held, r.claude.as_deref(), why)? else { return Ok(None) };
     r.set_session_status("working")?;
-    Ok(Some(text))
+    match moved {
+        lines::Moved::Now(_, text) => Ok(Some(text)),
+        lines::Moved::Later(l) => {
+            *r.line_later.borrow_mut() = Some(l);
+            Ok(Some(String::new()))
+        }
+    }
 }
 
 /// How long `tb submit --no-pr`'s reason may be: one short line.
@@ -4140,6 +4150,19 @@ pub fn handle(app: &App, body: Value, spooled: bool) -> Result<Value> {
     }
     if let Some(id) = out["waited"].as_i64() {
         give_back_slot(app, id);
+    }
+    // After the slot given back, which the next task may take. The move is saved by now: a failure
+    // here leaves the agent without its text, not the report refused.
+    let later = r.line_later.borrow_mut().take();
+    let text = later.and_then(|l| lines::finish(app, &l).unwrap_or_else(|e| {
+        app.info(format!("lines: couldn't write the text that moves the terminal on after {}: {}", r.event, e.message));
+        None
+    }));
+    if let Some(text) = text {
+        out["context"] = match out["context"].as_str() {
+            Some(had) if !had.is_empty() => json!(format!("{had}\n\n{text}")),
+            _ => json!(text),
+        };
     }
     Ok(out)
 }

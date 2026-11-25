@@ -426,7 +426,9 @@ fn lane_line(app: &App, t: &Row) -> Result<Option<String>> {
 fn worktree_and_lock_lines(app: &App, t: &Row, ctx: &Row) -> Result<Vec<String>> {
     let mut lines = vec![];
     lines.extend(lane_line(app, t)?);
-    if let Some(slot) = ctx.s("worktree_slot").filter(|s| !s.is_empty()) {
+    // Only while it holds it: a slot given back is the board's to give another task.
+    let holds = |slot: &str| crate::slots::held(app, t).ok().flatten().is_some_and(|s| crate::util::path_key(&s.st("path")) == crate::util::path_key(slot));
+    if let Some(slot) = ctx.s("worktree_slot").filter(|s| !s.is_empty() && holds(s)) {
         let name = slot.rsplit(crate::util::SEPARATORS).next().unwrap_or(slot);
         let base = ctx.s("worktree_base").map(|b| format!(", detached at {b}")).unwrap_or_default();
         lines.push(format!(
