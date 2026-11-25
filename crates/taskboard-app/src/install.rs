@@ -503,7 +503,7 @@ pub fn headless(args: &[String]) -> Option<i32> {
             }
         }
         Some("--version") => {
-            println!("taskboard-app {}", env!("CARGO_PKG_VERSION"));
+            println!("taskboard-app {}", crate::updater::VERSION);
             Some(0)
         }
         // Windows: what the startup entry runs; keeps the daemon running.

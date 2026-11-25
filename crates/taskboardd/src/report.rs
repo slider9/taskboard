@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::machine::{output, uptime};
 
-pub const REPO: &str = "mrgnhnt96/taskboard";
+/// Windows builds come from the fork (slider9/taskboard), so their issues go there too.
+pub const REPO: &str = if cfg!(windows) { "slider9/taskboard" } else { "mrgnhnt96/taskboard" };
 
 /// What the issue body reports. [`gather`] runs processes and reads the board, so it runs off the UI thread.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -302,7 +303,7 @@ mod tests {
     #[test]
     fn url_is_encoded() {
         let u = issue_url(&facts());
-        assert!(u.starts_with("https://github.com/mrgnhnt96/taskboard/issues/new?body=%23%23%23%20What"));
+        assert!(u.starts_with(&format!("https://github.com/{REPO}/issues/new?body=%23%23%23%20What")), "{u}");
         assert!(!u[u.find('?').unwrap() + 1..].contains([' ', '\n', '|', '#', '&']));
         assert_eq!(encode("a b/✓"), "a%20b%2F%E2%9C%93");
     }

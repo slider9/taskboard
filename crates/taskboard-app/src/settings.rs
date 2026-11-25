@@ -1789,7 +1789,8 @@ impl SettingsWindow {
 
         let app = line(t, "sys-app", true, false, "App version", "", None).child(controls().child(kit::dot(t.up, 7.)).child(div().text_size(px(12.)).child(updater::VERSION)));
         let daemon_v = self.info.as_ref().and_then(|i| i["version"].as_str()).map(str::to_string);
-        let behind = daemon_v.as_deref().is_some_and(|v| v != updater::VERSION);
+        // The daemon reports Cargo's version: a Windows build's own (`0.1.0-beta.97.w.1`) builds on it.
+        let behind = daemon_v.as_deref().is_some_and(|v| v != updater::BASE_VERSION);
         let daemon_note = match (&self.info, behind) {
             (None, _) => "Not connected.".to_string(),
             (Some(_), true) => format!("Doesn't match the app. Restart it to run {}.", updater::VERSION),
