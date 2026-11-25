@@ -21,6 +21,7 @@ pub struct FileConfig {
     pub open_midna: Option<bool>,
     pub notify: Option<bool>,
     pub first_weekday: Option<String>,
+    pub theme: Option<String>,
     pub claude: Option<String>,
     pub claude_projects: Option<String>,
     pub statusline_dir: Option<String>,
@@ -793,6 +794,8 @@ pub struct Config {
     pub notify: bool,
     /// The day weeks start on (the Days page, its `week` array and the hours menu): Sunday unless set.
     pub first_weekday: chrono::Weekday,
+    /// The desktop app's light or dark look: the system's unless set (`TASKBOARD_THEME` wins over it).
+    pub theme: AppTheme,
     pub claude: String,
     pub claude_projects: PathBuf,
     pub statusline_dir: PathBuf,
@@ -993,6 +996,7 @@ impl Config {
             open_midna: f.open_midna.unwrap_or(true),
             notify: f.notify.unwrap_or(true),
             first_weekday: f.first_weekday.as_deref().and_then(parse_weekday).unwrap_or(chrono::Weekday::Sun),
+            theme: f.theme.as_deref().map(AppTheme::parse).unwrap_or_default(),
             claude: env("TASKBOARD_CLAUDE").or(f.claude.clone()).unwrap_or_else(|| "claude".into()),
             claude_projects: expand_home(
                 &env("TASKBOARD_CLAUDE_PROJECTS").or(f.claude_projects.clone()).unwrap_or_else(|| "~/.claude/projects".into()),
@@ -1125,6 +1129,26 @@ impl Config {
 }
 
 /// `sun`, `Monday`, `sat` … as a weekday (the first three letters count).
+/// `theme` in config.toml: the app follows the system's appearance, or stays dark or light.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppTheme {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+impl AppTheme {
+    /// `dark` or `light` (any case); anything else is `System`.
+    pub fn parse(s: &str) -> AppTheme {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "dark" => AppTheme::Dark,
+            "light" => AppTheme::Light,
+            _ => AppTheme::System,
+        }
+    }
+}
+
 pub fn parse_weekday(s: &str) -> Option<chrono::Weekday> {
     use chrono::Weekday::*;
     let s: String = s.trim().to_lowercase().chars().take(3).collect();
@@ -1255,6 +1279,16 @@ mod tests {
         ] {
             assert_eq!(migrate_text(own), None, "the owner's own list stays: {own}");
         }
+    }
+
+    #[test]
+    fn theme_parses() {
+        let theme = |t: &str| Config::from_file(toml::from_str(t).unwrap(), PathBuf::from("/tmp/x.toml")).theme;
+        assert_eq!(theme(""), AppTheme::System);
+        assert_eq!(theme("theme = \"dark\""), AppTheme::Dark);
+        assert_eq!(theme("theme = \"Light\""), AppTheme::Light);
+        assert_eq!(theme("theme = \"system\""), AppTheme::System);
+        assert_eq!(theme("theme = \"sepia\""), AppTheme::System);
     }
 
     #[test]

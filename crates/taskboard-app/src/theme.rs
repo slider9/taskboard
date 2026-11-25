@@ -1,6 +1,7 @@
 //! The UI's colors (the web board's light and dark tokens), font families and the shared size
 //! scales: text sizes, spacing, control heights, corners, shadows, opacity and motion.
 use gpui_kit::*;
+use taskboardd::config::AppTheme;
 
 pub const UI_FONT: &str = "Atkinson Hyperlegible Next";
 pub const MONO_FONT: &str = "JetBrains Mono";
@@ -322,13 +323,28 @@ pub mod motion {
     pub const MOVE: u64 = 240;
 }
 
-/// The mode to start in: `TASKBOARD_THEME=dark|light`, else the system appearance.
+/// The mode to show: `TASKBOARD_THEME=dark|light`, else config.toml's `theme`, else the system
+/// appearance. Either pin holds while the system switches.
 pub fn startup_mode(system_dark: bool) -> ThemeMode {
-    match std::env::var("TASKBOARD_THEME").as_deref() {
-        Ok("dark") => ThemeMode::Dark,
-        Ok("light") => ThemeMode::Light,
-        _ if system_dark => ThemeMode::Dark,
-        _ => ThemeMode::Light,
+    static PINNED: std::sync::OnceLock<Option<ThemeMode>> = std::sync::OnceLock::new();
+    let pinned = *PINNED.get_or_init(|| {
+        let config = taskboardd::config::Config::load().map(|c| c.theme).unwrap_or_default();
+        pinned_mode(std::env::var("TASKBOARD_THEME").ok().as_deref(), config)
+    });
+    pinned.unwrap_or(if system_dark { ThemeMode::Dark } else { ThemeMode::Light })
+}
+
+/// The mode `TASKBOARD_THEME` or config.toml's `theme` pins, in that order; `None` follows the system.
+fn pinned_mode(env: Option<&str>, config: AppTheme) -> Option<ThemeMode> {
+    match env {
+        Some("dark") => return Some(ThemeMode::Dark),
+        Some("light") => return Some(ThemeMode::Light),
+        _ => {}
+    }
+    match config {
+        AppTheme::Dark => Some(ThemeMode::Dark),
+        AppTheme::Light => Some(ThemeMode::Light),
+        AppTheme::System => None,
     }
 }
 
@@ -355,6 +371,18 @@ pub fn load_fonts(cx: &mut App) -> (SharedString, SharedString) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn env_then_config_then_system() {
+        use super::{AppTheme, ThemeMode, pinned_mode};
+        assert_eq!(pinned_mode(Some("light"), AppTheme::Dark), Some(ThemeMode::Light));
+        assert_eq!(pinned_mode(Some("dark"), AppTheme::Light), Some(ThemeMode::Dark));
+        assert_eq!(pinned_mode(None, AppTheme::Dark), Some(ThemeMode::Dark));
+        assert_eq!(pinned_mode(None, AppTheme::Light), Some(ThemeMode::Light));
+        assert_eq!(pinned_mode(Some("sepia"), AppTheme::Light), Some(ThemeMode::Light));
+        assert_eq!(pinned_mode(None, AppTheme::System), None);
+        assert_eq!(pinned_mode(Some(""), AppTheme::System), None);
+    }
+
     use super::{Theme, ThemeMode};
     use gpui_kit::{Hsla, Rgba};
 
