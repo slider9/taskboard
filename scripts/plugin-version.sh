@@ -17,7 +17,27 @@ cd "$(dirname "$0")/../plugin/task-board"
 
 manifest=.claude-plugin/plugin.json
 
-hash=$(git ls-files -z -- . ":!$manifest" | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-12)
+# shasum ships with macOS and most Linux; Git Bash on Windows may only have sha256sum.
+if command -v shasum >/dev/null 2>&1; then
+  sha256() { shasum -a 256; }
+else
+  sha256() { sha256sum; }
+fi
+
+# Hash each file as git stores it (its staged blob), not the working copy: a Windows
+# checkout turns LF into CRLF and would hash to another version. Each line keeps
+# shasum's "<hash>  <path>" form, so the version matches hashing the files directly.
+files() {
+  local meta path blob
+  while IFS= read -r -d '' meta; do
+    path=${meta#*$'\t'}
+    blob=${meta#* }
+    blob=${blob%% *}
+    echo "$(git cat-file blob "$blob" | sha256 | cut -d' ' -f1)  $path"
+  done < <(git ls-files -s -z -- . ":!$manifest")
+}
+
+hash=$(files | sha256 | cut -c1-12)
 version="1.0.0-h$hash"
 current=$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$manifest" | head -1)
 
@@ -30,5 +50,8 @@ if [ "${1:-}" = "--check" ]; then
   exit 0
 fi
 
-sed -i '' "s/^\( *\"version\": *\"\)[^\"]*\"/\1$version\"/" "$manifest"
+# Through a temp file, not sed -i: BSD and GNU sed read -i differently.
+tmp=$(mktemp "$manifest.XXXXXX")
+sed "s/^\( *\"version\": *\"\)[^\"]*\"/\1$version\"/" "$manifest" >"$tmp"
+mv "$tmp" "$manifest"
 echo "plugin $version"
