@@ -1,7 +1,6 @@
 //! Midna permissions a task carries: a grant waits for the owner's Grant, and every terminal the board then
 //! opens for the task gets a Midna `allow` rule for it, scoped to that terminal and expiring.
 
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -41,7 +40,7 @@ esac
 "#,
     )
     .unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&exe).unwrap();
     cfg.midna = exe;
     let app = App::for_tests(cfg);
     let repo = repo.to_string_lossy().to_string();

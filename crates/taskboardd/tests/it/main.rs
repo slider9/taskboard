@@ -142,6 +142,8 @@ mod submit_merged_early;
 mod submit_pr_predates;
 mod tab_status;
 mod talk_again;
+// A scratch daemon watches its folder and parent only on Unix (`throwaway::Watch::new`).
+#[cfg(unix)]
 mod throwaway_serve;
 mod turn_waits;
 mod visit_prompt;

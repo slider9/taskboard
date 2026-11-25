@@ -820,7 +820,7 @@ fn a_worktree_on_main_isn_t_handed_to_a_shared_checkout_task_nor_a_release_cut_s
     assert!(!b.card(shared)["log"].to_string().contains("release-main"), "{}", b.card(shared)["log"]);
     let stray = &b.get("projects")["projects"][0]["stray_worktrees"];
     assert_eq!(stray.as_array().unwrap().len(), 1, "{stray}");
-    assert!(stray[0].as_str().unwrap().ends_with("/release-main"), "{stray}");
+    assert!(stray[0].as_str().unwrap().ends_with(&format!("{}release-main", std::path::MAIN_SEPARATOR)), "{stray}");
 
     b.app.db.x("DELETE FROM pending_cuts", p![]).unwrap();
     assert_eq!(worktrees::clean_up(&b.app).unwrap(), vec![cutter], "once the cut is through, its task's rules apply");

@@ -1,7 +1,6 @@
 //! The owner's steps (config.toml's `[[steps]]`): the agent is told them, records each with `tb step
 //! done`, and can't finish until they're recorded.
 
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -45,7 +44,7 @@ fn board_screening(config: &str, verdict: Value) -> Board {
         let saved = dir.join("prompt.txt");
         std::fs::write(&script, format!("#!/bin/sh\nprintf '%s' \"$2\" > '{}'\necho '{}'\n", saved.display(), json!({"structured_output": verdict})))
             .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        taskboardd::proc::make_runnable(&script).unwrap();
         cfg.claude = script.to_string_lossy().to_string();
         cfg.questions.screen = true;
     })

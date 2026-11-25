@@ -340,7 +340,7 @@ impl Board {
     }
 
     fn slot_holder(&self, cwd: &str) -> Option<i64> {
-        self.slots.iter().find(|(path, _)| cwd == path || cwd.starts_with(&format!("{path}/"))).map(|(_, t)| *t)
+        self.slots.iter().find(|(path, _)| Path::new(cwd).starts_with(path)).map(|(_, t)| *t)
     }
 
     /// Still working: active, or done with a PR visit on it.
@@ -551,8 +551,13 @@ fn stop_cmd(app: &App, d: &Row, task: Option<i64>) -> String {
 /// Carries out an `Act` on this Mac.
 pub fn perform(app: &App, a: &Act) -> bool {
     match a {
+        #[cfg(unix)]
         Act::Term(pid) => unsafe { libc::kill(*pid as libc::pid_t, libc::SIGTERM) == 0 },
+        #[cfg(unix)]
         Act::Kill(pid) => unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) == 0 },
+        // `scan` finds no processes off macOS, so there's none to stop.
+        #[cfg(not(unix))]
+        Act::Term(_) | Act::Kill(_) => false,
         Act::Remove(path) => std::fs::remove_dir_all(path).is_ok(),
         Act::Stop(cmd) => match crate::proc::run(Path::new("/bin/sh"), &["-c".into(), cmd.clone()], None, STOP_TIMEOUT) {
             Ok(o) if o.code == Some(0) => true,

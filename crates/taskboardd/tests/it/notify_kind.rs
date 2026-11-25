@@ -86,7 +86,7 @@ fn a_refused_send_leaves_a_line_in_server_log() {
     taskboardd::slowlog::install(&app);
     let exe = dir.path().join("midna");
     std::fs::write(&exe, "#!/bin/sh\necho 'midna: no kind `board` to send as; kinds you can send to: agent' >&2; exit 2\n").unwrap();
-    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    taskboardd::proc::make_runnable(&exe).unwrap();
     assert!(midna::notify_send(&exe, &params()).is_err());
     let log = std::fs::read_to_string(app.cfg.log_path()).unwrap();
     let line = log.lines().find(|l| l.contains("notification not sent")).unwrap_or_else(|| panic!("no line in server.log: {log}"));
