@@ -24,6 +24,12 @@ pub struct Launch {
 }
 
 impl Launch {
+    #[cfg(windows)]
+    pub fn current() -> Launch {
+        Launch { ppid: 0, group_leader: false, xpc_label: None }
+    }
+
+    #[cfg(unix)]
     pub fn current() -> Launch {
         let pid = std::process::id();
         // SAFETY: getpgrp has no preconditions and can't fail.
@@ -55,7 +61,9 @@ pub struct Watch {
 
 impl Watch {
     pub fn new(data: &Path, default_data: bool, launch: &Launch, exit_with: Option<u32>) -> Option<Watch> {
-        let scratch = !launch.by_launchd();
+        // Off Unix only `--exit-with` is watched: nothing tells a scratch daemon from the app's, and
+        // `folder_id` has no stable form there.
+        let scratch = cfg!(unix) && !launch.by_launchd();
         let w = Watch {
             data: scratch.then(|| data.to_path_buf()),
             data_id: folder_id(data),
@@ -93,20 +101,60 @@ impl Watch {
         loop {
             tick.tick().await;
             let there = self.data.as_deref().is_none_or(|d| self.data_id.is_some() && folder_id(d) == self.data_id);
-            if let Some(why) = self.reason(std::os::unix::process::parent_id(), there, alive) {
+            if let Some(why) = self.reason(parent_id(), there, alive) {
                 return why;
             }
         }
     }
 }
 
+#[cfg(unix)]
+fn parent_id() -> u32 {
+    std::os::unix::process::parent_id()
+}
+
+/// Unused off Unix: a `Watch` there has no `parent`.
+#[cfg(windows)]
+fn parent_id() -> u32 {
+    0
+}
+
 /// A folder's device and inode, or `None` when it isn't a folder.
+#[cfg(windows)]
+pub fn folder_id(_: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// A folder's device and inode, or `None` when it isn't a folder.
+#[cfg(unix)]
 pub fn folder_id(p: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(p).ok().filter(|m| m.is_dir()).map(|m| (m.dev(), m.ino()))
 }
 
+/// Whether a process with this pid is running.
+#[cfg(windows)]
+pub fn alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: a handle OpenProcess gives is closed once; the exit code is written to a local u32.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(h, &mut code) != 0;
+        CloseHandle(h);
+        ok && code == STILL_ACTIVE as u32
+    }
+}
+
 /// Whether a process with this pid is running (one owned by another user counts).
+#[cfg(unix)]
 pub fn alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else { return false };
     if pid <= 0 {
@@ -125,6 +173,7 @@ mod tests {
         Launch { ppid: 1, group_leader: true, xpc_label: Some("com.mrgnhnt.taskboard.daemon".into()) }
     }
 
+    #[cfg(unix)]
     fn shell(ppid: u32) -> Launch {
         Launch { ppid, group_leader: false, xpc_label: Some("com.mrgnhnt.midna.daemon".into()) }
     }
@@ -137,6 +186,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn orphan_of_a_shell_isnt_a_launchd_job() {
         let orphan = Launch { ppid: 1, group_leader: false, xpc_label: Some("com.mrgnhnt.midna.daemon".into()) };
         assert!(!orphan.by_launchd());
@@ -155,6 +205,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn scratch_daemon_watches_folder_and_parent() {
         let w = Watch::new(Path::new("/scratch"), false, &shell(500), None).unwrap();
         assert_eq!((w.data.clone(), w.parent, w.exit_with), (Some("/scratch".into()), Some(500), None));
@@ -165,6 +216,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn default_folder_by_hand_only_watches_the_folder() {
         let w = Watch::new(Path::new("/home/.config/taskboard"), true, &shell(500), None).unwrap();
         assert_eq!(w.parent, None);
@@ -173,6 +225,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn folder_id_tells_a_recreated_folder_apart() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path().join("data");

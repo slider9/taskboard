@@ -1,7 +1,6 @@
 //! The Needs you re-check (`recheck::run`): questions and human tasks the screener never read under
 //! today's rules are read again; what needn't wait on the owner comes off the list and is recorded.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -52,7 +51,7 @@ impl Board {
         let script = self.dir.path().join("claude");
         let out = json!({"structured_output": verdict}).to_string();
         std::fs::write(&script, format!("#!/bin/sh\necho x >> '{}'\necho '{out}'\n", self.calls_file().display())).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        taskboardd::proc::make_runnable(&script).unwrap();
     }
     fn calls_file(&self) -> PathBuf {
         self.dir.path().join("calls")

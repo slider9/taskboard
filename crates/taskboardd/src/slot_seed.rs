@@ -13,8 +13,10 @@
 //! it off.
 
 use std::collections::HashSet;
+#[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -129,6 +131,7 @@ fn prune(target: &Path, own: &HashSet<String>) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn c_path(p: &Path) -> std::io::Result<CString> {
     CString::new(p.as_os_str().as_bytes()).map_err(std::io::Error::other)
 }

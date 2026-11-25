@@ -232,6 +232,13 @@ pub fn parse_midna(v: &Value) -> Option<Reading> {
     Some(Reading { load1, cpus, memory, memory_free, midnad_cpu, midnad_memory, from: "midna" })
 }
 
+#[cfg(not(unix))]
+fn local() -> Option<Reading> {
+    // Windows has no load average: only Midna's reading counts there.
+    None
+}
+
+#[cfg(unix)]
 fn local() -> Option<Reading> {
     let mut avg = [0f64; 3];
     // SAFETY: getloadavg writes at most `nelem` doubles into the buffer it's given.
@@ -256,7 +263,7 @@ fn memory_level() -> &'static str {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn memory_level() -> &'static str {
     "normal"
 }
