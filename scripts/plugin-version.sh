@@ -37,6 +37,14 @@ files() {
   done < <(git ls-files -s -z -- . ":!$manifest")
 }
 
+# The hash covers what's staged, so an unstaged edit wouldn't move it: stop rather
+# than write a version the files on disk don't make.
+if ! git diff --quiet -- . ":!$manifest"; then
+  echo "The plugin has unstaged changes; the version is a hash of what's staged. Stage them first: git add plugin/task-board" >&2
+  git diff --name-only -- . ":!$manifest" >&2
+  exit 1
+fi
+
 hash=$(files | sha256 | cut -c1-12)
 version="1.0.0-h$hash"
 current=$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$manifest" | head -1)
