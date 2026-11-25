@@ -4,7 +4,7 @@
 //! - `TASKBOARD_BACKEND=fake` — the real board code in-process on seeded sample data (no daemon,
 //!   no runner, no Midna).
 //! - `TASKBOARD_URL` — where taskboardd answers (default from `config.toml`: 127.0.0.1:8792).
-//! - `TASKBOARD_THEME=dark|light` — override the system appearance.
+//! - `TASKBOARD_THEME=dark|light` — override config.toml's `theme` and the system appearance.
 //! - `TASKBOARD_PAGE=board|backlog|goals|projects|days|recap|review|ideas|releases|releases:webapp|G3|I2|settings`,
 //!   `TASKBOARD_OPEN=T2|B1` — initial page / panel. Anything else opens Needs you (the board).
 //! - `TASKBOARD_FAKE_RELEASES=1` — with the fake backend, sample releases and a pending cut too.

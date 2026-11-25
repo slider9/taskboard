@@ -396,7 +396,7 @@ impl MainWindow {
         if let Ok(r) = std::env::var("TASKBOARD_OPEN") {
             m.panel = Some(if r.starts_with('B') { Panel::Issue { r } } else { Panel::Task { r, tab: TaskTab::Overview } });
         }
-        // Follow the system's light / dark switch (unless TASKBOARD_THEME pins one).
+        // Follow the system's light / dark switch (unless TASKBOARD_THEME or config.toml's `theme` pins one).
         cx.observe_window_appearance(window, |_, window, cx| {
             let dark = matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark);
             let t = cx.global::<Theme>();
