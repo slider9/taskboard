@@ -549,8 +549,9 @@ How long the board keeps its history: `{"detail_days": 90, "summary_days": 365, 
 
 ### `GET /info`
 
-The running board, for Settings: `{"version": str, "uptime_secs": int, "pid": int, "launchd_label": str|null}`.
-`launchd_label` is the launchd job's label, `null` when the board wasn't started by launchd.
+The running board, for Settings: `{"version": str, "uptime_secs": int, "pid": int, "launchd_label": str|null, "exe": str|null}`.
+`launchd_label` is the launchd job's label, `null` when the board wasn't started by launchd. `exe` is the
+daemon's own program: on Windows, `tb daemon restart` runs the `taskboard-app.exe` beside it.
 
 ---
 
