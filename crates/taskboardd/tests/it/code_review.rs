@@ -520,7 +520,8 @@ fn the_tasks_agent_fixes_round_ones_findings_and_round_two_finds_nothing() {
     for want in ["round 1", "F1", "Off by one", "a.txt:1", "The change counts one page too many", &format!("finding T{id} <id> fixed"), "round 2 of at most 5", "round-1"] {
         assert!(text.contains(want), "{want} in {text}");
     }
-    assert!(!text.contains("Old helper") && !text.contains("F2"), "{text}");
+    // "F2:" as the list writes a finding: the text holds the temp dir's path, whose random name can hold "F2".
+    assert!(!text.contains("Old helper") && !text.contains("F2:"), "{text}");
     let state = b.get(&format!("tasks/T{id}/code-review/triage"));
     assert_eq!((state["fixing"].clone(), state["left"].clone()), (json!(true), json!(["F1"])), "{state}");
     assert_eq!(state["findings"].as_array().unwrap().len(), 1, "{state}");
