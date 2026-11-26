@@ -217,8 +217,23 @@ fn foreign_files(dir: &Path, name: &str) -> Result<(), String> {
 fn start_installed(dest: &Path) -> Result<(), String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
     unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+    keep_std_handles();
     let exe = dest.join(APP_EXE);
     crate::win::spawn_detached(Command::new(&exe).current_dir(dest)).map_err(|e| format!("Couldn't start {}: {e}", exe.display()))
+}
+
+/// Keeps this process's standard handles to itself. Rust starts every child with handle
+/// inheritance on, so the installed app (which outlives this launch) would hold the pipe a script
+/// reads this launch's output from, and the script would wait for its end for good.
+fn keep_std_handles() {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let h = unsafe { GetStdHandle(which) };
+        if !h.is_null() && h != INVALID_HANDLE_VALUE {
+            unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
 }
 
 /// Says `msg` to whoever ran this: the console it was run from, else a message box (a release
@@ -402,7 +417,7 @@ pub fn put_on_path(dir: &Path, m: &Manifest) -> Result<OnPath, String> {
     if std::env::var("PATH").is_ok_and(|p| path_has(&p, dir)) {
         return Ok(OnPath::Already);
     }
-    let added = add_to_path(ENV, &apps_key(m), dir)?;
+    let added = add_to_path(ENV, &apps_key(m), &backslashed(dir))?;
     if added == OnPath::Added {
         broadcast();
     }
@@ -518,6 +533,11 @@ pub fn without_dir(path: &str, dir: &Path) -> Option<String> {
 pub fn same_entry(entry: &str, dir: &Path) -> bool {
     let entry = expand(entry.trim().trim_matches('"'));
     !entry.is_empty() && taskboardd::util::path_key(&entry) == taskboardd::util::path_key(&dir.to_string_lossy())
+}
+
+/// `dir` as Windows writes a folder: `~/.local/bin` expands to `C:\Users\me/.local/bin`.
+fn backslashed(dir: &Path) -> PathBuf {
+    PathBuf::from(dir.to_string_lossy().replace('/', "\\"))
 }
 
 /// Is `dir` one of `path`'s folders?
@@ -763,6 +783,7 @@ mod tests {
         unsafe { std::env::set_var("TASKBOARD_TEST_PROFILE", r"C:\Users\me") };
         assert!(same_entry(r#""%TASKBOARD_TEST_PROFILE%\.local\bin""#, dir));
         assert!(!same_entry(r"%NOT_SET_ANYWHERE%\.local\bin", dir));
+        assert_eq!(backslashed(Path::new(r"C:\Users\me/.local/bin")), dir, "written the way Windows writes it");
     }
 
     #[test]

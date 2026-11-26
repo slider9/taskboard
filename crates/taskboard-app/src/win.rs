@@ -93,7 +93,8 @@ impl Manifest {
     }
 
     pub fn read(dir: &Path) -> Manifest {
-        let v = std::fs::read(dir.join(MANIFEST)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+        // A byte order mark (Notepad, PowerShell 5's `-Encoding utf8`) isn't JSON, but the rest is.
+        let v = std::fs::read(dir.join(MANIFEST)).ok().and_then(|b| serde_json::from_slice(b.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&b)).ok()).unwrap_or(Value::Null);
         Manifest::parse(&v)
     }
 }
@@ -648,6 +649,11 @@ mod tests {
         assert_eq!(m.label, "com.mrgnhnt.taskboard.dev.daemon", "the label follows the id");
         assert_eq!(m.version.as_deref(), Some("1.2.0"));
         assert_eq!(m.env, vec![("TASKBOARD_PORT".to_string(), "18792".to_string())]);
+        let dir = std::env::temp_dir().join(format!("taskboard-manifest-bom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(MANIFEST), b"\xEF\xBB\xBF{\"version\": \"1.2.0-w.3\"}").unwrap();
+        assert_eq!(Manifest::read(&dir).version.as_deref(), Some("1.2.0-w.3"), "a byte order mark is skipped");
+        let _ = std::fs::remove_dir_all(&dir);
         let none = Manifest::default();
         assert_eq!((none.id.as_str(), none.name.as_str(), none.scheme.as_str(), none.label.as_str()), ("com.mrgnhnt.taskboard", "Taskboard", "taskboard", "com.mrgnhnt.taskboard.daemon"));
     }
