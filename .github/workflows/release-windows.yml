@@ -102,6 +102,15 @@ jobs:
           { echo "tag=$tag"; echo "version=$version"; echo "base=$base"; echo "draft=$draft"; echo "beta=$beta"; } >> "$GITHUB_OUTPUT"
           echo "$tag: Windows build $version of $base (draft $draft, beta $beta)"
 
+      # .cargo/config.toml's rustc-wrapper is a .sh script, which Windows can't start: with it,
+      # build.sh's cargo build fails, and so does rust-cache's own `cargo metadata` when it saves
+      # (it then saves an empty cache). It comes out of the checkout's copy. Not an empty
+      # RUSTC_WRAPPER instead: Windows drops a variable set to an empty string.
+      - name: No rustc wrapper
+        run: |
+          sed -i '/^rustc-wrapper *=/d' .cargo/config.toml
+          ! grep -q '^rustc-wrapper' .cargo/config.toml
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
