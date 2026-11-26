@@ -65,8 +65,11 @@ if [ "$BUILD" = 1 ]; then
   # RUSTFLAGS would replace .cargo/config.toml's rustflags, and with them the static C runtime a
   # clean Windows needs (check-runtime.sh, below, catches a build without it).
   unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+  # .cargo/config.toml's rustc-wrapper is a .sh script, which Windows can't start (os error 193 on
+  # a runner with no RUSTC_WRAPPER), so the build runs without it. A RUSTC_WRAPPER you set
+  # (sccache) still wins over --config.
   env ${icon_env[@]+"${icon_env[@]}"} CARGO_TARGET_DIR="$TARGET_DIR" \
-    cargo build --release -p taskboard-app -p taskboardd -p taskboard-cli --bin taskboard-app --bin taskboardd --bin tb
+    cargo build --config "build.rustc-wrapper=''" --release -p taskboard-app -p taskboardd -p taskboard-cli --bin taskboard-app --bin taskboardd --bin tb
 fi
 for b in taskboard-app taskboardd tb; do [ -f "$BIN/$b.exe" ] || { echo "missing $BIN/$b.exe" >&2; exit 1; }; done
 
