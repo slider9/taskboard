@@ -9,6 +9,11 @@ rustc-wrapper = "scripts/rustc-wrapper.sh"
 # Test threads get the 8 MiB a binary's main thread has: parsing tb's large command enum in a debug
 # build outgrows the 2 MiB default.
 RUST_MIN_STACK = "8388608"
+# The bundled SQLite (libsqlite3-sys) without its memory statistics. With them on, SQLite's default,
+# every allocation it makes takes one process-wide mutex, a spinning critical section on Windows, so
+# threads using their own databases at once all queue on it: the daemon's integration tests, each
+# with boards of its own, ran at a fraction of their speed. Nothing reads the statistics.
+LIBSQLITE3_FLAGS = "-DSQLITE_DEFAULT_MEMSTATUS=0"
 
 # Windows gives a program's main thread 1 MiB, not macOS's 8 MiB; give it the same 8 MiB.
 # The C runtime is linked in (+crt-static): a clean Windows 10 has the Universal CRT but not
