@@ -160,7 +160,9 @@ fn a_silent_close_whose_work_is_on_the_base_gets_a_comment_naming_the_commits() 
     prhost::install(&b.app, host.clone());
     let id = b.pr_task(&head);
     let repo = b.repo();
-    git(&repo, &["cherry-pick", &head]);
+    // -x: a copy made in the same second as `head`, onto its own parent, would otherwise be the same
+    // commit byte for byte (same tree, parent, author, committer and message), so the same SHA.
+    git(&repo, &["cherry-pick", "-x", &head]);
     let landed = git(&repo, &["rev-parse", "--short=7", "HEAD"]);
     assert_ne!(landed, head[..7], "patch-equivalent, not the same commit");
     git(&repo, &["push", "-q", "origin", "main"]);
