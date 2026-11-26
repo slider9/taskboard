@@ -47,10 +47,6 @@ env:
   # No debug info: CI never reads it, and writing a PDB for every test binary is a large part of
   # a Windows build and its cache. Panics still say their file and line.
   CARGO_PROFILE_DEV_DEBUG: 0
-  # .cargo/config.toml's rustc-wrapper is a .sh script, which Windows can't start, so each cargo
-  # call sets it to none (TOML's empty string). Not an empty RUSTC_WRAPPER here: PowerShell and
-  # cmd treat an empty variable as unset, so it would depend on how each tool passes it on.
-  NO_WRAPPER: --config build.rustc-wrapper=''
 
 defaults:
   run:
@@ -68,6 +64,16 @@ jobs:
         run: git config --global core.longpaths true
 
       - uses: actions/checkout@v4
+
+      # .cargo/config.toml's rustc-wrapper is a .sh script, which Windows can't start. It comes
+      # out of the checkout's copy rather than off each of our cargo calls: rust-cache runs cargo
+      # too (`cargo metadata`, after the tests, to pick what to keep), and with the wrapper there
+      # that failed, so it cleaned target/ out and saved a 2 KB cache. Every run then built cold.
+      # Not an empty RUSTC_WRAPPER instead: Windows drops a variable set to an empty string.
+      - name: No rustc wrapper
+        run: |
+          sed -i '/^rustc-wrapper *=/d' .cargo/config.toml
+          ! grep -q '^rustc-wrapper' .cargo/config.toml
 
       # Pinned to what the Windows fork is built and tested with. From 1.100 cargo moves test
       # binaries under target/debug/build/ (midna's B152); move this on once the suite is checked
@@ -95,11 +101,11 @@ jobs:
       - name: Build
         id: build
         run: |
-          cargo build $NO_WRAPPER --workspace --locked
-          cargo test $NO_WRAPPER --locked -p taskboardd --lib --no-run
-          cargo test $NO_WRAPPER --locked -p taskboardd --test it --no-run
-          cargo test $NO_WRAPPER --locked -p taskboard-cli --no-run
-          cargo test $NO_WRAPPER --locked -p taskboard-app --no-run
+          cargo build --workspace --locked
+          cargo test --locked -p taskboardd --lib --no-run
+          cargo test --locked -p taskboardd --test it --no-run
+          cargo test --locked -p taskboard-cli --no-run
+          cargo test --locked -p taskboard-app --no-run
 
       # Each suite runs once the build passed, so one suite's failure doesn't hide another's.
       # Each has its own time limit: a hung test (a pipe or a child process that never answers)
@@ -107,13 +113,13 @@ jobs:
       - name: taskboardd unit tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 15
-        run: cargo test $NO_WRAPPER --locked -p taskboardd --lib
+        run: cargo test --locked -p taskboardd --lib
 
       - name: taskboardd integration tests
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 20
         run: >-
-          cargo test $NO_WRAPPER --locked -p taskboardd --test it --
+          cargo test --locked -p taskboardd --test it --
           --skip needs_recheck::an_old_human_task_an_agent_can_do_goes_back_to_the_agent_that_made_it
           --skip needs_recheck::a_pulled_back_human_task_waits_on_the_owner_again_and_the_task_made_for_it_goes
           --skip needs_recheck::haiku_unsure_goes_to_sonnet_and_a_kept_item_isn_t_read_again_until_it_changes
@@ -121,9 +127,9 @@ jobs:
       - name: taskboard-cli
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 15
-        run: cargo test $NO_WRAPPER --locked -p taskboard-cli
+        run: cargo test --locked -p taskboard-cli
 
       - name: taskboard-app
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         timeout-minutes: 15
-        run: cargo test $NO_WRAPPER --locked -p taskboard-app -- --skip ui::task_panel::tests::lost_task_resumes
+        run: cargo test --locked -p taskboard-app -- --skip ui::task_panel::tests::lost_task_resumes
