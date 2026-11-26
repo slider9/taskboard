@@ -32,6 +32,9 @@ It's built like Midna: a daemon that owns the work, a CLI for agents, and a GPUI
 
 ## Install
 
+**On Windows?** Download the zip from the [Windows releases](https://github.com/slider9/taskboard/releases) and follow
+[docs/INSTALL-windows.md](docs/INSTALL-windows.md).
+
 ```sh
 scripts/install-app.sh           # build, install to /Applications/Taskboard.app, (re)start it and its daemon
                                  # (first launch registers the daemon as a login item and links ~/.local/bin/tb)
@@ -46,7 +49,8 @@ update); the tooltip says which.
 If macOS asks, switch Taskboard on in System Settings ▸ General ▸ Login Items (the app shows a banner until you do).
 `/Applications/Taskboard.app/Contents/MacOS/taskboardd init` writes a starting config.
 
-**Windows**: download the release's `Taskboard-<version>-windows-x64.zip`, unzip it (Extract All) and run
+**Windows** (the steps, the SmartScreen warning, updates and uninstall are in
+[docs/INSTALL-windows.md](docs/INSTALL-windows.md)): download the release's `Taskboard-<version>-windows-x64.zip`, unzip it (Extract All) and run
 `taskboard-app.exe` in the `Taskboard` folder. There's no separate installer: it copies itself into
 `%LOCALAPPDATA%\Programs\Taskboard` (per user, no admin), opens that copy and exits, and the unzipped folder can go.
 Run again, it opens the installed copy; a newer zip updates it, and an older one is refused. The installed app adds
