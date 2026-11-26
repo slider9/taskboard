@@ -80,16 +80,26 @@ notarization and team, and swaps it in. A release without the archive isn't offe
 It used to install from the DMG, but mounting and unmounting a fresh DMG took about 14 seconds.
 
 A `windows-2022` job runs alongside, with the files checked out as they are in the repo (LF). It
-checks the version, then `packaging/windows/build.sh --zip --installer` builds:
+checks the version, then `packaging/windows/build.sh --zip` builds
+`Taskboard-<version>-windows-x64.zip`, the release folder (`Taskboard\`). There's no installer:
+people unzip it and run `taskboard-app.exe`, which installs itself (below). The updater downloads
+the same zip, checks it against GitHub's sha256, then that its `install.json` names the app and the
+release's version, and swaps the files in.
 
-- `Taskboard-<version>-windows-x64-setup.exe`, the installer (Inno Setup,
-  `packaging/windows/Taskboard.iss`). It's per user and needs no admin: the app goes in
-  `%LOCALAPPDATA%\Programs\Taskboard`, with a Start menu entry and an uninstaller.
-- `Taskboard-<version>-windows-x64.zip`, the same install folder, for the updater. It checks the zip
-  against GitHub's sha256, then that its `install.json` names the app and the release's version, and
-  swaps the files in.
+**Installing from the zip** (`crates/taskboard-app/src/win_install.rs`). The folder holds
+`taskboard-bundle.txt`; with it beside `taskboard-app.exe`, a launch from anywhere but
+`%LOCALAPPDATA%\Programs\Taskboard` doesn't run there. With nothing installed it copies the folder
+in (each file without the Mark of the Web, so SmartScreen doesn't ask again from the Start menu)
+and starts that copy; with the same version installed it starts that copy (a running one comes to
+the front); with an older one it quits it, stops the daemon, swaps the files in as an update does
+and starts it; with a newer one it refuses and says to uninstall that first. A folder holding
+anything but the release's files isn't installed from. Each launch of the installed copy adds it to
+the Start menu and Settings ▸ Apps (whose Uninstall runs `taskboard-app.exe --uninstall`), and
+puts `~\.local\bin`, where it copies `tb.exe`, on the user's `Path` (recorded under the Settings ▸
+Apps entry, so an uninstall takes off only what it added, and an update keeps it). A setup `.exe`
+may come later.
 
-Neither is code-signed yet, so Windows SmartScreen warns about the installer the first time.
+Nothing is code-signed yet, so Windows SmartScreen warns about `taskboard-app.exe` the first time.
 Once releases are signed, an install updates only to programs signed by the same publisher.
 
 A last job publishes the release with the macOS and Windows files.
@@ -129,14 +139,14 @@ branch's latest commit. `notarize.sh` uses the
 keychain profile `taskboard-notary` locally
 (`xcrun notarytool store-credentials taskboard-notary --apple-id … --team-id U2G2XV3688`).
 
-On Windows, in Git Bash (`--installer` needs Inno Setup 6):
+On Windows, in Git Bash:
 
 ```sh
-packaging/windows/build.sh --version 1.1.0 --out dist/1.1.0 --zip --installer
+packaging/windows/build.sh --version 1.1.0 --out dist/1.1.0 --zip
 ```
 
-`scripts/install-app.sh` and `scripts/dev-app.sh` work on Windows too: they build the install
-folder and put it in `%LOCALAPPDATA%\Programs\Taskboard` (or `Taskboard Dev`) without the installer.
+`scripts/install-app.sh` and `scripts/dev-app.sh` work on Windows too: they build the release
+folder and put it in `%LOCALAPPDATA%\Programs\Taskboard` (or `Taskboard Dev`) themselves.
 
 ## DMG window
 
@@ -227,14 +237,14 @@ doesn't match it). Two jobs, so a failed publish doesn't cost a rebuild:
 - **build** (`windows-2022`, the files checked out as they are in the repo, LF)
   1. checks the tag's version and that the files say its upstream base
      (`scripts/set-version.sh --check <base>`), and that the plugin's version matches its files
-  2. `packaging/windows/build.sh --version <v> --zip --installer` (Inno Setup 6), with
+  2. `packaging/windows/build.sh --version <v> --zip`, with
      `TASKBOARD_BUILD_VERSION=<v>` in cargo's environment, and checks `taskboard-app.exe` has
      `<v>` compiled in and `install.json` says `<v>`. A build that reported the base would see
      its own release as newer and update to it forever.
 - **publish** (`ubuntu-latest`)
   3. publishes the GitHub release `windows-v<v>`, "Taskboard `<v>` for Windows", with
-     `Taskboard-<v>-windows-x64-setup.exe` (the installer) and `Taskboard-<v>-windows-x64.zip`
-     (what the updater downloads). A build of a beta base is a prerelease; a build of a stable
+     `Taskboard-<v>-windows-x64.zip`: what people download, unzip and run (it installs itself),
+     and what the updater downloads. A build of a beta base is a prerelease; a build of a stable
      base is the latest release. A re-run that finds the release already made replaces its files.
 
 **What the updater reads.** A Windows Taskboard checks the fork's releases, not upstream's: a
@@ -245,12 +255,12 @@ the release's version ("Updates", above).
 
 **Secrets.** None. The workflow builds and publishes with `GITHUB_TOKEN` (`contents: write`), and
 the fork has no ruleset, so it needs no deploy key; the tag push is the only thing done with
-slider9's own credentials. Nothing is Authenticode-signed yet, so SmartScreen warns about the
-installer the first time; once releases are signed, an install updates only to programs signed
+slider9's own credentials. Nothing is Authenticode-signed yet, so SmartScreen warns about
+`taskboard-app.exe` from the zip the first time; once releases are signed, an install updates only to programs signed
 by the same publisher.
 
 **Trying it without a release.** Run the workflow by hand on a branch with a version, and it
-makes a **draft** release with the installer and the zip:
+makes a **draft** release with the zip:
 
 ```sh
 gh workflow run release-windows.yml --repo slider9/taskboard --ref <branch> -f version=0.1.0-beta.97.w.1 -f draft=true
@@ -295,8 +305,8 @@ used up, because installed copies may already have it.
 
 ### By hand
 
-The same build as the workflow, in Git Bash (`--installer` needs Inno Setup 6):
+The same build as the workflow, in Git Bash:
 
 ```sh
-TASKBOARD_BUILD_VERSION=0.1.0-beta.97.w.1 packaging/windows/build.sh --version 0.1.0-beta.97.w.1 --out dist/w --zip --installer
+TASKBOARD_BUILD_VERSION=0.1.0-beta.97.w.1 packaging/windows/build.sh --version 0.1.0-beta.97.w.1 --out dist/w --zip
 ```

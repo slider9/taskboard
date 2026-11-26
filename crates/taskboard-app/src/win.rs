@@ -1,8 +1,9 @@
 //! Windows: what an installed app sets up for itself, where macOS has the bundle, launchd and
 //! LaunchServices.
 //!
-//! - **The install** (`%LOCALAPPDATA%\Programs\Taskboard`, made by `packaging/windows/build.sh`)
-//!   holds the three programs, the plugin and [`MANIFEST`]: the install's id, name, link scheme and
+//! - **The install** (`%LOCALAPPDATA%\Programs\Taskboard`, which the release folder
+//!   `packaging/windows/build.sh` makes copies itself into: `win_install.rs`) holds the three
+//!   programs, the plugin, the marker and [`MANIFEST`]: the install's id, name, link scheme and
 //!   daemon label, and the environment its app and daemon run with. That's what Info.plist (with
 //!   its LSEnvironment) and the LaunchAgent's plist say on macOS; Taskboard Dev sets its own data
 //!   folder and port there.
@@ -388,8 +389,8 @@ fn startup_disabled(name: &str) -> bool {
     hkcu.open_subkey(APPROVED).and_then(|k| k.get_raw_value(name)).is_ok_and(|v| v.bytes.first().is_some_and(|b| b & 1 == 1))
 }
 
-/// Sign-in starts the daemon's supervisor (the Run entry), the link scheme opens this app, and the
-/// daemon runs now if it doesn't already. Run at every launch: an install that moved, or an
+/// Sign-in starts the daemon's supervisor (the Run entry), the link scheme opens this app, the
+/// Start menu and Settings ▸ Apps list it, and the daemon runs now if it doesn't already. Run at every launch: an install that moved, or an
 /// update, points them at itself again.
 pub fn register(dir: &Path, m: &Manifest) -> crate::install::LoginItem {
     use crate::install::LoginItem;
@@ -403,6 +404,12 @@ pub fn register(dir: &Path, m: &Manifest) -> crate::install::LoginItem {
     }
     if let Err(e) = register_scheme(dir, m) {
         crate::log::info(format!("couldn't register {}:// links: {e}", m.scheme));
+    }
+    if let Err(e) = crate::win_install::add_to_start_menu(dir, m) {
+        crate::log::info(format!("couldn't add it to the Start menu: {e}"));
+    }
+    if let Err(e) = crate::win_install::add_to_apps(dir, m) {
+        crate::log::info(format!("couldn't add it to Settings ▸ Apps: {e}"));
     }
     if !supervisor_running(m)
         && let Err(e) = start_supervisor(dir)
@@ -607,7 +614,7 @@ pub fn listen(pipe: Pipe, tx: async_channel::Sender<Vec<String>>) {
     });
 }
 
-/// Everything that runs from the install stops, so an installer can replace it or an uninstaller
+/// Everything that runs from the install stops, so a release folder can replace it or an uninstall
 /// delete it: the daemon and its supervisor, then the app, asked to quit. An app that doesn't within
 /// 10 seconds is ended. True when nothing is left running (an agent's `tb.exe` aside).
 pub fn shut_down(dir: &Path, m: &Manifest) -> bool {

@@ -1,9 +1,10 @@
 #!/bin/bash
 # The Windows side of scripts/install-app.sh (Taskboard) and scripts/dev-app.sh (Taskboard Dev):
 # builds the install folder (packaging/windows/build.sh), puts it in %LOCALAPPDATA%\Programs\<name>
-# and opens it. The app then adds its startup entry and link scheme and starts its daemon
-# (crates/taskboard-app/src/win.rs). No Start menu entry or uninstaller: the installer
-# (build.sh --installer) adds those.
+# and opens it. The app then adds its startup entry, link scheme, Start menu and Settings > Apps
+# entries and tb's folder on the user's Path, and starts its daemon (crates/taskboard-app/src/win.rs).
+# A release zip installs the same way with no script: its taskboard-app.exe copies itself in
+# (crates/taskboard-app/src/win_install.rs).
 #
 #   packaging/windows/install.sh --real|--dev [--test] [--no-build] [--seed]
 #   packaging/windows/install.sh --real|--dev --uninstall
@@ -46,7 +47,8 @@ for a in "$@"; do
 done
 
 if [ "$UNINSTALL" = 1 ]; then
-  # Quits the app, stops the daemon, takes out the startup entry, link scheme, tb copy and hooks.
+  # Quits the app, stops the daemon, takes out the startup entry, link scheme, tb copy, Path entry,
+  # Start menu and Settings > Apps entries and hooks (and deletes the folder itself, once it exits).
   [ -f "$DEST/taskboard-app.exe" ] && { "$DEST/taskboard-app.exe" --uninstall || true; }
   rm -rf "$DEST"
   echo "==> removed $DEST (data kept: $DATA)"

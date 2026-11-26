@@ -605,7 +605,7 @@ fn stage(archive: &Path, dir: &Path, version: &str, installed: &Path) -> Result<
     }
     let app = dir.join("Taskboard");
     let programs = [APP_EXE, DAEMON_EXE, "tb.exe"];
-    if !app.join(MANIFEST).is_file() || !app.join("plugin").is_dir() || programs.iter().any(|p| !app.join(p).is_file()) {
+    if !app.join(MANIFEST).is_file() || !app.join(crate::win_install::MARKER).is_file() || !app.join("plugin").is_dir() || programs.iter().any(|p| !app.join(p).is_file()) {
         return Err("The update isn't a whole Taskboard install.".into());
     }
     let m = Manifest::read(&app);
@@ -638,9 +638,10 @@ fn publisher(exe: &Path) -> Option<String> {
 
 /// Moves each file and folder of the new install into `installed`, the old one aside into
 /// `.old-<pid>` first (Windows renames a running program, but won't replace it). A folder with a
-/// file in use is done file by file. All undone if anything fails.
+/// file in use is done file by file. All undone if anything fails. Installing from a release
+/// folder does the same (`win_install::copy_in`).
 #[cfg(windows)]
-fn swap_in(staged: &Path, installed: &Path) -> Result<(), String> {
+pub fn swap_in(staged: &Path, installed: &Path) -> Result<(), String> {
     let aside = installed.join(format!("{OLD}{}", std::process::id()));
     let mut done = Vec::new();
     if let Err(e) = replace_all(staged, installed, &aside, &mut done) {
@@ -777,9 +778,9 @@ mod tests {
 
     /// A release as `release-windows.yml` publishes it on the fork.
     fn windows_release(version: &str, prerelease: bool, zip: bool) -> Value {
-        let setup = json!({"name": format!("Taskboard-{version}-windows-x64-setup.exe"), "browser_download_url": format!("https://x/{version}-setup.exe"), "size": 9});
+        let notes = json!({"name": "notes.md", "browser_download_url": "https://x/notes.md", "size": 9});
         let archive = json!({"name": format!("Taskboard-{version}-windows-x64.zip"), "browser_download_url": format!("https://x/Taskboard-{version}-windows-x64.zip"), "size": 6, "digest": "sha256:EF"});
-        let assets = if zip { json!([setup, archive]) } else { json!([setup]) };
+        let assets = if zip { json!([notes, archive]) } else { json!([notes]) };
         json!({"tag_name": format!("windows-v{version}"), "draft": false, "prerelease": prerelease, "html_url": format!("https://x/windows-v{version}"), "assets": assets})
     }
 
@@ -846,6 +847,7 @@ mod tests {
             std::fs::write(root.join(f), marker).unwrap();
         }
         std::fs::write(root.join(crate::win::MANIFEST), json!({"id": BUNDLE_ID, "version": version}).to_string()).unwrap();
+        std::fs::write(root.join(crate::win_install::MARKER), format!("Taskboard {version}")).unwrap();
     }
 
     #[cfg(windows)]
@@ -860,7 +862,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let (installed, staged) = (tmp.join("Taskboard"), tmp.join(r"Taskboard\.update\Taskboard"));
         install_tree(&installed, "1.0.0", "old");
-        std::fs::write(installed.join("unins000.exe"), "the installer's").unwrap();
+        std::fs::write(installed.join("app.log"), "the app's").unwrap();
         std::fs::write(installed.join(r"plugin\task-board\bin\gone"), "old").unwrap();
         install_tree(&staged, "1.1.0", "new");
         // A copy of ping stands in for a daemon still running from the install.
@@ -876,7 +878,7 @@ mod tests {
         assert_eq!(read(&installed.join(crate::win::APP_EXE)), "new");
         assert_eq!(read(&installed.join(r"plugin\task-board\bin\wait-hint")), "new");
         assert!(!installed.join(r"plugin\task-board\bin\gone").exists(), "a file the new version doesn't have goes");
-        assert_eq!(read(&installed.join("unins000.exe")), "the installer's", "files only the old install has stay");
+        assert_eq!(read(&installed.join("app.log")), "the app's", "files only the old install has stay");
         assert!(!installed.join(".update").exists());
         let aside = || std::fs::read_dir(&installed).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with(OLD)).count();
         assert_eq!(aside(), 1, "what's still running or open waits aside");
