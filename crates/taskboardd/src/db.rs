@@ -546,11 +546,35 @@ impl Db {
         Self::init(conn, Some(path.to_path_buf()))
     }
 
+    /// A board in memory (the tests' and the sample board's): a copy of an empty board whose schema
+    /// was made once in this process. Making it is most of a test's setup: the schema runs every
+    /// `ADD COLUMN`, and SQLite parses the whole schema again after each.
     pub fn memory() -> Result<Db> {
-        Self::init(Connection::open_in_memory()?, None)
+        static EMPTY: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+        let empty = EMPTY.get_or_init(|| {
+            let conn = Connection::open_in_memory().ok()?;
+            Self::schema(&conn).ok()?;
+            conn.serialize(rusqlite::MAIN_DB).ok().map(|d| d.to_vec())
+        });
+        let mut conn = Connection::open_in_memory()?;
+        match empty {
+            Some(bytes) => {
+                conn.deserialize_read_exact(rusqlite::MAIN_DB, &bytes[..], bytes.len(), false)?;
+                Self::settings(&conn)?;
+                Ok(Self::finish(conn, None))
+            }
+            None => Self::init(conn, None),
+        }
     }
 
     fn init(conn: Connection, path: Option<PathBuf>) -> Result<Db> {
+        Self::settings(&conn)?;
+        Self::schema(&conn)?;
+        Ok(Self::finish(conn, path))
+    }
+
+    /// The connection's own settings, which a copied database doesn't carry.
+    fn settings(conn: &Connection) -> rusqlite::Result<()> {
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -558,6 +582,11 @@ impl Db {
         // `GET /state`. 64 MB in memory, and the file mapped.
         conn.pragma_update(None, "cache_size", -65536).ok();
         conn.pragma_update(None, "mmap_size", 268_435_456).ok();
+        Ok(())
+    }
+
+    /// The tables, columns added since, and backfills: what's in the database itself.
+    fn schema(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch(SCHEMA)?;
         add_columns(&conn, ADDED)?;
         conn.execute_batch(crate::devices::SCHEMA)?;
@@ -604,16 +633,20 @@ impl Db {
         conn.execute_batch(crate::start_grants::SCHEMA)?;
         add_columns(&conn, crate::start_grants::ADDED)?;
         conn.execute_batch(crate::task_grants::SCHEMA)?;
+        Ok(())
+    }
+
+    fn finish(conn: Connection, path: Option<PathBuf>) -> Db {
         let changed: Arc<Mutex<Vec<(String, i64)>>> = Default::default();
         let hooked = changed.clone();
         conn.update_hook(Some(move |_, _: &str, table: &str, rowid: i64| hooked.lock().push((table.to_string(), rowid))));
-        Ok(Db {
+        Db {
             inner: ReentrantMutex::new(Inner { counted: Cell::new(conn.total_changes()), conn: RefCell::new(conn), depth: Cell::new(0), changed }),
             readers: path.map(Readers::new),
             writes: AtomicI64::new(0),
             log: Mutex::new(VecDeque::new()),
             reads: AtomicU64::new(0),
-        })
+        }
     }
 
     /// Whether this thread holds the connection: inside a `tx`, or a query on this thread's stack.
