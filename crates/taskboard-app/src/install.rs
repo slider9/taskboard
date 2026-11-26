@@ -5,10 +5,12 @@
 //!   the bundle's `taskboardd serve` at login and keeps it alive while the app is closed. Then link
 //!   `~/.local/bin/tb` to the bundle's copy (the Claude plugin's `tb` shim finds it
 //!   there) unless something else already lives at that path.
-//! - **Installed on Windows** (`%LOCALAPPDATA%\Programs\Taskboard\taskboard-app.exe`, with `tb.exe`
-//!   and `plugin\` beside it): a startup entry runs the daemon under `taskboard-app.exe --daemon`,
-//!   which starts it now too, and the link scheme opens this app (see `win.rs`). A copy of
-//!   `tb.exe` is kept at `~/.local/bin/tb.exe` (see [`copy_tb`]).
+//! - **Installed on Windows** (`%LOCALAPPDATA%\Programs\Taskboard\taskboard-app.exe`, with `tb.exe`,
+//!   `plugin\` and the release's marker beside it): a startup entry runs the daemon under
+//!   `taskboard-app.exe --daemon`, which starts it now too, the link scheme opens this app, and the
+//!   Start menu and Settings ▸ Apps list it (see `win.rs`). A copy of `tb.exe` is kept at
+//!   `~/.local/bin/tb.exe` (see [`copy_tb`]), and that folder is put on the user's `Path`. A release
+//!   folder run from anywhere else installs itself there first (`win_install.rs`).
 //! - **Dev** (`TASKBOARD_DEV=1`, or not inside a bundle, e.g. `cargo run`): nothing is
 //!   registered; run `taskboardd serve` yourself (or use `TASKBOARD_BACKEND=fake`).
 //!
@@ -17,9 +19,11 @@
 //!
 //! `taskboard-app --uninstall` unregisters the agent, removes the link (on Windows, the copy), takes
 //! the hooks that run this bundle's `tb` out of Claude Code's settings and withdraws the board's alert
-//! notifications (used by `scripts/dev-app.sh --uninstall`). On Windows it also quits the app and
-//! stops the daemon, so the uninstaller can delete them; `--stop` does just that (before an
-//! installer replaces them). `--restart-daemon` restarts the daemon and its supervisor on the
+//! notifications (used by `scripts/dev-app.sh --uninstall`). On Windows (what Settings ▸ Apps'
+//! Uninstall runs) it also quits the app, stops the daemon, takes out the `Path` entry the install
+//! added, the Start menu and Settings ▸ Apps entries, and deletes the install once it has exited
+//! (`--remove-install`, from a copy in `%TEMP%`); `--stop` just quits and stops them (before a
+//! script replaces the files). `--restart-daemon` restarts the daemon and its supervisor on the
 //! programs now in the install (`tb daemon restart` on Windows).
 //!
 //! Everything here blocks; `start` runs it on its own thread and publishes the result in
@@ -196,11 +200,17 @@ pub fn installed_bundle() -> Option<PathBuf> {
     bundle_of(&std::env::current_exe().ok()?)
 }
 
-/// Windows: `C:\…\Programs\Taskboard\taskboard-app.exe` -> `C:\…\Programs\Taskboard`, when `tb.exe`
-/// and the plugin are beside it (a cargo build's folder has no plugin, so it isn't an install).
+/// Windows: `C:\…\Programs\Taskboard\taskboard-app.exe` -> `C:\…\Programs\Taskboard`, when `tb.exe`,
+/// the plugin and the release's marker are beside it (a cargo build's folder has none, and a stray
+/// exe among other files no marker, so neither is an install). Run from anywhere but its
+/// install folder, it installs itself there (`win_install::place`).
 pub fn install_dir_of(exe: &Path) -> Option<PathBuf> {
     let dir = exe.parent()?;
-    (dir.join("tb.exe").is_file() && dir.join("plugin").is_dir()).then(|| dir.to_path_buf())
+    #[cfg(windows)]
+    let marked = dir.join(crate::win_install::MARKER).is_file();
+    #[cfg(not(windows))]
+    let marked = true;
+    (marked && dir.join("tb.exe").is_file() && dir.join("plugin").is_dir()).then(|| dir.to_path_buf())
 }
 
 /// The installed app, unless in dev mode: the bundle on macOS, the install folder on Windows. Its
@@ -484,8 +494,16 @@ pub fn headless(args: &[String]) -> Option<i32> {
                 code = 1;
             }
             withdraw_alerts();
+            // Windows: the rest of what the install added, then its files once this has exited.
+            #[cfg(windows)]
+            if !uninstall_windows(&bundle) {
+                code = 1;
+            }
             Some(code)
         }
+        // Windows: `--uninstall`'s copy in %TEMP%, deleting the install once it has exited.
+        #[cfg(windows)]
+        Some("--remove-install") => Some(crate::win_install::remove_main(args)),
         // Windows: `tb daemon restart` runs this one, beside the daemon, and waits for a new pid itself.
         #[cfg(windows)]
         Some("--restart-daemon") => {
@@ -528,6 +546,34 @@ pub fn headless(args: &[String]) -> Option<i32> {
         }
         _ => None,
     }
+}
+
+/// Windows, `--uninstall`: takes out the `Path` entry the install added, its Start menu and
+/// Settings ▸ Apps entries, and has its files deleted once this process exits. False when a step failed.
+#[cfg(windows)]
+fn uninstall_windows(dir: &Path) -> bool {
+    use crate::win_install as w;
+    let m = crate::win::Manifest::read(dir);
+    let mut ok = true;
+    // Before the Settings ▸ Apps entry, which records what was added.
+    match w::take_off_path(&m) {
+        Ok(Some(d)) => crate::log::info(format!("took {} off the user's Path", d.display())),
+        Ok(None) => {}
+        Err(e) => {
+            crate::log::info(format!("taking tb's folder off the user's Path failed: {e}"));
+            ok = false;
+        }
+    }
+    w::remove_from_start_menu(dir, &m);
+    if let Err(e) = w::remove_from_apps(dir, &m) {
+        crate::log::info(format!("taking it out of Settings ▸ Apps failed: {e}"));
+        ok = false;
+    }
+    if let Err(e) = w::remove_later(dir) {
+        crate::log::info(format!("couldn't start deleting {}: {e}", dir.display()));
+        ok = false;
+    }
+    ok
 }
 
 /// The app can't reach the daemon. Launch only checks the registration once, and launchd can start
@@ -596,6 +642,20 @@ fn register_and_link(bundle: &Path) {
         Err(e) => {
             crate::log::info(format!("couldn't put tb in ~/.local/bin: {e}"));
             set_link_failed(Some(format!("{what}: {e}")));
+        }
+    }
+    // Windows: nothing puts ~\.local\bin on a clean PC's Path, so `tb` in a new terminal needs it.
+    #[cfg(windows)]
+    if let Some(dir) = tb_link().parent() {
+        use crate::win_install::OnPath;
+        match crate::win_install::put_on_path(dir, &crate::win::Manifest::read(bundle)) {
+            Ok(OnPath::Added) => crate::log::info(format!("added {} to the user's Path", dir.display())),
+            Ok(OnPath::TakenOff) => crate::log::info(format!("{} was taken off the user's Path since the install added it; left off", dir.display())),
+            Ok(OnPath::Already) => {}
+            Err(e) => {
+                crate::log::info(format!("couldn't add {} to the user's Path: {e}", dir.display()));
+                set_link_failed(Some(format!("Adding {} to your Path: {e}", dir.display())));
+            }
         }
     }
 }
@@ -823,6 +883,11 @@ mod tests {
         std::fs::write(dir.join("tb.exe"), "").unwrap();
         assert_eq!(install_dir_of(&exe), None, "a cargo build's folder: tb.exe but no plugin");
         std::fs::create_dir_all(dir.join("plugin")).unwrap();
+        #[cfg(windows)]
+        {
+            assert_eq!(install_dir_of(&exe), None, "no marker: a stray exe among other files");
+            std::fs::write(dir.join(crate::win_install::MARKER), "").unwrap();
+        }
         assert_eq!(install_dir_of(&exe), Some(dir.clone()));
         let _ = std::fs::remove_dir_all(&dir);
     }

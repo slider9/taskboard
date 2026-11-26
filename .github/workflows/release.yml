@@ -167,15 +167,8 @@ jobs:
         with:
           workspaces: ". -> target/package"
 
-      # Inno Setup 6 is on GitHub's Windows images; installed if it isn't.
-      - name: Inno Setup
-        run: |
-          if ! command -v iscc >/dev/null && [ ! -f "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]; then
-            choco install innosetup --no-progress -y
-          fi
-
-      - name: Build install folder, update zip and installer
-        run: packaging/windows/build.sh --version "${GITHUB_REF_NAME#v}" --out dist/release --zip --installer
+      - name: Build release folder and zip
+        run: packaging/windows/build.sh --version "${GITHUB_REF_NAME#v}" --out dist/release --zip
 
       - name: Keep the Windows files for the release
         uses: actions/upload-artifact@v4
@@ -183,7 +176,6 @@ jobs:
           name: windows
           path: |
             dist/release/Taskboard-*-windows-x64.zip
-            dist/release/Taskboard-*-windows-x64-setup.exe
           if-no-files-found: error
           retention-days: 1
 

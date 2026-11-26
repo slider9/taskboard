@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build the Windows install folder (and, when asked, the update zip and the installer). Runs in Git
-# Bash, here and on GitHub's Windows runners; the macOS app is packaging/build-app.sh.
+# Build the Windows release folder (and, when asked, the release zip). Runs in Git Bash, here and on
+# GitHub's Windows runners; the macOS app is packaging/build-app.sh.
 #
 #   packaging/windows/build.sh [options]
 #     --version V         version for the install (default: workspace Cargo version)
@@ -14,19 +14,22 @@
 #     --scheme NAME       link scheme the app opens (default taskboard: taskboard://task/T12)
 #     --env K=V           the app's and the daemon's environment (e.g. TASKBOARD_DATA=…,
 #                         TASKBOARD_PORT=18792); repeatable
-#     --zip               also DIR/<name>-<version>-windows-x64.zip, what the updater downloads
-#     --installer         also DIR/<name>-<version>-windows-x64-setup.exe (needs Inno Setup 6's ISCC)
+#     --zip               also DIR/<name>-<version>-windows-x64.zip: what people download, and the
+#                         updater too
 #
-# The install folder holds taskboard-app.exe (the window, and with --daemon the daemon's
-# supervisor), taskboardd.exe (the board), tb.exe (the agent CLI; the app keeps a copy in
-# ~/.local/bin), the Claude Code plugin, the fonts' licenses and install.json, which says the above
-# (crates/taskboard-app/src/win.rs). The installer puts it in %LOCALAPPDATA%\Programs\<name>.
+# The folder holds taskboard-app.exe (the window, and with --daemon the daemon's supervisor),
+# taskboardd.exe (the board), tb.exe (the agent CLI; the app keeps a copy in ~/.local/bin and puts
+# that on the user's Path), the Claude Code plugin, the fonts' licenses, install.json, which says
+# the above (crates/taskboard-app/src/win.rs), and taskboard-bundle.txt. There's no installer:
+# taskboard-app.exe run from the folder (unzipped anywhere) copies it into
+# %LOCALAPPDATA%\Programs\<name> and starts that copy (crates/taskboard-app/src/win_install.rs).
+# The marker is what lets it: a taskboard-app.exe without one never installs itself.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
 VERSION="" OUT="" BUILD=1 TARGET_DIR="$ROOT/target/package" ID="com.mrgnhnt.taskboard" LABEL="" NAME="Taskboard"
-ICON="" SCHEME="taskboard" EXTRA_ENV=() ZIP=0 INSTALLER=0
+ICON="" SCHEME="taskboard" EXTRA_ENV=() ZIP=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="$2"; shift 2 ;;
@@ -40,8 +43,7 @@ while [ $# -gt 0 ]; do
     --scheme) SCHEME="$2"; shift 2 ;;
     --env) EXTRA_ENV+=("$2"); shift 2 ;;
     --zip) ZIP=1; shift ;;
-    --installer) INSTALLER=1; shift ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "build.sh: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -102,6 +104,11 @@ json_str() {  # a JSON string: backslashes and quotes escaped (Windows paths)
 } > "$DIR/install.json"
 python -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$DIR/install.json" 2>/dev/null \
   || python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$DIR/install.json"
+# The marker (win_install::MARKER): with it beside taskboard-app.exe, the folder installs itself.
+cat > "$DIR/taskboard-bundle.txt" <<EOF
+$NAME $VERSION. With this file beside it, taskboard-app.exe installs this folder into
+%LOCALAPPDATA%\Programs\\$NAME when it's run from anywhere else, then starts that copy.
+EOF
 packaging/windows/check-runtime.sh "$DIR"
 echo "==> built $DIR ($VERSION, $(du -sh "$DIR" | cut -f1))"
 
@@ -112,19 +119,9 @@ if [ "$ZIP" = 1 ]; then
   # Windows' own tar writes zips (-a picks the format from the name), and the updater unpacks with it.
   tar="$(cygpath -u "$SYSTEMROOT")/System32/tar.exe"
   (cd "$OUT" && "$tar" -a -c -f "$(cygpath -w "$zip")" "$NAME")
-  "$tar" -t -f "$(cygpath -w "$zip")" | grep -qx "$NAME/install.json"
-  echo "==> $zip"
-fi
-
-# ---------------------------------------------------------------- installer
-if [ "$INSTALLER" = 1 ]; then
-  iscc="$(command -v iscc || command -v ISCC || true)"
-  for c in "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" "/c/Program Files/Inno Setup 6/ISCC.exe" "$LOCALAPPDATA/Programs/Inno Setup 6/ISCC.exe"; do
-    [ -z "$iscc" ] && [ -f "$c" ] && iscc="$c"
+  listing="$("$tar" -t -f "$(cygpath -w "$zip")")"
+  for f in install.json taskboard-bundle.txt taskboard-app.exe; do
+    grep -qx "$NAME/$f" <<<"$listing" || { echo "$zip has no $NAME/$f" >&2; exit 1; }
   done
-  [ -n "$iscc" ] || { echo "no Inno Setup 6 (ISCC.exe): install it, or build without --installer" >&2; exit 1; }
-  # Windows wants a numeric file version: 1.2.0-beta.3 -> 1.2.0.
-  "$iscc" -Q "-DVersion=$VERSION" "-DFileVersion=${VERSION%%-*}" "-DName=$NAME" "-DSource=$(cygpath -w "$DIR")" \
-    "-DOutputDir=$(cygpath -w "$OUT")" "-DOutputName=$NAME-$VERSION-windows-x64-setup" "$(cygpath -w packaging/windows/Taskboard.iss)"
-  echo "==> $OUT/$NAME-$VERSION-windows-x64-setup.exe"
+  echo "==> $zip"
 fi

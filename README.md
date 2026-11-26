@@ -20,7 +20,7 @@ It's built like Midna: a daemon that owns the work, a CLI for agents, and a GPUI
 | `crates/taskboardd` | The daemon: SQLite, the JSON API on `http://127.0.0.1:8792/tasks/api`, the runner that starts terminals, and the Midna sync. The app runs it as a LaunchAgent, so it keeps working while the window is closed. |
 | `crates/taskboard-cli` | `tb`: the agent CLI (`tb` inside Claude sessions), the Claude Code hooks (`tb hook <Event>`) and the status line (`tb statusline`). |
 | `crates/taskboard-app` | `Taskboard.app`: the native window (GPUI via `gpui-kit`): board, goals, backlog, sessions, task and issue panels, forms, work hours. |
-| `packaging/`, `scripts/` | `build-app.sh` assembles and signs `Taskboard.app`; `install-app.sh` installs it to /Applications; `dev-app.sh` installs a separate "Taskboard Dev". On Windows, `packaging/windows/build.sh` builds the install folder, update zip and installer, and the two scripts install to `%LOCALAPPDATA%\Programs`. |
+| `packaging/`, `scripts/` | `build-app.sh` assembles and signs `Taskboard.app`; `install-app.sh` installs it to /Applications; `dev-app.sh` installs a separate "Taskboard Dev". On Windows, `packaging/windows/build.sh` builds the release folder and zip (the folder installs itself), and the two scripts install to `%LOCALAPPDATA%\Programs`. |
 | `docs/API.md` | The JSON API the app (and `tb`) rely on. |
 | `docs/HOOKS.md` | Your own commands, run at each step of the board's flow (`hooks.json`): they can stop or skip a step. |
 | `docs/STREAM.md` | The work event stream a relay posts PR, build, push and Jira events to (`POST /stream/events`). |
@@ -46,11 +46,14 @@ update); the tooltip says which.
 If macOS asks, switch Taskboard on in System Settings ▸ General ▸ Login Items (the app shows a banner until you do).
 `/Applications/Taskboard.app/Contents/MacOS/taskboardd init` writes a starting config.
 
-**Windows**: run the release's `Taskboard-<version>-windows-x64-setup.exe`. It's per user and needs no admin. It
-installs to `%LOCALAPPDATA%\Programs\Taskboard` and adds a Start menu entry and an uninstaller in Settings ▸ Apps. When
-the app opens it does what macOS's login item and link handler do: a startup entry runs the daemon whenever you sign in
-(and keeps it running), `taskboard://` links open the app, and a copy of `tb.exe` goes in `~\.local\bin`. From a
-checkout, `scripts/install-app.sh` in Git Bash builds and installs the same folder without the installer.
+**Windows**: download the release's `Taskboard-<version>-windows-x64.zip`, unzip it (Extract All) and run
+`taskboard-app.exe` in the `Taskboard` folder. There's no separate installer: it copies itself into
+`%LOCALAPPDATA%\Programs\Taskboard` (per user, no admin), opens that copy and exits, and the unzipped folder can go.
+Run again, it opens the installed copy; a newer zip updates it, and an older one is refused. The installed app adds
+itself to the Start menu and to Settings ▸ Apps, and does what macOS's login item and link handler do: a startup entry
+runs the daemon whenever you sign in (and keeps it running), `taskboard://` links open the app, and a copy of `tb.exe`
+goes in `~\.local\bin`, which it puts on your user `Path`, so `tb` works in a terminal opened after that. From a
+checkout, `scripts/install-app.sh` in Git Bash builds and installs the same folder.
 
 Coming from the old board? Follow `docs/CUTOVER.md` first: it holds the same port, and
 `taskboardd import` brings its tasks, goals and backlog over with their numbers.
@@ -168,5 +171,6 @@ repo with write access: `ssh-keygen -t ed25519 -N "" -f ~/.ssh/taskboard-release
 1. `claude plugin uninstall task-board@taskboard` and `claude plugin marketplace remove taskboard`.
 2. `/Applications/Taskboard.app/Contents/MacOS/taskboard-app --uninstall` (stops and unregisters the daemon, removes the `tb` link), then delete the app.
    On Windows, uninstall Taskboard in Settings ▸ Apps: it runs `taskboard-app.exe --uninstall` (quits the app, stops
-   the daemon, takes out its startup entry, link scheme and `tb.exe` copy) and deletes the install.
+   the daemon, takes out its startup entry, link scheme, `tb.exe` copy, the `Path` entry it added (only that one) and
+   its Start menu entry) and deletes the install.
 3. If you don't want the data, delete `~/.config/taskboard`.

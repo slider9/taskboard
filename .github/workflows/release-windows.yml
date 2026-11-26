@@ -110,22 +110,15 @@ jobs:
         with:
           workspaces: ". -> target/package"
 
-      # Inno Setup 6 is on GitHub's Windows images; installed if it isn't.
-      - name: Inno Setup
-        run: |
-          if ! command -v iscc >/dev/null && [ ! -f "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]; then
-            choco install innosetup --no-progress -y
-          fi
-
       # TASKBOARD_BUILD_VERSION is the full Windows version, compiled in so the app reports it
       # rather than Cargo.toml's base: a build that said the base would take its own release for
       # an update, again and again. install.json gets it from --version.
-      - name: Build install folder, update zip and installer
+      - name: Build release folder and zip
         env:
           TASKBOARD_BUILD_VERSION: ${{ steps.version.outputs.version }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          packaging/windows/build.sh --version "$VERSION" --out dist/release --zip --installer
+          packaging/windows/build.sh --version "$VERSION" --out dist/release --zip
           grep -qaF "$VERSION" dist/release/Taskboard/taskboard-app.exe ||
             { echo "::error::taskboard-app.exe doesn't have $VERSION compiled in (TASKBOARD_BUILD_VERSION)"; exit 1; }
           got=$(python -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' dist/release/Taskboard/install.json)
@@ -138,11 +131,11 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           mkdir -p release
-          cp "dist/release/Taskboard-$VERSION-windows-x64-setup.exe" "dist/release/Taskboard-$VERSION-windows-x64.zip" release/
+          cp "dist/release/Taskboard-$VERSION-windows-x64.zip" release/
           cat > release/notes.md <<EOF
           Taskboard for Windows $VERSION: upstream $BASE with the Windows port, from $GITHUB_SHA.
 
-          Download \`Taskboard-$VERSION-windows-x64-setup.exe\` and run it. It installs for you alone, with no admin, into \`%LOCALAPPDATA%\\Programs\\Taskboard\`, and an installed copy updates itself from here (the \`.zip\`). Builds aren't code-signed yet, so Windows SmartScreen may warn the first time: More info, then Run anyway. The steps are in the [install guide](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/docs/INSTALL-windows.md).
+          Download \`Taskboard-$VERSION-windows-x64.zip\`, unzip it (right-click, Extract All) and run \`taskboard-app.exe\` in the \`Taskboard\` folder. There's no separate installer: it installs itself for you alone, with no admin, into \`%LOCALAPPDATA%\\Programs\\Taskboard\`, adds Taskboard to the Start menu and Settings > Apps (where you uninstall it), puts \`tb\` on your Path for new terminals, and opens the installed copy; the unzipped folder can go. Running a newer zip the same way updates an install, and an installed copy updates itself from here. Builds aren't code-signed yet, so Windows SmartScreen may warn the first time: More info, then Run anyway. The steps are in the [install guide](https://github.com/$GITHUB_REPOSITORY/blob/$TAG/docs/INSTALL-windows.md).
           EOF
           cat release/notes.md
           ls -l release
@@ -177,7 +170,7 @@ jobs:
       # fresh release (deleting a draft leaves the tag alone).
       - name: Publish release
         run: |
-          files=("release/Taskboard-$VERSION-windows-x64-setup.exe" "release/Taskboard-$VERSION-windows-x64.zip")
+          files=("release/Taskboard-$VERSION-windows-x64.zip")
           existing=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null || true)
           if [ "$existing" = false ] && [ "$DRAFT" = true ]; then
             echo "::error::$TAG is already published; a draft run never replaces its files. Pick an unused version."

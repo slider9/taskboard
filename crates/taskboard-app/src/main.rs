@@ -48,6 +48,8 @@ mod ui;
 mod updater;
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod win_install;
 
 use gpui_kit::*;
 use theme::Theme;
@@ -109,6 +111,14 @@ fn main() {
     }
     log::init();
     if let Some(code) = install::headless(&args) {
+        std::process::exit(code);
+    }
+    // Windows: a release folder run from anywhere but its install folder installs itself there
+    // (or starts, updates or refuses the copy installed) and goes.
+    #[cfg(windows)]
+    if std::env::var("TASKBOARD_BACKEND").as_deref() != Ok("fake")
+        && let Some(code) = win_install::place()
+    {
         std::process::exit(code);
     }
     let backend = backend::from_env();
