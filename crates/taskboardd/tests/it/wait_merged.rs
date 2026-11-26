@@ -767,7 +767,8 @@ fn a_child_rebased_onto_main_with_its_parents_commits_carries_them() {
     let three = stacked_and_merged(&b, one, "tail");
     let (a, _) = stack_repo(&b);
     git(&b, &["switch", "-q", "-c", "feat/rebased", "main"]);
-    git(&b, &["cherry-pick", &a]);
+    // -x so the copy is a new SHA even in the same second as `a` (same parent, tree and times).
+    git(&b, &["cherry-pick", "-x", &a]);
     let c = commit(&b, "polish.txt", "polish");
     set_head(&b, one, "OPEN", "feat/endpoint", &a);
     set_head(&b, three, "MERGED", "feat/rebased", &c);
